@@ -1,0 +1,17 @@
+node_modules/
+.npm-cache/
+dist/
+.DS_Store
+backend/data/
+backend/uploads/
+backend/tmp/
+backend/backups/
+*.log
+*.tgz
+*.zip
+*.ppt
+*.pptx
+*.doc
+*.docx
+.env
+.env.*
