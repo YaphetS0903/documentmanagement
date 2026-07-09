@@ -80,6 +80,7 @@
           :actions="actions"
           :is-admin="isAdminUser"
           :enable-sync="true"
+          :recent-accesses="recentAccesses"
           @select-folder="selectFolder"
           @create-folder="openFolderDialog"
           @upload="openUploadDialog"
@@ -99,6 +100,7 @@
           @batch-download="batchDownload"
           @batch-move="openBatchMoveDialog"
           @batch-delete="batchDelete"
+          @batch-metadata="openBatchMetadataDialog"
           @move="openMoveDialog"
           @copy="openMoveDialog"
           @copy-enterprise="openCopyToEnterpriseDialog"
@@ -108,6 +110,8 @@
           @metadata="openMetadataDialog"
           @links="openLinkDialog"
           @workflow="openWorkflowDialog"
+          @security="openSecurityDialog"
+          @request-download="openDownloadApprovalDialog"
         />
         <DocsViewPanel
           v-if="activeView === 'drive'"
@@ -123,6 +127,7 @@
           :space-summary="driveSummary"
           :is-admin="false"
           :enable-sync="false"
+          :recent-accesses="recentAccesses"
           @select-folder="selectDriveFolder"
           @create-folder="openFolderDialog"
           @upload="openUploadDialog"
@@ -141,6 +146,7 @@
           @batch-download="batchDownload"
           @batch-move="openBatchMoveDialog"
           @batch-delete="batchDelete"
+          @batch-metadata="openBatchMetadataDialog"
           @move="openMoveDialog"
           @copy="openMoveDialog"
           @copy-enterprise="openCopyToEnterpriseDialog"
@@ -150,6 +156,8 @@
           @metadata="openMetadataDialog"
           @links="openLinkDialog"
           @workflow="openWorkflowDialog"
+          @security="openSecurityDialog"
+          @request-download="openDownloadApprovalDialog"
         />
         <UsersViewPanel v-if="activeView === 'users'" :users="users" :departments="flatDepartments" :roles="flatRoles" @create="openUserDialog" @edit="openUserDialog" @reset="resetPassword" />
         <OrgViewPanel
@@ -194,6 +202,16 @@
           @edit-reminder="openReminderDialog"
           @cancel-reminder="cancelReminder"
         />
+        <ApprovalCenterViewPanel
+          v-if="activeView === 'approvals'"
+          :todo="approvalTodo"
+          :mine="approvalMine"
+          :all="approvalAll"
+          :format-date="formatDate"
+          @approve="decideGeneralApproval($event, 'approve')"
+          @reject="decideGeneralApproval($event, 'reject')"
+          @refresh="loadApprovals"
+        />
         <ProfileViewPanel
           v-if="activeView === 'profile'"
           :user="user"
@@ -233,11 +251,16 @@
           :file-policy="filePolicy"
           :external-library="externalLibrary"
           :storage-settings="storageSettings"
+          :security-policy="securityPolicy"
+          :wecom-settings="wecomSettings"
           :format-date="formatDate"
           @edit-file-policy="openFilePolicyDialog"
           @edit-external-library="openExternalLibraryDialog"
           @edit-storage="openStorageDialog"
           @sync-storage="syncStorageToMysql"
+          @edit-security-policy="openSecurityPolicyDialog"
+          @edit-wecom="openWecomDialog"
+          @test-wecom="testWecomSettings"
           @export-audit="exportAuditLogs"
         />
         <AuditViewPanel v-if="activeView === 'audit'" :logs="auditLogs" :format-date="formatDate" @export="exportAuditLogs" />
@@ -650,6 +673,176 @@
       </template>
     </el-dialog>
 
+    <el-dialog v-model="securityDialog.visible" title="文件安全设置" width="560px">
+      <el-form label-position="top">
+        <el-form-item label="文件/文件夹">
+          <el-input :model-value="securityDialog.node?.fullPath || ''" disabled />
+        </el-form-item>
+        <el-form-item label="密级">
+          <el-segmented v-model="securityDialog.form.securityLevel" :options="securityLevelOptions" />
+        </el-form-item>
+        <el-form-item label="敏感文件">
+          <el-switch v-model="securityDialog.form.sensitive" active-text="敏感" inactive-text="普通" />
+        </el-form-item>
+        <el-form-item label="敏感原因">
+          <el-input v-model="securityDialog.form.sensitiveReason" type="textarea" :rows="3" placeholder="例如：包含经营数据、合同价格或内部资料" />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="securityDialog.visible = false">取消</el-button>
+        <el-button type="primary" :loading="loading" @click="saveNodeSecurity">保存</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="securityPolicyDialog.visible" title="安全策略配置" width="720px">
+      <el-form label-position="top">
+        <div class="form-grid">
+          <el-form-item label="预览水印">
+            <el-switch v-model="securityPolicyDialog.form.enablePreviewWatermark" active-text="启用" inactive-text="关闭" />
+          </el-form-item>
+          <el-form-item label="敏感文件下载">
+            <el-switch v-model="securityPolicyDialog.form.blockSensitiveDownload" active-text="限制" inactive-text="允许" />
+          </el-form-item>
+          <el-form-item label="管理员绕过">
+            <el-switch v-model="securityPolicyDialog.form.allowAdminBypass" active-text="允许" inactive-text="禁止" />
+          </el-form-item>
+          <el-form-item label="敏感访问日志">
+            <el-switch v-model="securityPolicyDialog.form.logSensitiveAccess" active-text="记录" inactive-text="关闭" />
+          </el-form-item>
+          <el-form-item label="下载水印预留">
+            <el-switch v-model="securityPolicyDialog.form.enableDownloadWatermark" active-text="启用" inactive-text="关闭" />
+          </el-form-item>
+          <el-form-item label="敏感下载审批">
+            <el-switch v-model="securityPolicyDialog.form.requireDownloadApprovalForSensitive" active-text="需要" inactive-text="不需要" />
+          </el-form-item>
+          <el-form-item label="发布审批">
+            <el-switch v-model="securityPolicyDialog.form.requirePublishApproval" active-text="需要" inactive-text="不需要" />
+          </el-form-item>
+          <el-form-item label="权限申请审批">
+            <el-switch v-model="securityPolicyDialog.form.requirePermissionApproval" active-text="需要" inactive-text="不需要" />
+          </el-form-item>
+        </div>
+        <el-form-item label="水印内容">
+          <el-radio-group v-model="securityPolicyDialog.form.watermarkTextMode">
+            <el-radio-button label="user">用户+时间</el-radio-button>
+            <el-radio-button label="company">公司名称</el-radio-button>
+            <el-radio-button label="custom">自定义</el-radio-button>
+          </el-radio-group>
+        </el-form-item>
+        <el-form-item label="固定/自定义水印文字">
+          <el-input v-model="securityPolicyDialog.form.customWatermarkText" placeholder="例如：公司内部资料" />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="securityPolicyDialog.visible = false">取消</el-button>
+        <el-button type="primary" :loading="loading" @click="saveSecurityPolicy">保存策略</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="wecomDialog.visible" title="企业微信配置" width="700px">
+      <el-form label-position="top">
+        <div class="form-grid">
+          <el-form-item label="启用企业微信">
+            <el-switch v-model="wecomDialog.form.enabled" active-text="启用" inactive-text="关闭" />
+          </el-form-item>
+          <el-form-item label="消息推送">
+            <el-switch v-model="wecomDialog.form.pushMessages" active-text="启用" inactive-text="关闭" />
+          </el-form-item>
+          <el-form-item label="CorpID">
+            <el-input v-model="wecomDialog.form.corpId" autocomplete="off" />
+          </el-form-item>
+          <el-form-item label="AgentID">
+            <el-input v-model="wecomDialog.form.agentId" autocomplete="off" />
+          </el-form-item>
+          <el-form-item label="Secret">
+            <el-input v-model="wecomDialog.form.secret" type="password" show-password autocomplete="new-password" :placeholder="wecomSettings?.hasSecret ? '留空表示不修改' : '请输入 Secret'" />
+          </el-form-item>
+          <el-form-item label="回调地址">
+            <el-input v-model="wecomDialog.form.callbackUrl" placeholder="/api/v1/wecom/auth/callback" />
+          </el-form-item>
+          <el-form-item label="同步部门">
+            <el-switch v-model="wecomDialog.form.syncDepartments" active-text="启用" inactive-text="关闭" />
+          </el-form-item>
+          <el-form-item label="同步用户">
+            <el-switch v-model="wecomDialog.form.syncUsers" active-text="启用" inactive-text="关闭" />
+          </el-form-item>
+        </div>
+      </el-form>
+      <template #footer>
+        <el-button @click="wecomDialog.visible = false">取消</el-button>
+        <el-button @click="testWecomSettings">测试配置</el-button>
+        <el-button type="primary" :loading="loading" @click="saveWecomSettings">保存配置</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="approvalRequestDialog.visible" :title="approvalRequestDialog.type === 'permission' ? '权限申请' : '下载审批申请'" width="560px">
+      <el-form label-position="top">
+        <el-form-item label="文件/文件夹">
+          <el-input :model-value="approvalRequestDialog.node?.fullPath || approvalRequestDialog.node?.name || ''" disabled />
+        </el-form-item>
+        <el-form-item label="审批人">
+          <el-select v-model="approvalRequestDialog.approverId" filterable style="width: 100%">
+            <el-option v-for="item in users" :key="item.id" :label="item.displayName || item.username" :value="item.id" />
+          </el-select>
+        </el-form-item>
+        <el-form-item v-if="approvalRequestDialog.type === 'permission'" label="申请权限">
+          <el-checkbox-group v-model="approvalRequestDialog.requestedActions">
+            <el-checkbox label="visible">可见</el-checkbox>
+            <el-checkbox label="file:preview">预览</el-checkbox>
+            <el-checkbox label="file:download">下载</el-checkbox>
+            <el-checkbox label="file:update">编辑</el-checkbox>
+          </el-checkbox-group>
+        </el-form-item>
+        <el-form-item label="申请理由">
+          <el-input v-model="approvalRequestDialog.reason" type="textarea" :rows="3" />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="approvalRequestDialog.visible = false">取消</el-button>
+        <el-button type="primary" :loading="loading" @click="submitApprovalRequest">提交申请</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="batchMetadataDialog.visible" title="批量属性编辑" width="640px">
+      <el-form label-position="top">
+        <el-alert type="info" :closable="false" :title="'将更新 ' + batchMetadataDialog.rows.length + ' 个项目'" />
+        <el-form-item label="标签">
+          <el-input v-model="batchMetadataDialog.tagsText" placeholder="留空不更新，多个标签用逗号分隔" />
+        </el-form-item>
+        <div class="form-grid">
+          <el-form-item label="业务状态">
+            <el-select v-model="batchMetadataDialog.businessStatus" clearable style="width: 100%">
+              <el-option label="不更新" value="" />
+              <el-option label="草稿" value="draft" />
+              <el-option label="有效" value="effective" />
+              <el-option label="作废" value="invalid" />
+              <el-option label="归档" value="archived" />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="密级">
+            <el-select v-model="batchMetadataDialog.securityLevel" clearable style="width: 100%">
+              <el-option label="不更新" value="" />
+              <el-option v-for="item in securityLevelOptions" :key="item.value" :label="item.label" :value="item.value" />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="敏感标识">
+            <el-select v-model="batchMetadataDialog.sensitiveMode" style="width: 100%">
+              <el-option label="不更新" value="keep" />
+              <el-option label="设为敏感" value="true" />
+              <el-option label="设为普通" value="false" />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="敏感原因">
+            <el-input v-model="batchMetadataDialog.sensitiveReason" />
+          </el-form-item>
+        </div>
+      </el-form>
+      <template #footer>
+        <el-button @click="batchMetadataDialog.visible = false">取消</el-button>
+        <el-button type="primary" :loading="loading" @click="saveBatchMetadata">保存</el-button>
+      </template>
+    </el-dialog>
+
     <el-dialog v-model="viewAccessDialog.visible" title="可查看范围" width="620px">
       <el-form label-position="top">
         <el-form-item label="文件/文件夹">
@@ -986,6 +1179,8 @@
         <el-descriptions-item label="类型">{{ metadataDialog.node?.nodeType === 'folder' ? '文件夹' : metadataDialog.node?.extension || '文件' }}</el-descriptions-item>
         <el-descriptions-item label="路径">{{ metadataDialog.node?.fullPath || '-' }}</el-descriptions-item>
         <el-descriptions-item label="大小">{{ metadataDialog.node?.currentVersion ? formatSize(metadataDialog.node.currentVersion.sizeBytes) : '-' }}</el-descriptions-item>
+        <el-descriptions-item label="密级">{{ securityLevelLabel(metadataDialog.node) }}</el-descriptions-item>
+        <el-descriptions-item label="敏感标识">{{ metadataDialog.node?.sensitive ? '敏感文件' : '普通文件' }}</el-descriptions-item>
         <el-descriptions-item label="创建时间">{{ formatDate(metadataDialog.node?.createdAt) }}</el-descriptions-item>
         <el-descriptions-item label="更新时间">{{ formatDate(metadataDialog.node?.updatedAt) }}</el-descriptions-item>
       </el-descriptions>
@@ -1098,13 +1293,23 @@
     </el-dialog>
 
     <el-dialog v-model="previewDialog.visible" :title="previewDialog.node?.name || '预览'" width="80%">
-      <div class="preview-box">
+      <div class="preview-box" :class="{ 'has-watermark': previewDialog.data?.watermark?.enabled }">
         <iframe v-if="previewDialog.data?.previewType === 'pdf'" class="preview-frame" :src="previewDialog.data.rawUrl" title="PDF预览" />
         <img v-else-if="previewDialog.data?.previewType === 'image'" class="preview-image" :src="previewDialog.data.rawUrl" alt="文件预览" />
         <pre v-else-if="previewDialog.data?.previewType === 'text'" class="preview-text">{{ previewDialog.data.content }}</pre>
         <el-empty v-else description="该格式暂不支持浏览器预览，请下载后查看">
           <el-button :icon="Download" type="primary" @click="downloadNode(previewDialog.node)">下载文件</el-button>
         </el-empty>
+        <div
+          v-if="previewDialog.data?.watermark?.enabled"
+          class="preview-watermark"
+          aria-hidden="true"
+        >
+          <span v-for="index in 36" :key="index">{{ previewDialog.data.watermark.text }}</span>
+        </div>
+        <div v-if="previewDialog.data?.officePreview" class="preview-service-note">
+          {{ previewDialog.data.officePreview.message }}
+        </div>
       </div>
     </el-dialog>
 
@@ -1239,6 +1444,7 @@ import { api, downloadFile, getToken, setToken } from './api.js';
 import {
   AnnouncementsView as AnnouncementsViewPanel,
   ApiManagementView as ApiManagementViewPanel,
+  ApprovalCenterView as ApprovalCenterViewPanel,
   AuditView as AuditViewPanel,
   CollaborationView as CollaborationViewPanel,
   DashboardView as DashboardViewPanel,
@@ -1288,6 +1494,12 @@ const permissionTemplates = ref([]);
 const filePolicy = ref({ allowedExtensions: [], maxSizeMb: 300 });
 const externalLibrary = ref({ rootPath: '', lastSyncedAt: null, lastSyncSummary: null });
 const storageSettings = ref(null);
+const securityPolicy = ref(null);
+const wecomSettings = ref(null);
+const approvalTodo = ref([]);
+const approvalMine = ref([]);
+const approvalAll = ref([]);
+const recentAccesses = ref([]);
 const nodeUnlockTokens = reactive({});
 
 const folderDialog = reactive({ visible: false, name: '' });
@@ -1352,6 +1564,52 @@ const storageDialog = reactive({
   testResult: null,
   form: { provider: 'json', host: '', port: 3306, database: '', user: '', password: '', ssl: false }
 });
+const securityDialog = reactive({ visible: false, node: null, form: { securityLevel: 'internal', sensitive: false, sensitiveReason: '' } });
+const securityPolicyDialog = reactive({
+  visible: false,
+  form: {
+    enablePreviewWatermark: true,
+    enableDownloadWatermark: false,
+    blockSensitiveDownload: true,
+    allowAdminBypass: true,
+    logSensitiveAccess: true,
+    watermarkTextMode: 'user',
+    customWatermarkText: '',
+    requireDownloadApprovalForSensitive: false,
+    requirePublishApproval: true,
+    requirePermissionApproval: true
+  }
+});
+const wecomDialog = reactive({
+  visible: false,
+  form: {
+    enabled: false,
+    corpId: '',
+    agentId: '',
+    secret: '',
+    callbackUrl: '',
+    syncDepartments: true,
+    syncUsers: true,
+    pushMessages: false
+  }
+});
+const approvalRequestDialog = reactive({
+  visible: false,
+  node: null,
+  type: 'download',
+  approverId: '',
+  requestedActions: ['file:download'],
+  reason: ''
+});
+const batchMetadataDialog = reactive({
+  visible: false,
+  rows: [],
+  tagsText: '',
+  businessStatus: '',
+  securityLevel: '',
+  sensitiveMode: 'keep',
+  sensitiveReason: ''
+});
 const viewAccessDialog = reactive({ visible: false, node: null, restricted: false, userIds: [], departmentIds: [], roleIds: [] });
 const nodePasswordDialog = reactive({ visible: false, node: null, enabled: false, password: '', confirmPassword: '' });
 const unlockDialog = reactive({ visible: false, node: null, nodeName: '', password: '', retry: null, resolve: null, reject: null });
@@ -1371,6 +1629,7 @@ const navItems = [
   { key: 'trash', label: '回收站', icon: Trash2 },
   { key: 'messages', label: '消息中心', icon: Bell },
   { key: 'collaboration', label: '协作中心', icon: Share2 },
+  { key: 'approvals', label: '审批中心', icon: ClipboardCheck },
   { key: 'announcements', label: '公告管理', icon: Bell },
   { key: 'api', label: '开放 API', icon: Shield },
   { key: 'system', label: '系统管理', icon: Settings },
@@ -1398,6 +1657,12 @@ const workflowActionOptions = [
   { label: '发布', value: 'publish' },
   { label: '作废', value: 'invalidate' },
   { label: '归档', value: 'archive' }
+];
+const securityLevelOptions = [
+  { label: '公开', value: 'public' },
+  { label: '内部', value: 'internal' },
+  { label: '受限', value: 'restricted' },
+  { label: '机密', value: 'confidential' }
 ];
 const reminderCycles = [
   { label: '不循环', value: 'none' },
@@ -1482,6 +1747,11 @@ function userName(userId) {
 
 function businessStatusLabel(status) {
   return { draft: '草稿', effective: '有效', invalid: '作废', archived: '归档' }[status] || status || '-';
+}
+
+function securityLevelLabel(nodeOrLevel) {
+  const level = typeof nodeOrLevel === 'string' ? nodeOrLevel : nodeOrLevel?.securityLevel;
+  return { public: '公开', internal: '内部', restricted: '受限', confidential: '机密' }[level] || '-';
 }
 
 function approvalStatusLabel(status) {
@@ -1599,8 +1869,8 @@ async function bootstrap() {
   user.value = me.user;
   actions.value = me.actions;
   if (adminOnlyViews.has(activeView.value) && !isAdminUser.value) activeView.value = 'dashboard';
-  const commonLoads = [loadOrg(), loadUsers(), loadKnowledge(), loadDashboard(), loadDocTree(), loadMessages(), loadCollaboration()];
-  const adminLoads = isAdminUser.value ? [loadAnnouncements(), loadAudit(), loadExternalLibrary()] : [];
+  const commonLoads = [loadOrg(), loadUsers(), loadKnowledge(), loadDashboard(), loadDocTree(), loadMessages(), loadCollaboration(), loadRecentAccess(), loadApprovals()];
+  const adminLoads = isAdminUser.value ? [loadAnnouncements(), loadAudit(), loadExternalLibrary(), loadSecurityPolicy(), loadWecomSettings()] : [];
   await Promise.all([...commonLoads, ...adminLoads]);
 }
 
@@ -1731,6 +2001,32 @@ async function loadStorageSettings() {
   storageSettings.value = await api('/system-settings/storage');
 }
 
+async function loadSecurityPolicy() {
+  if (!isAdminUser.value) return;
+  securityPolicy.value = await api('/system-settings/security-policy');
+}
+
+async function loadWecomSettings() {
+  if (!isAdminUser.value) return;
+  wecomSettings.value = await api('/system-settings/wecom');
+}
+
+async function loadApprovals() {
+  const [todo, mine, all] = await Promise.all([
+    api('/approvals?scope=todo&pageSize=200'),
+    api('/approvals?scope=mine&pageSize=200'),
+    isAdminUser.value ? api('/approvals?scope=all&pageSize=200') : Promise.resolve({ items: [] })
+  ]);
+  approvalTodo.value = todo.items || [];
+  approvalMine.value = mine.items || [];
+  approvalAll.value = all.items || [];
+}
+
+async function loadRecentAccess() {
+  const page = await api('/recent-access?pageSize=10');
+  recentAccesses.value = page.items || [];
+}
+
 async function loadSystemManagement() {
   if (!isAdminUser.value) return;
   await Promise.all([
@@ -1738,7 +2034,9 @@ async function loadSystemManagement() {
     loadAudit(),
     loadApiManagement(),
     loadExternalLibrary(),
-    loadStorageSettings()
+    loadStorageSettings(),
+    loadSecurityPolicy(),
+    loadWecomSettings()
   ]);
 }
 
@@ -1766,6 +2064,7 @@ async function refreshCurrent() {
   if (activeView.value === 'trash') await loadTrash();
   if (activeView.value === 'messages') await loadMessages();
   if (activeView.value === 'collaboration') await loadCollaboration();
+  if (activeView.value === 'approvals') await loadApprovals();
   if (activeView.value === 'announcements' && isAdminUser.value) await loadAnnouncements();
   if (activeView.value === 'api' && isAdminUser.value) {
     await loadUsers();
@@ -1856,21 +2155,64 @@ async function downloadNode(node, versionId = null) {
     ElMessage.warning('当前文件没有可下载版本');
     return;
   }
-  await runWithPasswordUnlock(node, async () => {
-    if (node.nodeType === 'folder') {
-      await downloadFile('/files/batch-download', `${node.name}.zip`, { nodeIds: [node.id] }, { headers: nodeUnlockHeaders() });
+  try {
+    await runWithPasswordUnlock(node, async () => {
+      if (node.nodeType === 'folder') {
+        await downloadFile('/files/batch-download', `${node.name}.zip`, { nodeIds: [node.id] }, { headers: nodeUnlockHeaders() });
+        return;
+      }
+      const suffix = versionId ? `?versionId=${encodeURIComponent(versionId)}` : '';
+      await downloadFile(`/files/${node.id}/download${suffix}`, node.name, null, { headers: nodeUnlockHeaders() });
+    });
+    await loadRecentAccess();
+  } catch (error) {
+    if (error.code === 'SENSITIVE_DOWNLOAD_BLOCKED') {
+      openDownloadApprovalDialog(node);
       return;
     }
-    const suffix = versionId ? `?versionId=${encodeURIComponent(versionId)}` : '';
-    await downloadFile(`/files/${node.id}/download${suffix}`, node.name, null, { headers: nodeUnlockHeaders() });
-  });
+    throw error;
+  }
 }
 
 async function batchDownload(rows) {
   if (!rows.length) return ElMessage.warning('请选择要下载的文件或文件夹');
-  await runWithPasswordUnlock(rows[0], async () => {
-    await downloadFile('/files/batch-download', '文档打包下载.zip', { nodeIds: rows.map((item) => item.id) }, { headers: nodeUnlockHeaders() });
-  });
+  try {
+    await runWithPasswordUnlock(rows[0], async () => {
+      await downloadFile('/files/batch-download', '文档打包下载.zip', { nodeIds: rows.map((item) => item.id) }, { headers: nodeUnlockHeaders() });
+    });
+    await loadRecentAccess();
+  } catch (error) {
+    if (error.code === 'SENSITIVE_DOWNLOAD_BLOCKED') {
+      ElMessage.warning(error.message || '批量下载中包含受控敏感文件');
+      return;
+    }
+    throw error;
+  }
+}
+
+function openBatchMetadataDialog(rows) {
+  if (!rows.length) return ElMessage.warning('请选择要批量编辑的文件或文件夹');
+  batchMetadataDialog.rows = rows;
+  batchMetadataDialog.tagsText = '';
+  batchMetadataDialog.businessStatus = '';
+  batchMetadataDialog.securityLevel = '';
+  batchMetadataDialog.sensitiveMode = 'keep';
+  batchMetadataDialog.sensitiveReason = '';
+  batchMetadataDialog.visible = true;
+}
+
+async function saveBatchMetadata() {
+  const body = { nodeIds: batchMetadataDialog.rows.map((item) => item.id) };
+  const tags = String(batchMetadataDialog.tagsText || '').split(/[,\s，]+/).map((item) => item.trim()).filter(Boolean);
+  if (tags.length) body.tags = tags;
+  if (batchMetadataDialog.businessStatus) body.businessStatus = batchMetadataDialog.businessStatus;
+  if (batchMetadataDialog.securityLevel) body.securityLevel = batchMetadataDialog.securityLevel;
+  if (batchMetadataDialog.sensitiveMode !== 'keep') body.sensitive = batchMetadataDialog.sensitiveMode === 'true';
+  if (batchMetadataDialog.sensitiveReason.trim()) body.sensitiveReason = batchMetadataDialog.sensitiveReason.trim();
+  await api('/nodes/batch-metadata', { method: 'PUT', headers: nodeUnlockHeaders(), body });
+  batchMetadataDialog.visible = false;
+  ElMessage.success('批量属性已更新');
+  await refreshCurrent();
 }
 
 function openMoveDialog(node, mode = 'move') {
@@ -1938,6 +2280,7 @@ async function previewNode(node, versionId = null) {
     previewDialog.data = await api(`/files/${node.id}/preview${suffix}`, { headers: nodeUnlockHeaders() });
     previewDialog.visible = true;
     await markUploadMessagesRead(node);
+    await loadRecentAccess();
   });
 }
 
@@ -2088,6 +2431,49 @@ async function decideWorkflowApproval(row, decision) {
   ElMessage.success(decision === 'approve' ? '已通过审批' : '已驳回审批');
   await loadWorkflowDialogData();
   await Promise.all([loadMessages(), refreshCurrent()]);
+}
+
+async function decideGeneralApproval(row, decision) {
+  const { value } = await ElMessageBox.prompt('请输入处理说明', decision === 'approve' ? '审批通过' : '审批驳回', {
+    inputValue: '',
+    inputPlaceholder: '可选'
+  });
+  await api(`/approvals/${row.id}/${decision}`, {
+    method: 'POST',
+    headers: nodeUnlockHeaders(),
+    body: { comment: value || '' }
+  });
+  ElMessage.success(decision === 'approve' ? '已通过审批' : '已驳回审批');
+  await Promise.all([loadApprovals(), loadMessages(), refreshCurrent()]);
+}
+
+function openApprovalRequest(node, type = 'download') {
+  approvalRequestDialog.node = node;
+  approvalRequestDialog.type = type;
+  approvalRequestDialog.approverId = defaultWorkflowApproverId();
+  approvalRequestDialog.requestedActions = type === 'permission' ? ['visible', 'file:preview'] : ['file:download'];
+  approvalRequestDialog.reason = type === 'download' && node?.sensitive ? '因工作需要申请下载敏感文件' : '';
+  approvalRequestDialog.visible = true;
+}
+
+function openDownloadApprovalDialog(node) {
+  openApprovalRequest(node, 'download');
+}
+
+async function submitApprovalRequest() {
+  if (!approvalRequestDialog.node) return;
+  if (!approvalRequestDialog.approverId) return ElMessage.warning('请选择审批人');
+  const body = {
+    nodeId: approvalRequestDialog.node.id,
+    type: approvalRequestDialog.type,
+    approverId: approvalRequestDialog.approverId,
+    reason: approvalRequestDialog.reason
+  };
+  if (approvalRequestDialog.type === 'permission') body.requestedActions = approvalRequestDialog.requestedActions;
+  await api('/approvals', { method: 'POST', headers: nodeUnlockHeaders(), body });
+  approvalRequestDialog.visible = false;
+  ElMessage.success('审批申请已提交');
+  await Promise.all([loadApprovals(), loadMessages()]);
 }
 
 async function openPermissionDialog(node) {
@@ -2375,6 +2761,85 @@ async function syncStorageToMysql() {
   } finally {
     loading.value = false;
   }
+}
+
+function openSecurityDialog(node) {
+  securityDialog.node = node;
+  securityDialog.form = {
+    securityLevel: node.securityLevel || 'internal',
+    sensitive: Boolean(node.sensitive),
+    sensitiveReason: node.sensitiveReason || ''
+  };
+  securityDialog.visible = true;
+}
+
+async function saveNodeSecurity() {
+  if (!securityDialog.node) return;
+  loading.value = true;
+  try {
+    const updated = await api(`/nodes/${securityDialog.node.id}/security`, {
+      method: 'PUT',
+      headers: nodeUnlockHeaders(),
+      body: securityDialog.form
+    });
+    securityDialog.visible = false;
+    ElMessage.success('安全设置已保存');
+    metadataDialog.node = metadataDialog.node?.id === updated.id ? updated : metadataDialog.node;
+    await refreshCurrent();
+  } finally {
+    loading.value = false;
+  }
+}
+
+async function openSecurityPolicyDialog() {
+  await loadSecurityPolicy();
+  securityPolicyDialog.form = { ...securityPolicyDialog.form, ...(securityPolicy.value || {}) };
+  securityPolicyDialog.visible = true;
+}
+
+async function saveSecurityPolicy() {
+  loading.value = true;
+  try {
+    securityPolicy.value = await api('/system-settings/security-policy', { method: 'PUT', body: securityPolicyDialog.form });
+    securityPolicyDialog.visible = false;
+    ElMessage.success('安全策略已保存');
+    await loadSystemManagement();
+  } finally {
+    loading.value = false;
+  }
+}
+
+async function openWecomDialog() {
+  await loadWecomSettings();
+  wecomDialog.form = {
+    enabled: Boolean(wecomSettings.value?.enabled),
+    corpId: wecomSettings.value?.corpId || '',
+    agentId: wecomSettings.value?.agentId || '',
+    secret: '',
+    callbackUrl: wecomSettings.value?.callbackUrl || '/api/v1/wecom/auth/callback',
+    syncDepartments: wecomSettings.value?.syncDepartments !== false,
+    syncUsers: wecomSettings.value?.syncUsers !== false,
+    pushMessages: Boolean(wecomSettings.value?.pushMessages)
+  };
+  wecomDialog.visible = true;
+}
+
+async function saveWecomSettings() {
+  loading.value = true;
+  try {
+    wecomSettings.value = await api('/system-settings/wecom', { method: 'PUT', body: wecomDialog.form });
+    wecomDialog.visible = false;
+    ElMessage.success('企业微信配置已保存');
+    await loadSystemManagement();
+  } finally {
+    loading.value = false;
+  }
+}
+
+async function testWecomSettings() {
+  const result = await api('/system-settings/wecom/test', { method: 'POST' });
+  ElMessage[result.ok ? 'success' : 'warning'](result.message);
+  await loadWecomSettings();
 }
 
 async function syncExternalLibrary() {

@@ -45,6 +45,11 @@ function rootFolder(id, name, parentId = null, createdBy = 'u_admin') {
     lockedAt: null,
     status: 'normal',
     businessStatus: 'effective',
+    securityLevel: 'internal',
+    sensitive: false,
+    sensitiveReason: '',
+    securityUpdatedBy: null,
+    securityUpdatedAt: null,
     createdAt: timestamp,
     updatedAt: timestamp,
     deletedAt: null
@@ -223,6 +228,7 @@ export function createInitialDb() {
     apiCallLogs: [],
     loginTickets: [],
     externalSyncJobs: [],
+    recentAccesses: [],
     settings: {
       filePolicy: {
         allowedExtensions: ['doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'pdf', 'txt', 'md', 'csv', 'json', 'xml', 'html', 'png', 'jpg', 'jpeg', 'gif', 'zip'],
@@ -235,6 +241,30 @@ export function createInitialDb() {
         lastSyncedAt: null,
         lastSyncSummary: null,
         lastSyncJob: null
+      },
+      securityPolicy: {
+        enablePreviewWatermark: true,
+        enableDownloadWatermark: false,
+        blockSensitiveDownload: true,
+        allowAdminBypass: true,
+        logSensitiveAccess: true,
+        watermarkTextMode: 'user',
+        customWatermarkText: '',
+        requireDownloadApprovalForSensitive: false,
+        requirePublishApproval: true,
+        requirePermissionApproval: true
+      },
+      wecom: {
+        enabled: false,
+        corpId: '',
+        agentId: '',
+        secret: '',
+        callbackUrl: '',
+        syncDepartments: true,
+        syncUsers: true,
+        pushMessages: false,
+        lastTestAt: null,
+        lastTestResult: null
       }
     }
   };

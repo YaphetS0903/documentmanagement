@@ -86,10 +86,36 @@ export const DashboardView = {
 };
 
 export const DocsView = {
-  props: ['tree', 'children', 'selectedFolder', 'users', 'departments', 'roles', 'formatDate', 'formatSize', 'actions', 'spaceSummary', 'isAdmin', 'enableSync'],
-  emits: ['select-folder', 'create-folder', 'upload', 'rename', 'delete', 'download', 'preview', 'versions', 'lock', 'unlock', 'favorite', 'permissions', 'view-access', 'node-password', 'sync-external', 'search', 'batch-download', 'batch-move', 'batch-delete', 'move', 'copy', 'copy-enterprise', 'share', 'subscribe', 'reminder', 'metadata', 'links', 'workflow'],
-  data: () => ({ keyword: '', selection: [], filtersVisible: false, fileTypesText: '', creatorId: '', updatedRange: [], sortBy: 'updatedAt', sortDir: 'desc', page: 1, pageSize: 20 }),
+  props: ['tree', 'children', 'selectedFolder', 'users', 'departments', 'roles', 'formatDate', 'formatSize', 'actions', 'spaceSummary', 'isAdmin', 'enableSync', 'recentAccesses'],
+  emits: ['select-folder', 'create-folder', 'upload', 'rename', 'delete', 'download', 'preview', 'versions', 'lock', 'unlock', 'favorite', 'permissions', 'view-access', 'node-password', 'sync-external', 'search', 'batch-download', 'batch-move', 'batch-delete', 'batch-metadata', 'move', 'copy', 'copy-enterprise', 'share', 'subscribe', 'reminder', 'metadata', 'links', 'workflow', 'security', 'request-download'],
+  data: () => ({
+    keyword: '',
+    treeKeyword: '',
+    selection: [],
+    filtersVisible: false,
+    fileTypesText: '',
+    creatorId: '',
+    updatedRange: [],
+    sortBy: 'updatedAt',
+    sortDir: 'desc',
+    page: 1,
+    pageSize: 20,
+    savedFilterName: '',
+    selectedFilterName: '',
+    savedFilters: [],
+    columnPrefs: { size: true, version: true, security: true, creator: true, updatedAt: true, permissions: true }
+  }),
   computed: {
+    filteredTree() {
+      const keyword = String(this.treeKeyword || '').trim().toLowerCase();
+      if (!keyword) return this.tree || [];
+      const filterNode = (node) => {
+        const children = (node.children || []).map(filterNode).filter(Boolean);
+        const matched = String(`${node.name} ${node.fullPath || ''}`).toLowerCase().includes(keyword);
+        return matched || children.length ? { ...node, children } : null;
+      };
+      return (this.tree || []).map(filterNode).filter(Boolean);
+    },
     pagedChildren() {
       const start = (this.page - 1) * this.pageSize;
       return (this.children || []).slice(start, start + this.pageSize);
@@ -103,6 +129,9 @@ export const DocsView = {
       this.page = 1;
       this.selection = [];
     }
+  },
+  mounted() {
+    this.loadLocalPrefs();
   },
   components: {
     Folder: FolderIcon,
@@ -137,6 +166,53 @@ export const DocsView = {
     canDownload(row) {
       if (!row) return false;
       return row.nodeType === 'folder' ? this.can(row, 'visible') : this.can(row, 'file:download');
+    },
+    downloadBlocked(row) {
+      return row?.nodeType === 'file' && row.sensitiveDownloadBlocked;
+    },
+    securityLevelLabel(row) {
+      return row.securityLevelLabel || { public: '公开', internal: '内部', restricted: '受限', confidential: '机密' }[row.securityLevel] || '-';
+    },
+    securityTagType(row) {
+      return { public: 'success', internal: 'info', restricted: 'warning', confidential: 'danger' }[row.securityLevel] || 'info';
+    },
+    loadLocalPrefs() {
+      try {
+        const rawColumns = localStorage.getItem('document_platform_column_prefs');
+        if (rawColumns) this.columnPrefs = { ...this.columnPrefs, ...JSON.parse(rawColumns) };
+        this.savedFilters = JSON.parse(localStorage.getItem('document_platform_saved_filters') || '[]');
+      } catch {
+        this.savedFilters = [];
+      }
+    },
+    saveColumnPrefs() {
+      localStorage.setItem('document_platform_column_prefs', JSON.stringify(this.columnPrefs));
+    },
+    saveCurrentFilter() {
+      const name = String(this.savedFilterName || '').trim();
+      if (!name) return;
+      const filter = {
+        name,
+        fileTypesText: this.fileTypesText,
+        creatorId: this.creatorId,
+        updatedRange: this.updatedRange,
+        sortBy: this.sortBy,
+        sortDir: this.sortDir
+      };
+      this.savedFilters = [...this.savedFilters.filter((item) => item.name !== name), filter];
+      localStorage.setItem('document_platform_saved_filters', JSON.stringify(this.savedFilters));
+      this.selectedFilterName = name;
+      this.savedFilterName = '';
+    },
+    applySavedFilter(name) {
+      const filter = this.savedFilters.find((item) => item.name === name);
+      if (!filter) return;
+      this.fileTypesText = filter.fileTypesText || '';
+      this.creatorId = filter.creatorId || '';
+      this.updatedRange = filter.updatedRange || [];
+      this.sortBy = filter.sortBy || 'updatedAt';
+      this.sortDir = filter.sortDir || 'desc';
+      this.runSearch();
     },
     userName(userId) {
       const user = (this.users || []).find((item) => item.id === userId);
@@ -188,6 +264,7 @@ export const DocsView = {
         open: () => this.openRow(row),
         preview: () => this.$emit('preview', row),
         download: () => this.$emit('download', row),
+        requestDownload: () => this.$emit('request-download', row),
         rename: () => this.$emit('rename', row),
         move: () => this.$emit('move', row, 'move'),
         copy: () => this.$emit('copy', row, 'copy'),
@@ -204,6 +281,7 @@ export const DocsView = {
         unlock: () => this.$emit('unlock', row),
         favorite: () => this.$emit('favorite', row),
         permissions: () => this.$emit('permissions', row),
+        security: () => this.$emit('security', row),
         viewAccess: () => this.$emit('view-access', row),
         password: () => this.$emit('node-password', row),
         delete: () => this.$emit('delete', row)
@@ -240,7 +318,8 @@ export const DocsView = {
           <h2 class="section-title">目录</h2>
           <el-button :icon="Plus" circle aria-label="新建文件夹" @click="$emit('create-folder')" />
         </div>
-        <el-tree :data="tree" node-key="id" :props="{ label: 'name', children: 'children' }" @node-click="$emit('select-folder', $event)">
+        <el-input v-model="treeKeyword" class="tree-search-input" clearable placeholder="搜索目录" />
+        <el-tree :data="filteredTree" node-key="id" :props="{ label: 'name', children: 'children' }" @node-click="$emit('select-folder', $event)">
           <template #default="{ data }">
             <span class="tree-node-label" :title="data.fullPath || data.name">
               <span class="tree-node-text">{{ data.name }}</span>
@@ -261,6 +340,12 @@ export const DocsView = {
           <div><span>版本</span><strong>{{ spaceSummary.versions || 0 }}</strong></div>
           <div><span>占用空间</span><strong>{{ formatSize(spaceSummary.sizeBytes || 0) }}</strong></div>
         </div>
+        <div v-if="recentAccesses?.length" class="recent-access-strip">
+          <span>最近访问</span>
+          <button v-for="item in recentAccesses.slice(0, 5)" :key="item.id" type="button" :title="item.nodePath" @click="$emit('preview', item.node)">
+            {{ item.nodeName || item.node?.name }}
+          </button>
+        </div>
         <div class="toolbar docs-toolbar">
           <div class="docs-actions">
             <el-button type="primary" :icon="UploadCloud" @click="$emit('upload')">上传</el-button>
@@ -272,24 +357,40 @@ export const DocsView = {
                 <el-dropdown-menu v-if="singleSelection" class="docs-more-menu">
                   <el-dropdown-item v-if="singleSelection.nodeType === 'folder'" :command="{ action: 'open', row: singleSelection }">打开文件夹</el-dropdown-item>
                   <el-dropdown-item v-if="singleSelection.nodeType === 'file'" :command="{ action: 'preview', row: singleSelection }" :disabled="!can(singleSelection, 'file:preview')">预览</el-dropdown-item>
-                  <el-dropdown-item :command="{ action: 'download', row: singleSelection }" :disabled="!canDownload(singleSelection)">{{ singleSelection.nodeType === 'folder' ? '打包下载' : '下载' }}</el-dropdown-item>
+                  <el-dropdown-item v-if="!downloadBlocked(singleSelection)" :command="{ action: 'download', row: singleSelection }" :disabled="!canDownload(singleSelection)">{{ singleSelection.nodeType === 'folder' ? '打包下载' : '下载' }}</el-dropdown-item>
+                  <el-dropdown-item v-if="downloadBlocked(singleSelection)" :command="{ action: 'requestDownload', row: singleSelection }">申请下载</el-dropdown-item>
                   <el-dropdown-item v-if="singleSelection.nodeType === 'file'" :command="{ action: 'versions', row: singleSelection }">版本</el-dropdown-item>
                   <el-dropdown-item :command="{ action: 'rename', row: singleSelection }" :disabled="!canModify(singleSelection)">重命名</el-dropdown-item>
                   <el-dropdown-item :command="{ action: 'move', row: singleSelection }" :disabled="!canModify(singleSelection)">移动</el-dropdown-item>
                   <el-dropdown-item :command="{ action: 'copy', row: singleSelection }">复制</el-dropdown-item>
                   <el-dropdown-item v-if="singleSelection.spaceType === 'personal'" :command="{ action: 'copyEnterprise', row: singleSelection }">复制到文档库</el-dropdown-item>
                   <el-dropdown-item v-if="can(singleSelection, 'permission:manage')" :command="{ action: 'permissions', row: singleSelection }">权限</el-dropdown-item>
+                  <el-dropdown-item :command="{ action: 'security', row: singleSelection }" :disabled="!canModify(singleSelection)">安全设置</el-dropdown-item>
                   <el-dropdown-item v-if="can(singleSelection, 'file:delete')" :command="{ action: 'delete', row: singleSelection }" divided>删除</el-dropdown-item>
                 </el-dropdown-menu>
               </template>
             </el-dropdown>
             <el-button :icon="Download" :disabled="!selection.length" @click="$emit('batch-download', selection)">下载</el-button>
             <el-button :disabled="!selection.length" @click="$emit('batch-move', selection)">移动</el-button>
+            <el-button :disabled="!selection.length" @click="$emit('batch-metadata', selection)">批量属性</el-button>
             <el-button type="danger" :icon="Trash2" :disabled="!selection.length" @click="$emit('batch-delete', selection)">删除</el-button>
           </div>
           <div class="docs-search-tools">
             <span class="selection-hint">{{ selection.length ? '已选 ' + selection.length + ' 项' : '未选择项目' }}</span>
             <el-button @click="filtersVisible = !filtersVisible">筛选</el-button>
+            <el-dropdown trigger="click" @command="saveColumnPrefs">
+              <el-button>列</el-button>
+              <template #dropdown>
+                <el-dropdown-menu class="docs-more-menu">
+                  <el-checkbox v-model="columnPrefs.size" label="大小" @change="saveColumnPrefs" />
+                  <el-checkbox v-model="columnPrefs.version" label="版本" @change="saveColumnPrefs" />
+                  <el-checkbox v-model="columnPrefs.security" label="安全" @change="saveColumnPrefs" />
+                  <el-checkbox v-model="columnPrefs.creator" label="创建者" @change="saveColumnPrefs" />
+                  <el-checkbox v-model="columnPrefs.updatedAt" label="修改时间" @change="saveColumnPrefs" />
+                  <el-checkbox v-model="columnPrefs.permissions" label="权限" @change="saveColumnPrefs" />
+                </el-dropdown-menu>
+              </template>
+            </el-dropdown>
             <el-input v-model="keyword" placeholder="搜索当前目录文件" clearable @keyup.enter="runSearch">
               <template #append>
                 <el-button aria-label="搜索" @click="runSearch"><Search class="toolbar-icon" /></el-button>
@@ -322,6 +423,11 @@ export const DocsView = {
             <el-option label="升序" value="asc" />
           </el-select>
           <el-button :icon="Search" @click="runSearch">应用筛选</el-button>
+          <el-select v-model="selectedFilterName" clearable placeholder="已保存筛选" style="max-width: 180px" @change="applySavedFilter">
+            <el-option v-for="item in savedFilters" :key="item.name" :label="item.name" :value="item.name" />
+          </el-select>
+          <el-input v-model="savedFilterName" placeholder="筛选名称" style="max-width: 150px" />
+          <el-button @click="saveCurrentFilter">保存筛选</el-button>
         </div>
         <div class="path-strip">当前位置：{{ selectedFolder?.fullPath || '/' }}</div>
         <el-table
@@ -350,6 +456,8 @@ export const DocsView = {
                   aria-label="有未读新文件"
                 ></span>
                 <el-tag v-if="row.sourceType === 'external'" size="small" type="success">同步</el-tag>
+                <el-tag v-if="row.sensitive" size="small" type="danger">敏感</el-tag>
+                <el-tag v-if="row.sensitiveDownloadBlocked" size="small" type="warning">限下载</el-tag>
                 <el-tag v-if="row.pendingApprovalCount" size="small" type="warning">审批 {{ row.pendingApprovalCount }}</el-tag>
                 <el-tag v-if="row.passwordProtected" size="small" type="danger">加密</el-tag>
                 <el-tag v-if="row.lockedBy" size="small" type="warning">锁定</el-tag>
@@ -357,19 +465,24 @@ export const DocsView = {
               </div>
             </template>
           </el-table-column>
-          <el-table-column label="大小" width="90">
+          <el-table-column v-if="columnPrefs.size" label="大小" width="90">
             <template #default="{ row }">{{ row.currentVersion ? formatSize(row.currentVersion.sizeBytes) : '-' }}</template>
           </el-table-column>
-          <el-table-column label="版本" width="70">
+          <el-table-column v-if="columnPrefs.version" label="版本" width="70">
             <template #default="{ row }">{{ versionLabel(row) }}</template>
           </el-table-column>
-          <el-table-column label="创建者" width="110">
+          <el-table-column v-if="columnPrefs.security" label="安全" width="110">
+            <template #default="{ row }">
+              <el-tag size="small" :type="securityTagType(row)">{{ securityLevelLabel(row) }}</el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column v-if="columnPrefs.creator" label="创建者" width="110">
             <template #default="{ row }">{{ userName(row.createdBy || row.ownerId) }}</template>
           </el-table-column>
-          <el-table-column label="修改时间" width="150">
+          <el-table-column v-if="columnPrefs.updatedAt" label="修改时间" width="150">
             <template #default="{ row }">{{ formatDate(row.updatedAt) }}</template>
           </el-table-column>
-          <el-table-column label="我的权限" min-width="120">
+          <el-table-column v-if="columnPrefs.permissions" label="我的权限" min-width="120">
             <template #default="{ row }">
               <span class="permission-summary" :title="permissionSummary(row)">{{ permissionSummary(row) }}</span>
             </template>
@@ -484,6 +597,78 @@ export const CollaborationView = {
                 <el-button size="small" type="danger" :disabled="row.status !== 'active'" @click="$emit('cancel-reminder', row)">取消</el-button>
               </template>
             </el-table-column>
+          </el-table>
+        </el-tab-pane>
+      </el-tabs>
+    </section>
+  `
+};
+
+export const ApprovalCenterView = {
+  props: ['todo', 'mine', 'all', 'formatDate'],
+  emits: ['approve', 'reject', 'refresh'],
+  data: () => ({ activeTab: 'todo' }),
+  components: { RefreshCwIcon },
+  methods: {
+    statusLabel(status) {
+      return { pending: '待审批', approved: '已通过', rejected: '已驳回', cancelled: '已取消' }[status] || status || '-';
+    },
+    statusTag(status) {
+      return { pending: 'warning', approved: 'success', rejected: 'danger', cancelled: 'info' }[status] || 'info';
+    },
+    securityLabel(row) {
+      if (!row.nodeSensitive && !row.nodeSecurityLevel) return '-';
+      const level = { public: '公开', internal: '内部', restricted: '受限', confidential: '机密' }[row.nodeSecurityLevel] || row.nodeSecurityLevel || '';
+      return row.nodeSensitive ? `${level} / 敏感` : level;
+    }
+  },
+  template: `
+    <section class="section">
+      <div class="section-header">
+        <h2 class="section-title">审批中心</h2>
+        <el-button :icon="RefreshCwIcon" @click="$emit('refresh')">刷新</el-button>
+      </div>
+      <el-tabs v-model="activeTab">
+        <el-tab-pane label="待我审批" name="todo">
+          <el-table :data="todo" border height="calc(100dvh - 220px)">
+            <el-table-column prop="typeLabel" label="类型" width="110" />
+            <el-table-column prop="actionLabel" label="动作" width="110" />
+            <el-table-column prop="nodePath" label="文件/文件夹" min-width="260" />
+            <el-table-column label="安全" width="120"><template #default="{ row }">{{ securityLabel(row) }}</template></el-table-column>
+            <el-table-column prop="requesterName" label="申请人" width="120" />
+            <el-table-column prop="requestComment" label="申请说明" min-width="180" />
+            <el-table-column label="状态" width="100"><template #default="{ row }"><el-tag :type="statusTag(row.status)">{{ statusLabel(row.status) }}</el-tag></template></el-table-column>
+            <el-table-column label="时间" width="170"><template #default="{ row }">{{ formatDate(row.createdAt) }}</template></el-table-column>
+            <el-table-column label="操作" width="150" fixed="right">
+              <template #default="{ row }">
+                <el-button v-if="row.canDecide" size="small" type="primary" @click="$emit('approve', row)">通过</el-button>
+                <el-button v-if="row.canDecide" size="small" type="danger" @click="$emit('reject', row)">驳回</el-button>
+                <span v-if="!row.canDecide" class="muted">-</span>
+              </template>
+            </el-table-column>
+          </el-table>
+        </el-tab-pane>
+        <el-tab-pane label="我的申请" name="mine">
+          <el-table :data="mine" border height="calc(100dvh - 220px)">
+            <el-table-column prop="typeLabel" label="类型" width="110" />
+            <el-table-column prop="actionLabel" label="动作" width="110" />
+            <el-table-column prop="nodePath" label="文件/文件夹" min-width="280" />
+            <el-table-column prop="approverName" label="审批人" width="120" />
+            <el-table-column prop="requestComment" label="申请说明" min-width="180" />
+            <el-table-column prop="decisionComment" label="处理说明" min-width="180" />
+            <el-table-column label="状态" width="100"><template #default="{ row }"><el-tag :type="statusTag(row.status)">{{ statusLabel(row.status) }}</el-tag></template></el-table-column>
+            <el-table-column label="时间" width="170"><template #default="{ row }">{{ formatDate(row.createdAt) }}</template></el-table-column>
+          </el-table>
+        </el-tab-pane>
+        <el-tab-pane label="全部记录" name="all">
+          <el-table :data="all" border height="calc(100dvh - 220px)">
+            <el-table-column prop="typeLabel" label="类型" width="110" />
+            <el-table-column prop="actionLabel" label="动作" width="110" />
+            <el-table-column prop="nodePath" label="文件/文件夹" min-width="260" />
+            <el-table-column prop="requesterName" label="申请人" width="120" />
+            <el-table-column prop="approverName" label="审批人" width="120" />
+            <el-table-column label="状态" width="100"><template #default="{ row }"><el-tag :type="statusTag(row.status)">{{ statusLabel(row.status) }}</el-tag></template></el-table-column>
+            <el-table-column label="更新时间" width="170"><template #default="{ row }">{{ formatDate(row.updatedAt) }}</template></el-table-column>
           </el-table>
         </el-tab-pane>
       </el-tabs>
@@ -857,8 +1042,8 @@ export const ApiManagementView = {
 };
 
 export const SystemManagementView = {
-  props: ['dashboard', 'auditLogs', 'filePolicy', 'externalLibrary', 'storageSettings', 'formatDate'],
-  emits: ['edit-file-policy', 'edit-external-library', 'edit-storage', 'sync-storage', 'export-audit'],
+  props: ['dashboard', 'auditLogs', 'filePolicy', 'externalLibrary', 'storageSettings', 'securityPolicy', 'wecomSettings', 'formatDate'],
+  emits: ['edit-file-policy', 'edit-external-library', 'edit-storage', 'sync-storage', 'export-audit', 'edit-security-policy', 'edit-wecom', 'test-wecom'],
   computed: {
     stats() {
       return this.dashboard?.stats || {};
@@ -914,16 +1099,38 @@ export const SystemManagementView = {
           <h2 class="section-title">系统参数</h2>
           <div class="toolbar compact-toolbar">
             <el-button @click="$emit('edit-file-policy')">上传策略</el-button>
+            <el-button @click="$emit('edit-security-policy')">安全策略</el-button>
             <el-button type="primary" @click="$emit('edit-external-library')">同步目录</el-button>
           </div>
         </div>
         <el-descriptions :column="2" border>
           <el-descriptions-item label="允许扩展名">{{ (filePolicy?.allowedExtensions || []).join('、') || '-' }}</el-descriptions-item>
           <el-descriptions-item label="单文件大小">{{ filePolicy?.maxSizeMb || '-' }} MB</el-descriptions-item>
+          <el-descriptions-item label="预览水印">{{ securityPolicy?.enablePreviewWatermark ? '启用' : '关闭' }}</el-descriptions-item>
+          <el-descriptions-item label="敏感文件下载">{{ securityPolicy?.blockSensitiveDownload ? '限制下载' : '允许下载' }}</el-descriptions-item>
           <el-descriptions-item label="同步根目录">{{ externalLibrary?.rootPath || '-' }}</el-descriptions-item>
           <el-descriptions-item label="同步状态">{{ externalStatus }}</el-descriptions-item>
           <el-descriptions-item label="只同步目录">{{ (externalLibrary?.includePaths || []).join('、') || '全部' }}</el-descriptions-item>
           <el-descriptions-item label="排除规则">{{ (externalLibrary?.excludePatterns || []).join('、') || '-' }}</el-descriptions-item>
+        </el-descriptions>
+      </section>
+      <section class="section">
+        <div class="section-header">
+          <h2 class="section-title">企业微信集成</h2>
+          <div class="toolbar compact-toolbar">
+            <el-button @click="$emit('edit-wecom')">配置</el-button>
+            <el-button type="primary" @click="$emit('test-wecom')">测试配置</el-button>
+          </div>
+        </div>
+        <el-descriptions :column="2" border>
+          <el-descriptions-item label="启用状态">{{ wecomSettings?.enabled ? '启用' : '关闭' }}</el-descriptions-item>
+          <el-descriptions-item label="CorpID">{{ wecomSettings?.corpId || '-' }}</el-descriptions-item>
+          <el-descriptions-item label="AgentID">{{ wecomSettings?.agentId || '-' }}</el-descriptions-item>
+          <el-descriptions-item label="Secret">{{ wecomSettings?.hasSecret ? '已保存' : '-' }}</el-descriptions-item>
+          <el-descriptions-item label="组织同步">{{ wecomSettings?.syncDepartments || wecomSettings?.syncUsers ? '已配置' : '关闭' }}</el-descriptions-item>
+          <el-descriptions-item label="消息推送">{{ wecomSettings?.pushMessages ? '启用' : '关闭' }}</el-descriptions-item>
+          <el-descriptions-item label="最后测试">{{ formatDate(wecomSettings?.lastTestAt) }}</el-descriptions-item>
+          <el-descriptions-item label="测试结果">{{ wecomSettings?.lastTestResult?.message || '-' }}</el-descriptions-item>
         </el-descriptions>
       </section>
       <section class="section">

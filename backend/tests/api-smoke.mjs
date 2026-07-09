@@ -132,9 +132,16 @@ try {
   assert.ok(openapi.paths['/nodes/{id}/workflow-actions']);
   assert.ok(openapi.paths['/nodes/{id}/approvals']);
   assert.ok(openapi.paths['/approvals/{id}/approve']);
+  assert.ok(openapi.paths['/approvals/{id}']);
   assert.ok(openapi.paths['/files/{id}/version-logs']);
   assert.ok(openapi.paths['/nodes/{id}/view-access']);
   assert.ok(openapi.paths['/nodes/{id}/password']);
+  assert.ok(openapi.paths['/nodes/{id}/security']);
+  assert.ok(openapi.paths['/nodes/batch-metadata']);
+  assert.ok(openapi.paths['/system-settings/security-policy']);
+  assert.ok(openapi.paths['/system-settings/wecom']);
+  assert.ok(openapi.paths['/system-settings/wecom/test']);
+  assert.ok(openapi.paths['/recent-access']);
   assert.ok(openapi.paths['/sso/tickets']);
 
   const ssoTicket = await request(`${base}/sso/tickets`, {
@@ -335,6 +342,116 @@ try {
     headers: { Authorization: `Bearer ${demoLoginForPrivateDrive.data.token}` }
   });
   assert.equal(demoReadChildren.data.find((item) => item.id === upload.data.id)?.hasUnread, false);
+
+  const originalSecurityPolicy = await request(`${base}/system-settings/security-policy`, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  const updatedSecurityPolicy = await request(`${base}/system-settings/security-policy`, {
+    method: 'PUT',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      ...originalSecurityPolicy.data,
+      enablePreviewWatermark: true,
+      blockSensitiveDownload: true,
+      allowAdminBypass: true,
+      logSensitiveAccess: true,
+      watermarkTextMode: 'custom',
+      customWatermarkText: 'SMOKE WATERMARK'
+    })
+  });
+  assert.equal(updatedSecurityPolicy.data.blockSensitiveDownload, true);
+  const securityUpdatedNode = await request(`${base}/nodes/${upload.data.id}/security`, {
+    method: 'PUT',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ securityLevel: 'confidential', sensitive: true, sensitiveReason: 'smoke sensitive' })
+  });
+  assert.equal(securityUpdatedNode.data.sensitive, true);
+  assert.equal(securityUpdatedNode.data.securityLevel, 'confidential');
+  const demoSensitivePreview = await request(`${base}/files/${upload.data.id}/preview`, {
+    headers: { Authorization: `Bearer ${demoLoginForPrivateDrive.data.token}` }
+  });
+  assert.equal(demoSensitivePreview.data.watermark.enabled, true);
+  assert.equal(demoSensitivePreview.data.watermark.text, 'SMOKE WATERMARK');
+  const recentAccess = await request(`${base}/recent-access?pageSize=5`, {
+    headers: { Authorization: `Bearer ${demoLoginForPrivateDrive.data.token}` }
+  });
+  assert.ok(recentAccess.data.items.some((item) => item.nodeId === upload.data.id && item.action === 'preview'));
+  const blockedSensitiveDownload = await requestRaw(`${base}/files/${upload.data.id}/download`, {
+    headers: { Authorization: `Bearer ${demoLoginForPrivateDrive.data.token}` }
+  });
+  assert.equal(blockedSensitiveDownload.res.status, 403);
+  assert.equal(blockedSensitiveDownload.body.code, 'SENSITIVE_DOWNLOAD_BLOCKED');
+  const downloadApproval = await request(`${base}/approvals`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${demoLoginForPrivateDrive.data.token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ nodeId: upload.data.id, type: 'download', approverId: 'u_admin', reason: 'download smoke sensitive file' })
+  });
+  assert.equal(downloadApproval.data.type, 'download');
+  assert.equal(downloadApproval.data.status, 'pending');
+  const downloadApprovalDetail = await request(`${base}/approvals/${downloadApproval.data.id}`, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  assert.equal(downloadApprovalDetail.data.id, downloadApproval.data.id);
+  await request(`${base}/approvals/${downloadApproval.data.id}/approve`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ comment: 'allow smoke download' })
+  });
+  const approvedSensitiveDownload = await requestRaw(`${base}/files/${upload.data.id}/download`, {
+    headers: { Authorization: `Bearer ${demoLoginForPrivateDrive.data.token}` }
+  });
+  assert.equal(approvedSensitiveDownload.res.status, 200);
+  assert.match(approvedSensitiveDownload.text, /质量手册 smoke test content/);
+  const permissionApproval = await request(`${base}/approvals`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${demoLoginForPrivateDrive.data.token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ nodeId: upload.data.id, type: 'permission', approverId: 'u_admin', requestedActions: ['file:update'], reason: 'need edit smoke file' })
+  });
+  await request(`${base}/approvals/${permissionApproval.data.id}/approve`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ comment: 'allow update smoke' })
+  });
+  const demoPermissionAfterApproval = await request(`${base}/nodes/${upload.data.id}/permissions/effective`, {
+    headers: { Authorization: `Bearer ${demoLoginForPrivateDrive.data.token}` }
+  });
+  assert.equal(demoPermissionAfterApproval.data.actions.includes('file:update'), true);
+  const batchMetadata = await request(`${base}/nodes/batch-metadata`, {
+    method: 'PUT',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ nodeIds: [upload.data.id], tags: ['二期测试'], businessStatus: 'draft', securityLevel: 'restricted', sensitive: false })
+  });
+  assert.equal(batchMetadata.data.count, 1);
+  assert.equal(batchMetadata.data.nodes[0].businessStatus, 'draft');
+  const wecomSettings = await request(`${base}/system-settings/wecom`, {
+    method: 'PUT',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled: true, corpId: 'corp-smoke', agentId: 'agent-smoke', secret: '<test-wecom-secret>', callbackUrl: '/api/v1/wecom/auth/callback', pushMessages: true })
+  });
+  assert.equal(wecomSettings.data.enabled, true);
+  assert.equal(wecomSettings.data.hasSecret, true);
+  const wecomTest = await request(`${base}/system-settings/wecom/test`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  assert.equal(wecomTest.data.ok, true);
+  const wecomCallback = await request(`${base}/wecom/auth/callback?code=smoke-code`);
+  assert.equal(wecomCallback.data.status, 'reserved');
+  await request(`${base}/system-settings/security-policy`, {
+    method: 'PUT',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(originalSecurityPolicy.data)
+  });
+  await request(`${base}/nodes/${upload.data.id}/security`, {
+    method: 'PUT',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ securityLevel: 'internal', sensitive: false, sensitiveReason: '' })
+  });
+  await request(`${base}/nodes/${upload.data.id}/status`, {
+    method: 'PATCH',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ businessStatus: 'effective' })
+  });
 
   const dashboard = await request(`${base}/dashboard`, {
     headers: { Authorization: `Bearer ${token}` }
