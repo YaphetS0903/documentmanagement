@@ -1042,7 +1042,7 @@ export const ApiManagementView = {
 };
 
 export const SystemManagementView = {
-  props: ['dashboard', 'auditLogs', 'filePolicy', 'externalLibrary', 'storageSettings', 'securityPolicy', 'wecomSettings', 'formatDate'],
+  props: ['dashboard', 'auditLogs', 'filePolicy', 'externalLibrary', 'storageSettings', 'securityPolicy', 'wecomSettings', 'runtimeStatus', 'auditReport', 'formatDate'],
   emits: ['edit-file-policy', 'edit-external-library', 'edit-storage', 'sync-storage', 'export-audit', 'edit-security-policy', 'edit-wecom', 'test-wecom'],
   computed: {
     stats() {
@@ -1170,6 +1170,51 @@ export const SystemManagementView = {
           <el-descriptions-item label="最后保存">{{ formatDate(storageRuntime.lastSavedAt) }}</el-descriptions-item>
           <el-descriptions-item label="最近错误" :span="2">{{ storageRuntime.lastError || '-' }}</el-descriptions-item>
         </el-descriptions>
+      </section>
+      <section class="section">
+        <div class="section-header">
+          <h2 class="section-title">运行与备份状态</h2>
+        </div>
+        <div class="storage-status-row">
+          <div class="storage-status-item">
+            <span>服务状态</span>
+            <strong><el-tag type="success">{{ runtimeStatus?.status || '-' }}</el-tag></strong>
+          </div>
+          <div class="storage-status-item">
+            <span>运行时长</span>
+            <strong>{{ runtimeStatus?.uptimeSeconds || 0 }} 秒</strong>
+          </div>
+          <div class="storage-status-item">
+            <span>待审批</span>
+            <strong>{{ runtimeStatus?.counts?.pendingApprovals || 0 }}</strong>
+          </div>
+          <div class="storage-status-item">
+            <span>审计日志</span>
+            <strong>{{ runtimeStatus?.counts?.auditLogs || 0 }}</strong>
+          </div>
+        </div>
+        <el-table class="compact-data-table" :data="runtimeStatus?.backupItems || []" border>
+          <el-table-column prop="name" label="备份对象" width="150" />
+          <el-table-column prop="path" label="路径" min-width="320" />
+          <el-table-column label="状态" width="100">
+            <template #default="{ row }"><el-tag :type="row.exists ? 'success' : 'danger'">{{ row.exists ? '存在' : '缺失' }}</el-tag></template>
+          </el-table-column>
+        </el-table>
+      </section>
+      <section class="section">
+        <div class="section-header">
+          <h2 class="section-title">审计概览</h2>
+        </div>
+        <div class="stats-grid">
+          <div class="stat-tile"><span>日志总数</span><strong>{{ auditReport?.total || 0 }}</strong></div>
+          <div class="stat-tile"><span>敏感访问</span><strong>{{ auditReport?.sensitiveAccesses || 0 }}</strong></div>
+          <div class="stat-tile"><span>下载拦截</span><strong>{{ auditReport?.blockedDownloads || 0 }}</strong></div>
+          <div class="stat-tile"><span>动作类型</span><strong>{{ auditReport?.topActions?.length || 0 }}</strong></div>
+        </div>
+        <el-table class="compact-data-table" :data="auditReport?.topActions || []" border>
+          <el-table-column prop="name" label="高频动作" min-width="220" />
+          <el-table-column prop="count" label="次数" width="100" />
+        </el-table>
       </section>
       <section class="section">
         <div class="section-header">

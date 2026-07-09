@@ -1746,6 +1746,64 @@ function publicRecentAccess(db, user, access) {
   };
 }
 
+function runtimeStatus(db) {
+  const files = db.nodes.filter((item) => item.nodeType === 'file' && item.status !== 'deleted');
+  const folders = db.nodes.filter((item) => item.nodeType === 'folder' && item.status !== 'deleted');
+  return {
+    status: 'up',
+    time: now(),
+    uptimeSeconds: Math.round(process.uptime()),
+    dataDir: config.dataDir,
+    uploadDir: config.uploadDir,
+    tmpDir: config.tmpDir,
+    dataDirExists: fsSync.existsSync(config.dataDir),
+    uploadDirExists: fsSync.existsSync(config.uploadDir),
+    tmpDirExists: fsSync.existsSync(config.tmpDir),
+    backupItems: [
+      { name: '账本数据目录', path: config.dataDir, exists: fsSync.existsSync(config.dataDir) },
+      { name: '上传文件目录', path: config.uploadDir, exists: fsSync.existsSync(config.uploadDir) },
+      { name: '临时文件目录', path: config.tmpDir, exists: fsSync.existsSync(config.tmpDir) }
+    ],
+    counts: {
+      users: db.users.length,
+      folders: folders.length,
+      files: files.length,
+      versions: db.versions.length,
+      auditLogs: db.auditLogs.length,
+      pendingApprovals: (db.documentApprovals || []).filter((item) => item.status === 'pending').length
+    }
+  };
+}
+
+function auditReport(db) {
+  const logs = db.auditLogs || [];
+  const byAction = new Map();
+  const byActor = new Map();
+  const today = new Date();
+  today.setUTCHours(0, 0, 0, 0);
+  const daily = Array.from({ length: 7 }, (_, index) => {
+    const date = new Date(today);
+    date.setUTCDate(today.getUTCDate() - (6 - index));
+    return { date: date.toISOString().slice(0, 10), count: 0 };
+  });
+  const dailyMap = new Map(daily.map((item) => [item.date, item]));
+  logs.forEach((log) => {
+    byAction.set(log.action, (byAction.get(log.action) || 0) + 1);
+    byActor.set(log.actorId || 'system', (byActor.get(log.actorId || 'system') || 0) + 1);
+    const key = String(log.createdAt || '').slice(0, 10);
+    if (dailyMap.has(key)) dailyMap.get(key).count += 1;
+  });
+  const top = (map) => [...map.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10).map(([name, count]) => ({ name, count }));
+  return {
+    total: logs.length,
+    sensitiveAccesses: logs.filter((item) => String(item.action || '').startsWith('sensitive.')).length,
+    blockedDownloads: logs.filter((item) => item.action === 'sensitive.download.blocked').length,
+    topActions: top(byAction),
+    topActors: top(byActor),
+    daily
+  };
+}
+
 const WORKFLOW_ACTIONS = {
   publish: { status: 'effective', label: '发布' },
   invalidate: { status: 'invalid', label: '作废' },
@@ -2122,7 +2180,9 @@ function openApiDocument() {
       '/sso/tickets': endpoint('创建一次性登录票据', 'post'),
       '/sso/consume': endpoint('消费一次性登录票据'),
       '/audit-logs': endpoint('审计日志'),
+      '/audit-logs/report': endpoint('审计统计报表'),
       '/recent-access': endpoint('最近访问'),
+      '/system/runtime-status': endpoint('系统运行与备份状态'),
       '/system-settings/file-policy': endpoint('文件上传策略'),
       '/system-settings/security-policy': endpoint('文件安全策略'),
       '/system-settings/external-library': endpoint('服务器文档目录设置'),
@@ -4185,6 +4245,16 @@ app.get('/api/v1/recent-access', requireAuth, (req, res) => {
     .filter((item) => item.node)
     .sort((a, b) => String(b.accessedAt || '').localeCompare(String(a.accessedAt || '')));
   sendPage(res, items, req.query.page, req.query.pageSize || 20);
+});
+
+app.get('/api/v1/audit-logs/report', requireAuth, (req, res) => {
+  if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以查看审计报表');
+  res.json(ok(auditReport(req.db)));
+});
+
+app.get('/api/v1/system/runtime-status', requireAuth, (req, res) => {
+  if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以查看系统运行状态');
+  res.json(ok(runtimeStatus(req.db)));
 });
 
 app.post('/api/v1/audit-logs/export', requireAuth, asyncRoute(async (req, res) => {

@@ -253,6 +253,8 @@
           :storage-settings="storageSettings"
           :security-policy="securityPolicy"
           :wecom-settings="wecomSettings"
+          :runtime-status="runtimeStatus"
+          :audit-report="auditReport"
           :format-date="formatDate"
           @edit-file-policy="openFilePolicyDialog"
           @edit-external-library="openExternalLibraryDialog"
@@ -1500,6 +1502,8 @@ const approvalTodo = ref([]);
 const approvalMine = ref([]);
 const approvalAll = ref([]);
 const recentAccesses = ref([]);
+const runtimeStatus = ref(null);
+const auditReport = ref(null);
 const nodeUnlockTokens = reactive({});
 
 const folderDialog = reactive({ visible: false, name: '' });
@@ -2011,6 +2015,16 @@ async function loadWecomSettings() {
   wecomSettings.value = await api('/system-settings/wecom');
 }
 
+async function loadRuntimeStatus() {
+  if (!isAdminUser.value) return;
+  runtimeStatus.value = await api('/system/runtime-status');
+}
+
+async function loadAuditReport() {
+  if (!isAdminUser.value) return;
+  auditReport.value = await api('/audit-logs/report');
+}
+
 async function loadApprovals() {
   const [todo, mine, all] = await Promise.all([
     api('/approvals?scope=todo&pageSize=200'),
@@ -2036,7 +2050,9 @@ async function loadSystemManagement() {
     loadExternalLibrary(),
     loadStorageSettings(),
     loadSecurityPolicy(),
-    loadWecomSettings()
+    loadWecomSettings(),
+    loadRuntimeStatus(),
+    loadAuditReport()
   ]);
 }
 

@@ -142,6 +142,8 @@ try {
   assert.ok(openapi.paths['/system-settings/wecom']);
   assert.ok(openapi.paths['/system-settings/wecom/test']);
   assert.ok(openapi.paths['/recent-access']);
+  assert.ok(openapi.paths['/audit-logs/report']);
+  assert.ok(openapi.paths['/system/runtime-status']);
   assert.ok(openapi.paths['/sso/tickets']);
 
   const ssoTicket = await request(`${base}/sso/tickets`, {
@@ -437,6 +439,17 @@ try {
   assert.equal(wecomTest.data.ok, true);
   const wecomCallback = await request(`${base}/wecom/auth/callback?code=smoke-code`);
   assert.equal(wecomCallback.data.status, 'reserved');
+  const runtime = await request(`${base}/system/runtime-status`, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  assert.equal(runtime.data.status, 'up');
+  assert.equal(runtime.data.dataDirExists, true);
+  assert.ok(runtime.data.backupItems.length >= 3);
+  const auditReport = await request(`${base}/audit-logs/report`, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  assert.ok(auditReport.data.total > 0);
+  assert.ok(Array.isArray(auditReport.data.topActions));
   await request(`${base}/system-settings/security-policy`, {
     method: 'PUT',
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
