@@ -1,0 +1,16 @@
+[Unit]
+Description=Document Management Platform
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/document-platform
+EnvironmentFile=/opt/document-platform/.env
+ExecStart=/usr/bin/npm start
+Restart=always
+RestartSec=5
+User=document
+Group=document
+
+[Install]
+WantedBy=multi-user.target

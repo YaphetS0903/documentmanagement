@@ -58,6 +58,12 @@
 npm install --cache .npm-cache
 ```
 
+如需使用本地环境变量：
+
+```bash
+cp .env.example .env
+```
+
 初始化数据：
 
 ```bash
@@ -133,8 +139,15 @@ npm test
 
 - 前端：Vue 3、Vite、Element Plus、Lucide 图标。
 - 后端：Node.js、Express。
-- 数据：文件型 JSON 数据库。
-- 文件：本地上传目录。
+- 数据：本地 JSON 账本或远程 MySQL 快照账本，可在后台切换。
+- 文件：服务器本地目录，可对接 NAS/共享目录。
+
+生产部署请参考：
+
+```text
+docs/生产部署说明.md
+docs/部署与数据安全说明.md
+```
 
 后续生产化建议替换为：
 
