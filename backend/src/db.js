@@ -1,6 +1,7 @@
 import fs from 'node:fs/promises';
 import { config } from './config.js';
 import {
+  getStorageRuntimeInfo,
   hasCompleteMysqlConfig,
   loadMysqlSnapshot,
   markStorageRuntime,
@@ -50,6 +51,14 @@ function rootFolder(id, name, parentId = null, createdBy = 'u_admin') {
     sensitiveReason: '',
     securityUpdatedBy: null,
     securityUpdatedAt: null,
+    reviewEnabled: false,
+    reviewCycleDays: 365,
+    reviewOwnerId: null,
+    nextReviewAt: null,
+    lastReviewedAt: null,
+    lastReviewedBy: null,
+    lastReviewConclusion: '',
+    lastReviewNote: '',
     createdAt: timestamp,
     updatedAt: timestamp,
     deletedAt: null
@@ -221,6 +230,7 @@ export function createInitialDb() {
     fileRelations: [],
     reminders: [],
     documentApprovals: [],
+    documentReviews: [],
     versionChangeLogs: [],
     announcements: [],
     auditLogs: [],
@@ -229,6 +239,7 @@ export function createInitialDb() {
     loginTickets: [],
     externalSyncJobs: [],
     recentAccesses: [],
+    searchEvents: [],
     settings: {
       filePolicy: {
         allowedExtensions: ['doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'pdf', 'txt', 'md', 'csv', 'json', 'xml', 'html', 'png', 'jpg', 'jpeg', 'gif', 'zip'],
@@ -263,6 +274,15 @@ export function createInitialDb() {
         syncDepartments: true,
         syncUsers: true,
         pushMessages: false,
+        lastTestAt: null,
+        lastTestResult: null
+      },
+      officePreview: {
+        enabled: false,
+        provider: 'onlyoffice',
+        documentServerUrl: '',
+        publicBaseUrl: '',
+        jwtSecret: '',
         lastTestAt: null,
         lastTestResult: null
       }
@@ -333,6 +353,16 @@ export async function saveDb(db = cache) {
   cache = db;
   await writeJsonDb(db);
   const storageConfig = await readStorageConfig({ includePassword: true });
+  const runtimeInfo = getStorageRuntimeInfo();
+  if (storageConfig.provider === 'mysql' && runtimeInfo.activeProvider === 'json' && runtimeInfo.lastError) {
+    markStorageRuntime({
+      configuredProvider: 'mysql',
+      activeProvider: 'json',
+      lastError: runtimeInfo.lastError,
+      lastSavedAt: now()
+    });
+    return;
+  }
   if (storageConfig.provider === 'mysql' && hasCompleteMysqlConfig(storageConfig.mysql)) {
     try {
       await saveMysqlSnapshot(db, storageConfig);

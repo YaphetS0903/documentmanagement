@@ -108,27 +108,44 @@ function mysqlConnectionOptions(mysqlConfig) {
   };
 }
 
+function isTransientMysqlError(error) {
+  return ['PROTOCOL_CONNECTION_LOST', 'ECONNRESET', 'ETIMEDOUT'].includes(error?.code) || /Connection lost/i.test(error?.message || '');
+}
+
+async function withMysqlConnection(mysqlConfig, operation) {
+  let lastError = null;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    let connection = null;
+    try {
+      connection = await mysql.createConnection(mysqlConnectionOptions(mysqlConfig));
+      return await operation(connection);
+    } catch (error) {
+      lastError = error;
+      if (!isTransientMysqlError(error) || attempt === 1) throw error;
+    } finally {
+      if (connection) await connection.end().catch(() => {});
+    }
+  }
+  throw lastError;
+}
+
 export async function testMysqlConnection(mysqlConfig) {
   const normalized = normalizeMysqlConfig(mysqlConfig, mysqlConfig);
   if (!hasCompleteMysqlConfig(normalized)) {
     throw Object.assign(new Error('请完整填写 MySQL 主机、端口、数据库名和用户名'), { code: 'VALIDATION_ERROR', status: 400 });
   }
-  const connection = await mysql.createConnection(mysqlConnectionOptions(normalized));
-  try {
+  return withMysqlConnection(normalized, async (connection) => {
     const [rows] = await connection.query('SELECT VERSION() AS version, DATABASE() AS databaseName');
     return {
       ok: true,
       version: rows?.[0]?.version || '',
       database: rows?.[0]?.databaseName || normalized.database
     };
-  } finally {
-    await connection.end();
-  }
+  });
 }
 
 export async function ensureMysqlStore(mysqlConfig) {
-  const connection = await mysql.createConnection(mysqlConnectionOptions(mysqlConfig));
-  try {
+  return withMysqlConnection(mysqlConfig, async (connection) => {
     await connection.execute(`
       CREATE TABLE IF NOT EXISTS ${STORE_TABLE} (
         store_key VARCHAR(64) NOT NULL PRIMARY KEY,
@@ -136,9 +153,7 @@ export async function ensureMysqlStore(mysqlConfig) {
         updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
       ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
     `);
-  } finally {
-    await connection.end();
-  }
+  });
 }
 
 export async function loadMysqlSnapshot(storageConfig = null) {
@@ -146,14 +161,11 @@ export async function loadMysqlSnapshot(storageConfig = null) {
   const mysqlConfig = activeConfig.mysql;
   if (!hasCompleteMysqlConfig(mysqlConfig)) return null;
   await ensureMysqlStore(mysqlConfig);
-  const connection = await mysql.createConnection(mysqlConnectionOptions(mysqlConfig));
-  try {
+  return withMysqlConnection(mysqlConfig, async (connection) => {
     const [rows] = await connection.execute(`SELECT store_value FROM ${STORE_TABLE} WHERE store_key = ? LIMIT 1`, [DB_STORE_KEY]);
     if (!rows.length) return null;
     return JSON.parse(rows[0].store_value);
-  } finally {
-    await connection.end();
-  }
+  });
 }
 
 export async function saveMysqlSnapshot(db, storageConfig = null) {
@@ -163,16 +175,13 @@ export async function saveMysqlSnapshot(db, storageConfig = null) {
     throw Object.assign(new Error('MySQL 连接配置不完整'), { code: 'VALIDATION_ERROR', status: 400 });
   }
   await ensureMysqlStore(mysqlConfig);
-  const connection = await mysql.createConnection(mysqlConnectionOptions(mysqlConfig));
-  try {
+  return withMysqlConnection(mysqlConfig, async (connection) => {
     await connection.execute(
       `INSERT INTO ${STORE_TABLE} (store_key, store_value) VALUES (?, ?)
        ON DUPLICATE KEY UPDATE store_value = VALUES(store_value), updated_at = CURRENT_TIMESTAMP`,
       [DB_STORE_KEY, JSON.stringify(db)]
     );
-  } finally {
-    await connection.end();
-  }
+  });
 }
 
 export function markStorageRuntime(patch = {}) {

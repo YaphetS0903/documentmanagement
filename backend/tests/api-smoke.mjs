@@ -138,7 +138,21 @@ try {
   assert.ok(openapi.paths['/nodes/{id}/password']);
   assert.ok(openapi.paths['/nodes/{id}/security']);
   assert.ok(openapi.paths['/nodes/batch-metadata']);
+  assert.ok(openapi.paths['/search/suggestions']);
+  assert.ok(openapi.paths['/search/index/status']);
+  assert.ok(openapi.paths['/search/index/rebuild']);
+  assert.ok(openapi.paths['/governance/dashboard']);
+  assert.ok(openapi.paths['/governance/quality']);
+  assert.ok(openapi.paths['/governance/duplicates']);
+  assert.ok(openapi.paths['/governance/reviews']);
+  assert.ok(openapi.paths['/governance/search-analytics']);
+  assert.ok(openapi.paths['/nodes/{id}/quality']);
+  assert.ok(openapi.paths['/nodes/{id}/review']);
+  assert.ok(openapi.paths['/nodes/{id}/review/complete']);
+  assert.ok(openapi.paths['/nodes/{id}/review-history']);
   assert.ok(openapi.paths['/system-settings/security-policy']);
+  assert.ok(openapi.paths['/system-settings/office-preview']);
+  assert.ok(openapi.paths['/system-settings/office-preview/test']);
   assert.ok(openapi.paths['/system-settings/wecom']);
   assert.ok(openapi.paths['/system-settings/wecom/test']);
   assert.ok(openapi.paths['/recent-access']);
@@ -152,6 +166,7 @@ try {
     body: JSON.stringify({ userId: 'u_demo', expiresInMinutes: 5 })
   });
   assert.ok(ssoTicket.data.loginUrl.includes(ssoTicket.data.id));
+  assert.ok(ssoTicket.data.frontendLoginUrl.includes(ssoTicket.data.id));
   const ssoLogin = await request(`${base}/sso/consume?ticket=${encodeURIComponent(ssoTicket.data.id)}`);
   assert.equal(ssoLogin.data.user.username, 'demo');
   const consumedAgain = await requestRaw(`${base}/sso/consume?ticket=${encodeURIComponent(ssoTicket.data.id)}`);
@@ -188,6 +203,7 @@ try {
   await fs.mkdir(path.join(externalRoot, '无权限目录'), { recursive: true });
   await fs.writeFile(path.join(externalRoot, '质量体系', '外部质量手册.txt'), '外部目录质量手册 smoke sync content', 'utf8');
   await fs.writeFile(path.join(externalRoot, '项目台账.csv'), '项目,状态\n同步测试,运行', 'utf8');
+  await fs.writeFile(path.join(externalRoot, '.deploy_remote.py'), 'print("remote deploy smoke")\n', 'utf8');
   await fs.writeFile(path.join(externalRoot, '无权限目录', '不可读取.txt'), 'should be skipped', 'utf8');
   await fs.chmod(path.join(externalRoot, '无权限目录'), 0o000);
   const externalSettings = await request(`${base}/system-settings/external-library`, {
@@ -212,8 +228,10 @@ try {
   });
   const syncedFolder = children.data.find((item) => item.name === '质量体系');
   const syncedFile = children.data.find((item) => item.name === '项目台账.csv');
+  const syncedPyFile = children.data.find((item) => item.name === '.deploy_remote.py');
   assert.ok(syncedFolder);
   assert.ok(syncedFile);
+  assert.ok(syncedPyFile);
   assert.equal(syncedFile.hasUnread, true);
   assert.equal(syncedFolder.sourceType, 'external');
   assert.equal(syncedFile.currentVersion.storageType, 'external');
@@ -221,6 +239,11 @@ try {
     headers: { Authorization: `Bearer ${token}` }
   });
   assert.match(syncedPreview.data.content, /同步测试/);
+  const syncedPyPreview = await request(`${base}/files/${syncedPyFile.id}/preview`, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  assert.equal(syncedPyPreview.data.previewType, 'text');
+  assert.match(syncedPyPreview.data.content, /remote deploy smoke/);
 
   const personalTree = await request(`${base}/personal-drive/tree`, {
     headers: { Authorization: `Bearer ${token}` }
@@ -321,6 +344,150 @@ try {
   assert.equal(upload.data.name, 'smoke.txt');
   assert.equal(upload.data.hasUnread, true);
   assert.equal(upload.data.unreadCount, 1);
+
+  const initialQuality = await request(`${base}/nodes/${upload.data.id}/quality`, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  assert.ok(initialQuality.data.quality.score >= 0 && initialQuality.data.quality.score <= 100);
+  assert.equal(initialQuality.data.quality.dimensions.reduce((sum, item) => sum + item.score, 0), initialQuality.data.quality.score);
+  assert.ok(initialQuality.data.quality.suggestions.length >= 1);
+
+  const overdueReviewAt = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  const configuredReview = await request(`${base}/nodes/${upload.data.id}/review`, {
+    method: 'PUT',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled: true, cycleDays: 180, ownerId: 'u_demo', nextReviewAt: overdueReviewAt })
+  });
+  assert.equal(configuredReview.data.review.status, 'overdue');
+  assert.equal(configuredReview.data.review.ownerId, 'u_demo');
+
+  const overdueReviews = await request(`${base}/governance/reviews?status=overdue&pageSize=100`, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  assert.ok(overdueReviews.data.items.some((item) => item.id === upload.data.id));
+
+  const completedReview = await request(`${base}/nodes/${upload.data.id}/review/complete`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${demoLoginForPrivateDrive.data.token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ conclusion: 'valid', note: '三期冒烟复审通过' })
+  });
+  assert.equal(completedReview.data.review.conclusion, 'valid');
+  assert.equal(completedReview.data.settings.status, 'normal');
+  const reviewHistory = await request(`${base}/nodes/${upload.data.id}/review-history`, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  assert.equal(reviewHistory.data.items[0].reviewerId, 'u_demo');
+
+  const duplicateForm = new FormData();
+  duplicateForm.append('parentId', 'n_root');
+  duplicateForm.append('description', 'duplicate smoke version');
+  duplicateForm.append('file', new Blob([await fs.readFile(sampleFile)]), 'smoke-copy.txt');
+  const duplicateUpload = await request(`${base}/files`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` },
+    body: duplicateForm
+  });
+  const duplicateGroups = await request(`${base}/governance/duplicates`, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  const exactDuplicateGroup = duplicateGroups.data.groups.find((group) => group.type === 'exact' && group.files.some((item) => item.id === upload.data.id));
+  assert.ok(exactDuplicateGroup);
+  assert.ok(exactDuplicateGroup.files.some((item) => item.id === duplicateUpload.data.id));
+  assert.ok(duplicateGroups.data.summary.wastedBytes > 0);
+
+  await request(`${base}/search/files`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ keyword: 'governance-zero-result-smoke', page: 1, pageSize: 10 })
+  });
+  const searchAnalytics = await request(`${base}/governance/search-analytics?days=30`, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  assert.ok(searchAnalytics.data.stats.totalSearches >= 1);
+  assert.ok(searchAnalytics.data.zeroResultKeywords.some((item) => item.keyword === 'governance-zero-result-smoke'));
+
+  const governanceDashboard = await request(`${base}/governance/dashboard`, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  assert.ok(governanceDashboard.data.stats.files >= 2);
+  assert.ok(governanceDashboard.data.stats.duplicateGroups >= 1);
+  assert.ok(Array.isArray(governanceDashboard.data.issues));
+  const governanceQuality = await request(`${base}/governance/quality?pageSize=100`, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  assert.ok(governanceQuality.data.items.some((item) => item.id === upload.data.id));
+  const forbiddenGovernance = await requestRaw(`${base}/governance/dashboard`, {
+    headers: { Authorization: `Bearer ${demoLoginForPrivateDrive.data.token}` }
+  });
+  assert.equal(forbiddenGovernance.res.status, 403);
+
+  const relevanceForm = new FormData();
+  relevanceForm.append('parentId', 'n_root');
+  relevanceForm.append('description', 'relevance smoke');
+  relevanceForm.append('file', new Blob([Buffer.from('filename relevance smoke content')], { type: 'text/plain' }), 'ranking-keyword-name.txt');
+  const relevanceUpload = await request(`${base}/files`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` },
+    body: relevanceForm
+  });
+  const rankingContentForm = new FormData();
+  rankingContentForm.append('parentId', 'n_root');
+  rankingContentForm.append('description', 'ranking content smoke');
+  rankingContentForm.append('file', new Blob([Buffer.from('ranking-keyword content relevance smoke')], { type: 'text/plain' }), 'ranking-content.txt');
+  const rankingContentUpload = await request(`${base}/files`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` },
+    body: rankingContentForm
+  });
+
+  const jsonForm = new FormData();
+  jsonForm.append('parentId', 'n_root');
+  jsonForm.append('file', new Blob([Buffer.from('{"name":"demo","items":[1,2]}')], { type: 'application/json' }), 'package-lock.json');
+  const jsonUpload = await request(`${base}/files`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` },
+    body: jsonForm
+  });
+  const jsonPreview = await request(`${base}/files/${jsonUpload.data.id}/preview`, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  assert.equal(jsonPreview.data.previewType, 'json');
+  assert.match(jsonPreview.data.content, /"name": "demo"/);
+
+  const officeForm = new FormData();
+  officeForm.append('parentId', 'n_root');
+  officeForm.append('file', new Blob([Buffer.from('ppt placeholder')], { type: 'application/vnd.openxmlformats-officedocument.presentationml.presentation' }), '方案演示.pptx');
+  const officeUpload = await request(`${base}/files`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` },
+    body: officeForm
+  });
+  const officePreview = await request(`${base}/files/${officeUpload.data.id}/preview`, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  assert.equal(officePreview.data.previewType, 'office');
+  assert.equal(officePreview.data.officePreview.status, 'text_fallback');
+  const officePreviewSettings = await request(`${base}/system-settings/office-preview`, {
+    method: 'PUT',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      enabled: true,
+      provider: 'onlyoffice',
+      documentServerUrl: 'http://127.0.0.1:8080',
+      publicBaseUrl: `http://localhost:${testPort}`,
+      jwtSecret: 'office-smoke-secret'
+    })
+  });
+  assert.equal(officePreviewSettings.data.enabled, true);
+  assert.equal(officePreviewSettings.data.hasJwtSecret, true);
+  const nativeOfficePreview = await request(`${base}/files/${officeUpload.data.id}/preview`, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  assert.equal(nativeOfficePreview.data.officePreview.status, 'native_ready');
+  assert.match(nativeOfficePreview.data.officePreview.native.scriptUrl, /web-apps\/apps\/api\/documents\/api\.js$/);
+  assert.equal(nativeOfficePreview.data.officePreview.native.config.documentType, 'slide');
+  assert.ok(nativeOfficePreview.data.officePreview.native.config.document.url.startsWith(`http://localhost:${testPort}/storage/raw/`));
+  assert.ok(nativeOfficePreview.data.officePreview.native.config.token);
 
   const demoUnreadChildren = await request(`${base}/nodes/n_root/children`, {
     headers: { Authorization: `Bearer ${demoLoginForPrivateDrive.data.token}` }
@@ -754,6 +921,43 @@ try {
   assert.equal(advancedHit.businessStatus, 'archived');
   assert.equal(advancedHit.matchedKeyword, '质量手册');
   assert.equal(advancedHit.highlight, '质量手册');
+  assert.equal(advancedHit.searchMatch.source, 'content');
+  assert.equal(advancedHit.searchMatch.sourceLabel, '正文内容');
+  assert.match(advancedHit.searchMatch.snippet, /质量手册/);
+
+  const relevanceSearch = await request(`${base}/search/files`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ keyword: 'ranking-keyword', sortBy: 'relevance', sortDir: 'desc', page: 1, pageSize: 10 })
+  });
+  const relevanceRank = relevanceSearch.data.items.findIndex((item) => item.id === relevanceUpload.data.id);
+  const contentRank = relevanceSearch.data.items.findIndex((item) => item.id === rankingContentUpload.data.id);
+  assert.ok(relevanceRank >= 0);
+  assert.ok(contentRank >= 0);
+  assert.ok(relevanceRank < contentRank);
+  assert.equal(relevanceSearch.data.items[relevanceRank].searchMatch.source, 'name');
+  assert.equal(relevanceSearch.data.items[contentRank].searchMatch.source, 'content');
+  assert.ok(relevanceSearch.data.items[relevanceRank].searchMatch.score > relevanceSearch.data.items[contentRank].searchMatch.score);
+
+  const suggestions = await request(`${base}/search/suggestions?keyword=${encodeURIComponent('质量手册')}&limit=5`, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  assert.ok(suggestions.data.length >= 1);
+  assert.ok(suggestions.data.some((item) => item.value.includes('质量手册') || item.detail.includes('质量手册')));
+
+  const searchIndexStatus = await request(`${base}/search/index/status`, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  assert.ok(searchIndexStatus.data.total >= 1);
+  assert.ok(searchIndexStatus.data.counts.ready >= 1);
+
+  const rebuiltIndex = await request(`${base}/search/index/rebuild`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  assert.ok(rebuiltIndex.data.total >= 1);
+  assert.ok(rebuiltIndex.data.rebuilt >= 1);
+  assert.ok(rebuiltIndex.data.status.counts.ready >= 1);
 
   const versions = await request(`${base}/files/${upload.data.id}/versions`, {
     headers: { Authorization: `Bearer ${token}` }
@@ -1080,6 +1284,15 @@ try {
     headers: { Authorization: `Bearer ${token}` }
   });
   await request(`${base}/categories/${category.data.id}`, {
+    method: 'DELETE',
+    headers: { Authorization: `Bearer ${token}` }
+  });
+
+  await request(`${base}/nodes/${duplicateUpload.data.id}`, {
+    method: 'DELETE',
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  await request(`${base}/trash/${duplicateUpload.data.id}`, {
     method: 'DELETE',
     headers: { Authorization: `Bearer ${token}` }
   });

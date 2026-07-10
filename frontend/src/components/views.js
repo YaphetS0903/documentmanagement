@@ -86,8 +86,8 @@ export const DashboardView = {
 };
 
 export const DocsView = {
-  props: ['tree', 'children', 'selectedFolder', 'users', 'departments', 'roles', 'formatDate', 'formatSize', 'actions', 'spaceSummary', 'isAdmin', 'enableSync', 'recentAccesses'],
-  emits: ['select-folder', 'create-folder', 'upload', 'rename', 'delete', 'download', 'preview', 'versions', 'lock', 'unlock', 'favorite', 'permissions', 'view-access', 'node-password', 'sync-external', 'search', 'batch-download', 'batch-move', 'batch-delete', 'batch-metadata', 'move', 'copy', 'copy-enterprise', 'share', 'subscribe', 'reminder', 'metadata', 'links', 'workflow', 'security', 'request-download'],
+  props: ['tree', 'children', 'selectedFolder', 'users', 'departments', 'roles', 'formatDate', 'formatSize', 'actions', 'spaceSummary', 'isAdmin', 'enableSync', 'recentAccesses', 'storageScope', 'suggestSearch'],
+  emits: ['select-folder', 'create-folder', 'upload', 'rename', 'delete', 'download', 'preview', 'versions', 'lock', 'unlock', 'favorite', 'permissions', 'view-access', 'node-password', 'sync-external', 'search', 'batch-download', 'batch-move', 'batch-delete', 'batch-metadata', 'move', 'copy', 'copy-enterprise', 'share', 'subscribe', 'reminder', 'metadata', 'links', 'workflow', 'security', 'request-download', 'governance'],
   data: () => ({
     keyword: '',
     treeKeyword: '',
@@ -96,7 +96,7 @@ export const DocsView = {
     fileTypesText: '',
     creatorId: '',
     updatedRange: [],
-    sortBy: 'updatedAt',
+    sortBy: 'relevance',
     sortDir: 'desc',
     page: 1,
     pageSize: 20,
@@ -122,6 +122,20 @@ export const DocsView = {
     },
     singleSelection() {
       return this.selection.length === 1 ? this.selection[0] : null;
+    },
+    filterStorageKey() {
+      return `document_platform_filter_state_${this.storageScope || 'docs'}`;
+    },
+    activeFilterSummary() {
+      const items = [];
+      if (String(this.keyword || '').trim()) items.push(`关键词：${String(this.keyword).trim()}`);
+      if (String(this.fileTypesText || '').trim()) items.push(`类型：${String(this.fileTypesText).trim()}`);
+      const creator = this.users?.find((item) => item.id === this.creatorId);
+      if (this.creatorId) items.push(`创建人：${creator?.displayName || creator?.username || this.creatorId}`);
+      if (this.updatedRange?.[0] || this.updatedRange?.[1]) items.push('更新时间');
+      const sortLabels = { relevance: '相关性', updatedAt: '更新时间', createdAt: '创建时间', name: '文件名', sizeBytes: '大小', extension: '类型' };
+      if (this.sortBy !== 'relevance' || this.sortDir !== 'desc') items.push(`排序：${sortLabels[this.sortBy] || this.sortBy}/${this.sortDir === 'asc' ? '升序' : '降序'}`);
+      return items;
     }
   },
   watch: {
@@ -181,9 +195,33 @@ export const DocsView = {
         const rawColumns = localStorage.getItem('document_platform_column_prefs');
         if (rawColumns) this.columnPrefs = { ...this.columnPrefs, ...JSON.parse(rawColumns) };
         this.savedFilters = JSON.parse(localStorage.getItem('document_platform_saved_filters') || '[]');
+        const rawFilterState = localStorage.getItem(this.filterStorageKey);
+        if (rawFilterState) this.applyFilterState(JSON.parse(rawFilterState), false);
       } catch {
         this.savedFilters = [];
       }
+    },
+    filterState() {
+      return {
+        keyword: this.keyword,
+        fileTypesText: this.fileTypesText,
+        creatorId: this.creatorId,
+        updatedRange: this.updatedRange,
+        sortBy: this.sortBy,
+        sortDir: this.sortDir
+      };
+    },
+    applyFilterState(state, run = true) {
+      this.keyword = state?.keyword || '';
+      this.fileTypesText = state?.fileTypesText || '';
+      this.creatorId = state?.creatorId || '';
+      this.updatedRange = state?.updatedRange || [];
+      this.sortBy = state?.sortBy || 'relevance';
+      this.sortDir = state?.sortDir || 'desc';
+      if (run) this.runSearch();
+    },
+    persistFilterState() {
+      localStorage.setItem(this.filterStorageKey, JSON.stringify(this.filterState()));
     },
     saveColumnPrefs() {
       localStorage.setItem('document_platform_column_prefs', JSON.stringify(this.columnPrefs));
@@ -193,6 +231,7 @@ export const DocsView = {
       if (!name) return;
       const filter = {
         name,
+        keyword: this.keyword,
         fileTypesText: this.fileTypesText,
         creatorId: this.creatorId,
         updatedRange: this.updatedRange,
@@ -207,12 +246,7 @@ export const DocsView = {
     applySavedFilter(name) {
       const filter = this.savedFilters.find((item) => item.name === name);
       if (!filter) return;
-      this.fileTypesText = filter.fileTypesText || '';
-      this.creatorId = filter.creatorId || '';
-      this.updatedRange = filter.updatedRange || [];
-      this.sortBy = filter.sortBy || 'updatedAt';
-      this.sortDir = filter.sortDir || 'desc';
-      this.runSearch();
+      this.applyFilterState(filter);
     },
     userName(userId) {
       const user = (this.users || []).find((item) => item.id === userId);
@@ -251,7 +285,7 @@ export const DocsView = {
         return;
       }
       if (this.can(row, 'file:preview')) {
-        this.$emit('preview', row);
+        this.$emit('preview', row, null, { searchKeyword: row.searchMatch?.keyword || this.keyword || '' });
         return;
       }
       this.selectOnlyRow(row);
@@ -262,7 +296,7 @@ export const DocsView = {
       if (!row) return;
       const commands = {
         open: () => this.openRow(row),
-        preview: () => this.$emit('preview', row),
+        preview: () => this.$emit('preview', row, null, { searchKeyword: row.searchMatch?.keyword || this.keyword || '' }),
         download: () => this.$emit('download', row),
         requestDownload: () => this.$emit('request-download', row),
         rename: () => this.$emit('rename', row),
@@ -282,6 +316,7 @@ export const DocsView = {
         favorite: () => this.$emit('favorite', row),
         permissions: () => this.$emit('permissions', row),
         security: () => this.$emit('security', row),
+        governance: () => this.$emit('governance', row),
         viewAccess: () => this.$emit('view-access', row),
         password: () => this.$emit('node-password', row),
         delete: () => this.$emit('delete', row)
@@ -290,7 +325,8 @@ export const DocsView = {
     },
     runSearch() {
       this.page = 1;
-      this.$emit('search', {
+      this.persistFilterState();
+      const criteria = {
         keyword: this.keyword,
         fileTypes: String(this.fileTypesText || '').split(/[,\s，]+/).map((item) => item.replace(/^\./, '').trim().toLowerCase()).filter(Boolean),
         creatorId: this.creatorId,
@@ -298,17 +334,52 @@ export const DocsView = {
         updatedTo: this.updatedRange?.[1] ? new Date(this.updatedRange[1]).toISOString() : '',
         sortBy: this.sortBy,
         sortDir: this.sortDir
+      };
+      this.$emit('search', criteria);
+    },
+    clearSearch() {
+      this.applyFilterState({
+        keyword: '',
+        fileTypesText: '',
+        creatorId: '',
+        updatedRange: [],
+        sortBy: 'relevance',
+        sortDir: 'desc'
       });
+      this.selectedFilterName = '';
+    },
+    async querySearchSuggestions(queryString, callback) {
+      const query = String(queryString || '').trim();
+      if (!query || typeof this.suggestSearch !== 'function') {
+        callback([]);
+        return;
+      }
+      try {
+        const suggestions = await this.suggestSearch(query);
+        callback((suggestions || []).map((item) => ({ ...item, value: item.value || query })));
+      } catch {
+        callback([]);
+      }
+    },
+    selectSearchSuggestion(item) {
+      this.keyword = item?.value || this.keyword;
+      this.runSearch();
     },
     escapeHtml(value) {
       return String(value || '').replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
     },
     highlightName(row) {
-      const name = this.escapeHtml(row.name);
-      const keyword = String(row.matchedKeyword || this.keyword || '').trim();
-      if (!keyword) return name;
+      return this.highlightText(row.name, row.matchedKeyword || this.keyword);
+    },
+    highlightText(value, keywordValue) {
+      const text = this.escapeHtml(value);
+      const keyword = String(keywordValue || '').trim();
+      if (!keyword) return text;
       const escapedKeyword = keyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      return name.replace(new RegExp(escapedKeyword, 'ig'), (match) => `<mark class="search-hit">${match}</mark>`);
+      return text.replace(new RegExp(escapedKeyword, 'ig'), (match) => `<mark class="search-hit">${match}</mark>`);
+    },
+    highlightSnippet(row) {
+      return this.highlightText(row.searchMatch?.snippet || '', row.searchMatch?.keyword || row.matchedKeyword || this.keyword);
     }
   },
   template: `
@@ -342,7 +413,13 @@ export const DocsView = {
         </div>
         <div v-if="recentAccesses?.length" class="recent-access-strip">
           <span>最近访问</span>
-          <button v-for="item in recentAccesses.slice(0, 5)" :key="item.id" type="button" :title="item.nodePath" @click="$emit('preview', item.node)">
+          <button
+            v-for="item in recentAccesses.slice(0, 5)"
+            :key="item.id"
+            type="button"
+            :title="item.nodePath"
+            @click="$emit('preview', item.node || { id: item.nodeId, name: item.nodeName, nodeType: 'file' })"
+          >
             {{ item.nodeName || item.node?.name }}
           </button>
         </div>
@@ -366,6 +443,7 @@ export const DocsView = {
                   <el-dropdown-item v-if="singleSelection.spaceType === 'personal'" :command="{ action: 'copyEnterprise', row: singleSelection }">复制到文档库</el-dropdown-item>
                   <el-dropdown-item v-if="can(singleSelection, 'permission:manage')" :command="{ action: 'permissions', row: singleSelection }">权限</el-dropdown-item>
                   <el-dropdown-item :command="{ action: 'security', row: singleSelection }" :disabled="!canModify(singleSelection)">安全设置</el-dropdown-item>
+                  <el-dropdown-item v-if="singleSelection.nodeType === 'file'" :command="{ action: 'governance', row: singleSelection }">质量与复审</el-dropdown-item>
                   <el-dropdown-item v-if="can(singleSelection, 'file:delete')" :command="{ action: 'delete', row: singleSelection }" divided>删除</el-dropdown-item>
                 </el-dropdown-menu>
               </template>
@@ -391,11 +469,28 @@ export const DocsView = {
                 </el-dropdown-menu>
               </template>
             </el-dropdown>
-            <el-input v-model="keyword" placeholder="搜索当前目录文件" clearable @keyup.enter="runSearch">
-              <template #append>
-                <el-button aria-label="搜索" @click="runSearch"><Search class="toolbar-icon" /></el-button>
-              </template>
-            </el-input>
+            <div class="docs-search-box">
+              <el-autocomplete
+                v-model="keyword"
+                :fetch-suggestions="querySearchSuggestions"
+                placeholder="搜索文件名/正文内容"
+                clearable
+                :trigger-on-focus="false"
+                @select="selectSearchSuggestion"
+                @keyup.enter="runSearch"
+              >
+                <template #default="{ item }">
+                  <div class="search-suggestion-item">
+                    <div>
+                      <strong>{{ item.value }}</strong>
+                      <span>{{ item.detail || item.fullPath }}</span>
+                    </div>
+                    <el-tag size="small" effect="plain">{{ item.typeLabel || '建议' }}</el-tag>
+                  </div>
+                </template>
+              </el-autocomplete>
+              <el-button aria-label="搜索" @click="runSearch"><Search class="toolbar-icon" /></el-button>
+            </div>
           </div>
         </div>
         <div v-if="filtersVisible" class="toolbar filter-toolbar">
@@ -412,6 +507,7 @@ export const DocsView = {
             style="max-width: 280px"
           />
           <el-select v-model="sortBy" style="max-width: 160px">
+            <el-option label="相关性" value="relevance" />
             <el-option label="更新时间" value="updatedAt" />
             <el-option label="创建时间" value="createdAt" />
             <el-option label="文件名" value="name" />
@@ -429,6 +525,10 @@ export const DocsView = {
           <el-input v-model="savedFilterName" placeholder="筛选名称" style="max-width: 150px" />
           <el-button @click="saveCurrentFilter">保存筛选</el-button>
         </div>
+        <div v-if="activeFilterSummary.length" class="active-filter-strip">
+          <span v-for="item in activeFilterSummary" :key="item">{{ item }}</span>
+          <el-button size="small" text @click="clearSearch">清空</el-button>
+        </div>
         <div class="path-strip">当前位置：{{ selectedFolder?.fullPath || '/' }}</div>
         <el-table
           ref="docsTable"
@@ -443,25 +543,31 @@ export const DocsView = {
           <el-table-column type="selection" width="44" />
           <el-table-column label="名称" min-width="300">
             <template #default="{ row }">
-              <div class="file-name">
-                <Folder v-if="row.nodeType === 'folder'" class="toolbar-icon" />
-                <FileText v-else class="toolbar-icon" />
-                <button class="file-title" :title="row.fullPath || row.name" @click.stop="openRow(row)">
-                  <span v-html="highlightName(row)"></span>
-                </button>
-                <span
-                  v-if="row.hasUnread"
-                  class="unread-dot"
-                  :title="'有 ' + (row.unreadCount || 1) + ' 个未读新文件'"
-                  aria-label="有未读新文件"
-                ></span>
-                <el-tag v-if="row.sourceType === 'external'" size="small" type="success">同步</el-tag>
-                <el-tag v-if="row.sensitive" size="small" type="danger">敏感</el-tag>
-                <el-tag v-if="row.sensitiveDownloadBlocked" size="small" type="warning">限下载</el-tag>
-                <el-tag v-if="row.pendingApprovalCount" size="small" type="warning">审批 {{ row.pendingApprovalCount }}</el-tag>
-                <el-tag v-if="row.passwordProtected" size="small" type="danger">加密</el-tag>
-                <el-tag v-if="row.lockedBy" size="small" type="warning">锁定</el-tag>
-                <el-tag v-if="row.businessStatus && row.businessStatus !== 'effective'" size="small" type="info">{{ row.businessStatus }}</el-tag>
+              <div class="file-name-cell">
+                <div class="file-name">
+                  <Folder v-if="row.nodeType === 'folder'" class="toolbar-icon" />
+                  <FileText v-else class="toolbar-icon" />
+                  <button class="file-title" :title="row.fullPath || row.name" @click.stop="openRow(row)">
+                    <span v-html="highlightName(row)"></span>
+                  </button>
+                  <span
+                    v-if="row.hasUnread"
+                    class="unread-dot"
+                    :title="'有 ' + (row.unreadCount || 1) + ' 个未读新文件'"
+                    aria-label="有未读新文件"
+                  ></span>
+                  <el-tag v-if="row.sourceType === 'external'" size="small" type="success">同步</el-tag>
+                  <el-tag v-if="row.sensitive" size="small" type="danger">敏感</el-tag>
+                  <el-tag v-if="row.sensitiveDownloadBlocked" size="small" type="warning">限下载</el-tag>
+                  <el-tag v-if="row.pendingApprovalCount" size="small" type="warning">审批 {{ row.pendingApprovalCount }}</el-tag>
+                  <el-tag v-if="row.passwordProtected" size="small" type="danger">加密</el-tag>
+                  <el-tag v-if="row.lockedBy" size="small" type="warning">锁定</el-tag>
+                  <el-tag v-if="row.businessStatus && row.businessStatus !== 'effective'" size="small" type="info">{{ row.businessStatus }}</el-tag>
+                </div>
+                <div v-if="row.searchMatch?.snippet" class="search-snippet">
+                  <el-tag size="small" type="info" effect="plain">{{ row.searchMatch.sourceLabel || '命中' }}</el-tag>
+                  <span v-html="highlightSnippet(row)"></span>
+                </div>
               </div>
             </template>
           </el-table-column>
@@ -790,32 +896,43 @@ export const KnowledgeView = {
   props: ['categories', 'properties', 'categoryFiles', 'selectedCategory', 'formatDate', 'formatSize'],
   emits: ['create-category', 'edit-category', 'delete-category', 'select-category', 'preview-file', 'metadata-file', 'create-property', 'edit-property', 'delete-property'],
   template: `
-    <div class="split-layout">
-      <section class="section">
+    <div class="knowledge-layout">
+      <section class="section knowledge-sidebar">
         <div class="section-header">
-          <h2 class="section-title">分类树</h2>
-          <el-button type="primary" @click="$emit('create-category', null)">新建分类</el-button>
+          <h2 class="section-title">知识分类</h2>
+          <el-button type="primary" size="small" @click="$emit('create-category', null)">新建一级</el-button>
         </div>
-        <el-tree :data="categories" node-key="id" default-expand-all :expand-on-click-node="false" :props="{ label: 'name', children: 'children' }" @node-click="$emit('select-category', $event)">
+        <div class="knowledge-actions">
+          <el-button size="small" :disabled="!selectedCategory" @click="$emit('create-category', selectedCategory)">新建下级</el-button>
+          <el-button size="small" :disabled="!selectedCategory" @click="$emit('edit-category', selectedCategory)">编辑</el-button>
+          <el-button size="small" type="danger" :disabled="!selectedCategory" @click="$emit('delete-category', selectedCategory)">删除</el-button>
+        </div>
+        <el-empty v-if="!categories?.length" description="暂无分类" :image-size="84" />
+        <el-tree
+          v-else
+          :data="categories"
+          node-key="id"
+          highlight-current
+          :current-node-key="selectedCategory?.id"
+          :expand-on-click-node="false"
+          :props="{ label: 'name', children: 'children' }"
+          @node-click="$emit('select-category', $event)"
+        >
           <template #default="{ data }">
-            <div class="tree-row">
-              <span>{{ data.name }}</span>
-              <span class="tree-actions">
-                <el-button size="small" @click.stop="$emit('create-category', data)">新建下级</el-button>
-                <el-button size="small" @click.stop="$emit('edit-category', data)">编辑</el-button>
-                <el-button size="small" type="danger" @click.stop="$emit('delete-category', data)">删除</el-button>
-              </span>
-            </div>
+            <span class="knowledge-tree-label" :title="data.fullPath || data.name">{{ data.name }}</span>
           </template>
         </el-tree>
       </section>
-      <div>
+      <div class="knowledge-main">
         <section class="section">
           <div class="section-header">
-            <h2 class="section-title">分类文件</h2>
-            <span class="muted">{{ selectedCategory?.fullPath || selectedCategory?.name || '请选择分类' }}</span>
+            <div>
+              <h2 class="section-title">分类文件</h2>
+              <span class="muted">{{ selectedCategory?.fullPath || selectedCategory?.name || '请选择左侧分类' }}</span>
+            </div>
           </div>
-          <el-table :data="categoryFiles" border>
+          <el-empty v-if="!selectedCategory" description="请选择左侧分类" :image-size="88" />
+          <el-table v-else :data="categoryFiles" border empty-text="该分类下暂无文件">
             <el-table-column prop="name" label="文件名称" min-width="180" />
             <el-table-column prop="fullPath" label="路径" min-width="260" />
             <el-table-column label="大小" width="110">
@@ -834,13 +951,19 @@ export const KnowledgeView = {
         </section>
         <section class="section">
           <div class="section-header">
-            <h2 class="section-title">文件扩展属性</h2>
-            <el-button type="primary" @click="$emit('create-property')">新建属性</el-button>
+            <h2 class="section-title">扩展属性</h2>
+            <el-button type="primary" size="small" @click="$emit('create-property')">新建属性</el-button>
           </div>
-          <el-table :data="properties" border>
+          <el-table :data="properties" border empty-text="暂无扩展属性">
             <el-table-column prop="name" label="属性名称" min-width="160" />
-            <el-table-column prop="targetType" label="对象" width="100" />
-            <el-table-column prop="dataType" label="类型" width="120" />
+            <el-table-column label="对象" width="100">
+              <template #default="{ row }">{{ row.targetType === 'category' ? '分类' : '文件' }}</template>
+            </el-table-column>
+            <el-table-column label="类型" width="120">
+              <template #default="{ row }">
+                <span class="property-type">{{ row.dataType }}</span>
+              </template>
+            </el-table-column>
             <el-table-column label="必填" width="90">
               <template #default="{ row }">{{ row.required ? '是' : '否' }}</template>
             </el-table-column>
@@ -1041,9 +1164,229 @@ export const ApiManagementView = {
   `
 };
 
+export const GovernanceView = {
+  props: ['dashboard', 'qualityItems', 'duplicateData', 'reviewItems', 'searchAnalytics', 'users', 'formatDate', 'formatSize'],
+  emits: ['preview', 'manage', 'refresh', 'change-search-days'],
+  data: () => ({
+    activeTab: 'overview',
+    issueFilter: 'all',
+    qualityLevel: 'all',
+    reviewStatus: 'all',
+    searchDays: 30
+  }),
+  computed: {
+    stats() {
+      return this.dashboard?.stats || {};
+    },
+    qualityDistribution() {
+      return this.dashboard?.qualityDistribution || {};
+    },
+    reviewDistribution() {
+      return this.dashboard?.reviewDistribution || {};
+    },
+    filteredIssues() {
+      const rows = this.dashboard?.issues || [];
+      if (this.issueFilter === 'all') return rows;
+      return rows.filter((item) => (item.issueTypes || []).includes(this.issueFilter));
+    },
+    filteredQualityItems() {
+      if (this.qualityLevel === 'all') return this.qualityItems || [];
+      return (this.qualityItems || []).filter((item) => item.quality?.level === this.qualityLevel);
+    },
+    filteredReviewItems() {
+      if (this.reviewStatus === 'all') return this.reviewItems || [];
+      return (this.reviewItems || []).filter((item) => item.reviewStatus === this.reviewStatus);
+    }
+  },
+  methods: {
+    qualityTag(level) {
+      return { excellent: 'success', good: 'primary', fair: 'warning', poor: 'danger' }[level] || 'info';
+    },
+    reviewTag(status) {
+      return { normal: 'success', due_soon: 'warning', overdue: 'danger', not_scheduled: 'info' }[status] || 'info';
+    },
+    issueLabel(type) {
+      return { quality: '质量待完善', review_due_soon: '即将复审', review_overdue: '复审逾期', duplicate: '重复文件' }[type] || type;
+    },
+    issueTag(type) {
+      return { quality: 'warning', review_due_soon: 'warning', review_overdue: 'danger', duplicate: 'info' }[type] || 'info';
+    },
+    userName(userId) {
+      const user = (this.users || []).find((item) => item.id === userId);
+      return user?.displayName || user?.username || userId || '-';
+    },
+    qualityPercent(level) {
+      const total = Number(this.stats.files || 0);
+      return total ? Math.round((Number(this.qualityDistribution[level] || 0) / total) * 100) : 0;
+    },
+    reviewPercent(status) {
+      const total = Number(this.stats.files || 0);
+      return total ? Math.round((Number(this.reviewDistribution[status] || 0) / total) * 100) : 0;
+    },
+    changeSearchDays(value) {
+      this.searchDays = Number(value || 30);
+      this.$emit('change-search-days', this.searchDays);
+    }
+  },
+  template: `
+    <div class="governance-page">
+      <div class="governance-header">
+        <div>
+          <h2>知识治理</h2>
+          <p>文档质量、重复资料、复审任务和搜索运营</p>
+        </div>
+        <el-button type="primary" @click="$emit('refresh')">刷新数据</el-button>
+      </div>
+      <div class="governance-metrics">
+        <div class="governance-metric"><span>文档总数</span><strong>{{ stats.files || 0 }}</strong><small>当前有效文件</small></div>
+        <div class="governance-metric"><span>平均质量分</span><strong>{{ stats.averageQualityScore || 0 }}</strong><small>满分 100</small></div>
+        <div class="governance-metric"><span>待完善</span><strong>{{ stats.lowQualityFiles || 0 }}</strong><small>质量分低于 70</small></div>
+        <div class="governance-metric"><span>复审逾期</span><strong>{{ stats.overdueReviews || 0 }}</strong><small>需优先处理</small></div>
+        <div class="governance-metric"><span>重复组</span><strong>{{ stats.duplicateGroups || 0 }}</strong><small>{{ formatSize(stats.duplicateWastedBytes || 0) }} 可核查</small></div>
+        <div class="governance-metric"><span>零结果搜索</span><strong>{{ stats.zeroResultSearches || 0 }}</strong><small>{{ stats.zeroResultRate || 0 }}% 占比</small></div>
+      </div>
+
+      <section class="section governance-tabs-section">
+        <el-tabs v-model="activeTab">
+          <el-tab-pane label="治理概览" name="overview">
+            <div class="governance-distribution-grid">
+              <div class="governance-distribution">
+                <h3>质量分布</h3>
+                <div v-for="item in [{ key: 'excellent', label: '优秀' }, { key: 'good', label: '良好' }, { key: 'fair', label: '待完善' }, { key: 'poor', label: '较差' }]" :key="item.key" class="distribution-row">
+                  <span>{{ item.label }}</span>
+                  <el-progress :percentage="qualityPercent(item.key)" :stroke-width="8" :show-text="false" />
+                  <strong>{{ qualityDistribution[item.key] || 0 }}</strong>
+                </div>
+              </div>
+              <div class="governance-distribution">
+                <h3>复审状态</h3>
+                <div v-for="item in [{ key: 'normal', label: '正常' }, { key: 'due_soon', label: '即将到期' }, { key: 'overdue', label: '已逾期' }, { key: 'not_scheduled', label: '未设置' }]" :key="item.key" class="distribution-row">
+                  <span>{{ item.label }}</span>
+                  <el-progress :percentage="reviewPercent(item.key)" :stroke-width="8" :show-text="false" />
+                  <strong>{{ reviewDistribution[item.key] || 0 }}</strong>
+                </div>
+              </div>
+            </div>
+            <div class="section-header governance-table-header">
+              <h3 class="section-title">待治理文档</h3>
+              <el-select v-model="issueFilter" style="width: 160px">
+                <el-option label="全部问题" value="all" />
+                <el-option label="质量待完善" value="quality" />
+                <el-option label="即将复审" value="review_due_soon" />
+                <el-option label="复审逾期" value="review_overdue" />
+                <el-option label="重复文件" value="duplicate" />
+              </el-select>
+            </div>
+            <el-table :data="filteredIssues" border height="420" empty-text="当前没有待治理文档">
+              <el-table-column prop="name" label="文件" min-width="220" />
+              <el-table-column prop="fullPath" label="路径" min-width="280" />
+              <el-table-column label="质量" width="120"><template #default="{ row }"><el-tag :type="qualityTag(row.quality?.level)">{{ row.quality?.score }} · {{ row.quality?.levelLabel }}</el-tag></template></el-table-column>
+              <el-table-column label="问题" min-width="220"><template #default="{ row }"><div class="governance-tag-list"><el-tag v-for="type in row.issueTypes" :key="type" size="small" :type="issueTag(type)" effect="plain">{{ issueLabel(type) }}</el-tag></div></template></el-table-column>
+              <el-table-column label="操作" width="150" fixed="right"><template #default="{ row }"><el-button size="small" @click="$emit('preview', row)">预览</el-button><el-button size="small" type="primary" @click="$emit('manage', row)">治理</el-button></template></el-table-column>
+            </el-table>
+          </el-tab-pane>
+
+          <el-tab-pane label="质量清单" name="quality">
+            <div class="governance-filter-row">
+              <el-select v-model="qualityLevel" style="width: 160px">
+                <el-option label="全部等级" value="all" />
+                <el-option label="优秀" value="excellent" />
+                <el-option label="良好" value="good" />
+                <el-option label="待完善" value="fair" />
+                <el-option label="较差" value="poor" />
+              </el-select>
+              <span>按质量分从低到高排列，优先处理表格顶部资料</span>
+            </div>
+            <el-table :data="filteredQualityItems" border height="520" empty-text="暂无文档">
+              <el-table-column prop="name" label="文件" min-width="220" />
+              <el-table-column prop="fullPath" label="路径" min-width="280" />
+              <el-table-column label="质量分" width="150"><template #default="{ row }"><div class="quality-score-cell"><strong>{{ row.quality?.score }}</strong><el-progress :percentage="row.quality?.score || 0" :stroke-width="7" :show-text="false" /></div></template></el-table-column>
+              <el-table-column label="等级" width="110"><template #default="{ row }"><el-tag :type="qualityTag(row.quality?.level)">{{ row.quality?.levelLabel }}</el-tag></template></el-table-column>
+              <el-table-column label="首要建议" min-width="260"><template #default="{ row }">{{ row.quality?.suggestions?.[0]?.suggestion || '暂无改进项' }}</template></el-table-column>
+              <el-table-column label="操作" width="150" fixed="right"><template #default="{ row }"><el-button size="small" @click="$emit('preview', row)">预览</el-button><el-button size="small" type="primary" @click="$emit('manage', row)">详情</el-button></template></el-table-column>
+            </el-table>
+          </el-tab-pane>
+
+          <el-tab-pane label="重复文件" name="duplicates">
+            <div class="duplicate-summary-row">
+              <span>重复组 <strong>{{ duplicateData?.summary?.groupCount || 0 }}</strong></span>
+              <span>涉及文件 <strong>{{ duplicateData?.summary?.fileCount || 0 }}</strong></span>
+              <span>可核查空间 <strong>{{ formatSize(duplicateData?.summary?.wastedBytes || 0) }}</strong></span>
+            </div>
+            <el-empty v-if="!duplicateData?.groups?.length" description="当前未发现重复文件" />
+            <el-collapse v-else class="duplicate-collapse">
+              <el-collapse-item v-for="group in duplicateData.groups" :key="group.id" :name="group.id">
+                <template #title><div class="duplicate-group-title"><el-tag :type="group.type === 'exact' ? 'danger' : 'warning'" effect="plain">{{ group.typeLabel }}</el-tag><strong>{{ group.fileCount }} 个文件</strong><span>置信度 {{ group.confidence }}%</span><span>约 {{ formatSize(group.wastedBytes) }}</span></div></template>
+                <el-table :data="group.files" border>
+                  <el-table-column prop="name" label="文件" min-width="220" />
+                  <el-table-column prop="fullPath" label="路径" min-width="300" />
+                  <el-table-column label="大小" width="100"><template #default="{ row }">{{ formatSize(row.duplicateVersion?.sizeBytes || 0) }}</template></el-table-column>
+                  <el-table-column label="更新时间" width="170"><template #default="{ row }">{{ formatDate(row.updatedAt) }}</template></el-table-column>
+                  <el-table-column label="操作" width="150"><template #default="{ row }"><el-button size="small" @click="$emit('preview', row)">预览</el-button><el-button size="small" @click="$emit('manage', row)">详情</el-button></template></el-table-column>
+                </el-table>
+              </el-collapse-item>
+            </el-collapse>
+          </el-tab-pane>
+
+          <el-tab-pane label="复审任务" name="reviews">
+            <div class="governance-filter-row">
+              <el-select v-model="reviewStatus" style="width: 160px">
+                <el-option label="全部状态" value="all" />
+                <el-option label="已逾期" value="overdue" />
+                <el-option label="即将到期" value="due_soon" />
+                <el-option label="正常" value="normal" />
+                <el-option label="未设置" value="not_scheduled" />
+              </el-select>
+              <span>逾期任务会优先显示</span>
+            </div>
+            <el-table :data="filteredReviewItems" border height="520" empty-text="暂无复审任务">
+              <el-table-column prop="name" label="文件" min-width="220" />
+              <el-table-column prop="fullPath" label="路径" min-width="280" />
+              <el-table-column label="状态" width="110"><template #default="{ row }"><el-tag :type="reviewTag(row.reviewStatus)">{{ row.reviewStatusLabel }}</el-tag></template></el-table-column>
+              <el-table-column label="负责人" width="130"><template #default="{ row }">{{ userName(row.review?.ownerId) }}</template></el-table-column>
+              <el-table-column label="下次复审" width="180"><template #default="{ row }">{{ formatDate(row.review?.nextReviewAt) }}</template></el-table-column>
+              <el-table-column label="周期" width="100"><template #default="{ row }">{{ row.review?.enabled ? row.review?.cycleDays + ' 天' : '-' }}</template></el-table-column>
+              <el-table-column label="操作" width="150" fixed="right"><template #default="{ row }"><el-button size="small" @click="$emit('preview', row)">预览</el-button><el-button size="small" type="primary" @click="$emit('manage', row)">处理</el-button></template></el-table-column>
+            </el-table>
+          </el-tab-pane>
+
+          <el-tab-pane label="搜索运营" name="search">
+            <div class="governance-filter-row">
+              <el-radio-group v-model="searchDays" size="small" @change="changeSearchDays">
+                <el-radio-button :value="7">近 7 天</el-radio-button>
+                <el-radio-button :value="30">近 30 天</el-radio-button>
+                <el-radio-button :value="90">近 90 天</el-radio-button>
+              </el-radio-group>
+              <span>搜索 {{ searchAnalytics?.stats?.totalSearches || 0 }} 次，零结果率 {{ searchAnalytics?.stats?.zeroResultRate || 0 }}%</span>
+            </div>
+            <div class="search-analytics-grid">
+              <div>
+                <h3>搜索热词</h3>
+                <el-table :data="searchAnalytics?.popularKeywords || []" border height="360" empty-text="产生搜索记录后将在这里展示">
+                  <el-table-column prop="keyword" label="关键词" min-width="180" />
+                  <el-table-column prop="count" label="次数" width="90" />
+                  <el-table-column prop="averageResults" label="平均结果" width="100" />
+                </el-table>
+              </div>
+              <div>
+                <h3>零结果关键词</h3>
+                <el-table :data="searchAnalytics?.zeroResultKeywords || []" border height="360" empty-text="当前没有零结果搜索">
+                  <el-table-column prop="keyword" label="关键词" min-width="180" />
+                  <el-table-column prop="zeroResultCount" label="零结果次数" width="110" />
+                  <el-table-column prop="count" label="总搜索" width="90" />
+                </el-table>
+              </div>
+            </div>
+          </el-tab-pane>
+        </el-tabs>
+      </section>
+    </div>
+  `
+};
+
 export const SystemManagementView = {
-  props: ['dashboard', 'auditLogs', 'filePolicy', 'externalLibrary', 'storageSettings', 'securityPolicy', 'wecomSettings', 'runtimeStatus', 'auditReport', 'formatDate'],
-  emits: ['edit-file-policy', 'edit-external-library', 'edit-storage', 'sync-storage', 'export-audit', 'edit-security-policy', 'edit-wecom', 'test-wecom'],
+  props: ['dashboard', 'auditLogs', 'filePolicy', 'externalLibrary', 'storageSettings', 'securityPolicy', 'wecomSettings', 'officePreviewSettings', 'searchIndexStatus', 'runtimeStatus', 'auditReport', 'formatDate'],
+  emits: ['edit-file-policy', 'edit-external-library', 'edit-storage', 'sync-storage', 'export-audit', 'edit-security-policy', 'edit-office-preview', 'test-office-preview', 'rebuild-search-index', 'edit-wecom', 'test-wecom'],
   computed: {
     stats() {
       return this.dashboard?.stats || {};
@@ -1079,6 +1422,17 @@ export const SystemManagementView = {
       const host = this.storageMysql.host || '-';
       const port = this.storageMysql.port || 3306;
       return `${host}:${port}`;
+    },
+    officePreviewStatusType() {
+      if (!this.officePreviewSettings?.enabled) return 'info';
+      return this.officePreviewSettings?.lastTestResult?.ok ? 'success' : 'warning';
+    },
+    officePreviewStatusText() {
+      if (!this.officePreviewSettings?.enabled) return '未启用';
+      return this.officePreviewSettings?.lastTestResult?.ok ? '可用' : '待联调';
+    },
+    searchIndexCounts() {
+      return this.searchIndexStatus?.counts || {};
     }
   },
   template: `
@@ -1112,6 +1466,46 @@ export const SystemManagementView = {
           <el-descriptions-item label="同步状态">{{ externalStatus }}</el-descriptions-item>
           <el-descriptions-item label="只同步目录">{{ (externalLibrary?.includePaths || []).join('、') || '全部' }}</el-descriptions-item>
           <el-descriptions-item label="排除规则">{{ (externalLibrary?.excludePatterns || []).join('、') || '-' }}</el-descriptions-item>
+        </el-descriptions>
+      </section>
+      <section class="section">
+        <div class="section-header">
+          <h2 class="section-title">Office 原版预览</h2>
+          <div class="toolbar compact-toolbar">
+            <el-button @click="$emit('edit-office-preview')">配置</el-button>
+            <el-button type="primary" :disabled="!officePreviewSettings?.enabled" @click="$emit('test-office-preview')">测试配置</el-button>
+          </div>
+        </div>
+        <el-descriptions :column="2" border>
+          <el-descriptions-item label="启用状态">
+            <el-tag :type="officePreviewStatusType" effect="light">{{ officePreviewStatusText }}</el-tag>
+          </el-descriptions-item>
+          <el-descriptions-item label="服务类型">{{ officePreviewSettings?.provider === 'onlyoffice' ? 'ONLYOFFICE Docs' : '-' }}</el-descriptions-item>
+          <el-descriptions-item label="Document Server">{{ officePreviewSettings?.documentServerUrl || '-' }}</el-descriptions-item>
+          <el-descriptions-item label="平台外部地址">{{ officePreviewSettings?.publicBaseUrl || '自动使用当前访问地址' }}</el-descriptions-item>
+          <el-descriptions-item label="JWT Secret">{{ officePreviewSettings?.hasJwtSecret ? '已保存' : '-' }}</el-descriptions-item>
+          <el-descriptions-item label="最后测试">{{ formatDate(officePreviewSettings?.lastTestAt) }}</el-descriptions-item>
+          <el-descriptions-item label="测试结果" :span="2">{{ officePreviewSettings?.lastTestResult?.message || '-' }}</el-descriptions-item>
+        </el-descriptions>
+      </section>
+      <section class="section">
+        <div class="section-header">
+          <h2 class="section-title">全文检索索引</h2>
+          <div class="toolbar compact-toolbar">
+            <el-button type="primary" @click="$emit('rebuild-search-index')">重建索引</el-button>
+          </div>
+        </div>
+        <div class="storage-status-row search-index-row">
+          <div class="storage-status-item"><span>当前文件</span><strong>{{ searchIndexStatus?.total || 0 }}</strong></div>
+          <div class="storage-status-item"><span>已索引</span><strong>{{ searchIndexCounts.ready || 0 }}</strong></div>
+          <div class="storage-status-item"><span>空内容</span><strong>{{ searchIndexCounts.empty || 0 }}</strong></div>
+          <div class="storage-status-item"><span>异常</span><strong>{{ searchIndexCounts.failed || 0 }}</strong></div>
+        </div>
+        <el-descriptions :column="2" border>
+          <el-descriptions-item label="暂不支持">{{ searchIndexCounts.unsupported || 0 }}</el-descriptions-item>
+          <el-descriptions-item label="待处理">{{ searchIndexCounts.pending || 0 }}</el-descriptions-item>
+          <el-descriptions-item label="索引字符数">{{ searchIndexStatus?.indexedChars || 0 }}</el-descriptions-item>
+          <el-descriptions-item label="最近索引">{{ formatDate(searchIndexStatus?.lastIndexedAt) }}</el-descriptions-item>
         </el-descriptions>
       </section>
       <section class="section">

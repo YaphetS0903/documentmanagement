@@ -10,7 +10,8 @@
     "build": "vite build",
     "start": "node backend/src/server.js",
     "seed": "node backend/src/seed.js",
-    "test": "node backend/tests/api-smoke.mjs"
+    "test": "node backend/tests/api-smoke.mjs",
+    "onlyoffice:setup": "bash scripts/setup-onlyoffice-local.sh"
   },
   "dependencies": {
     "@vitejs/plugin-vue": "^5.2.4",

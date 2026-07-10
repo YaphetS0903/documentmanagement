@@ -4,6 +4,7 @@ import multer from 'multer';
 import fs from 'node:fs/promises';
 import fsSync from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import mime from 'mime-types';
 import archiver from 'archiver';
 import AdmZip from 'adm-zip';
@@ -75,6 +76,15 @@ const DEFAULT_WECOM_SETTINGS = {
   lastTestAt: null,
   lastTestResult: null
 };
+const DEFAULT_OFFICE_PREVIEW_SETTINGS = {
+  enabled: false,
+  provider: 'onlyoffice',
+  documentServerUrl: '',
+  publicBaseUrl: '',
+  jwtSecret: '',
+  lastTestAt: null,
+  lastTestResult: null
+};
 const LOGIN_FAILURE_LIMIT = 5;
 const LOGIN_LOCK_MINUTES = 15;
 const NODE_PASSWORD_UNLOCK_MS = 30 * 60 * 1000;
@@ -94,6 +104,17 @@ const EXTERNAL_SYNC_IGNORED_DIR_NAMES = new Set([
   '$RECYCLE.BIN',
   'System Volume Information'
 ]);
+const TEXT_PREVIEW_EXTENSIONS = new Set([
+  'txt', 'md', 'csv', 'xml', 'html', 'css', 'js', 'mjs', 'cjs', 'jsx', 'ts', 'tsx', 'vue', 'jsonl', 'log',
+  'py', 'pyw', 'sh', 'bash', 'zsh', 'fish', 'bat', 'cmd', 'ps1',
+  'yml', 'yaml', 'toml', 'ini', 'conf', 'config', 'properties', 'env', 'example', 'gitignore',
+  'sql', 'java', 'kt', 'kts', 'go', 'rs', 'php', 'rb', 'c', 'h', 'cpp', 'hpp', 'cs', 'swift',
+  'dockerfile', 'makefile'
+]);
+const TEXT_PREVIEW_FILENAMES = new Set(['.gitignore', '.dockerignore', '.npmrc', '.nvmrc', '.env', 'dockerfile', 'makefile', 'readme', 'license']);
+const JSON_PREVIEW_EXTENSIONS = new Set(['json']);
+const OFFICE_PREVIEW_EXTENSIONS = new Set(['doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx']);
+const SEARCH_OFFICE_EXTENSIONS = new Set(['docx', 'xlsx', 'pptx']);
 const captchaStore = new Map();
 const apiRateBuckets = new Map();
 
@@ -103,6 +124,16 @@ app.use(express.urlencoded({ extended: true }));
 
 function asyncRoute(fn) {
   return (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+}
+
+async function saveDbBestEffort(db, label) {
+  try {
+    await saveDb(db);
+    return true;
+  } catch (error) {
+    console.error(`${label} save failed`, error);
+    return false;
+  }
 }
 
 function getBearer(req) {
@@ -239,6 +270,7 @@ const COLLECTIONS = [
   'fileRelations',
   'reminders',
   'documentApprovals',
+  'documentReviews',
   'versionChangeLogs',
   'subscriptions',
   'shares',
@@ -248,7 +280,8 @@ const COLLECTIONS = [
   'apiCallLogs',
   'loginTickets',
   'externalSyncJobs',
-  'recentAccesses'
+  'recentAccesses',
+  'searchEvents'
 ];
 
 function defaultPermissionTemplates(timestamp = now()) {
@@ -321,6 +354,7 @@ function ensureDbShape(db) {
   };
   db.settings.securityPolicy = normalizeSecurityPolicy(db.settings.securityPolicy || {});
   db.settings.wecom = normalizeWecomSettings(db.settings.wecom || {});
+  db.settings.officePreview = normalizeOfficePreviewSettings(db.settings.officePreview || {});
   db.settings.externalLibrary = {
     rootPath: db.settings.externalLibrary?.rootPath || config.externalLibraryRoot || '',
     includePaths: normalizeOptions(db.settings.externalLibrary?.includePaths || []),
@@ -334,7 +368,10 @@ function ensureDbShape(db) {
     user.lastFailedLoginAt = user.lastFailedLoginAt || null;
     user.lockedUntil = user.lockedUntil || null;
   });
-  db.nodes.forEach((node) => ensureNodeSecurityShape(db, node));
+  db.nodes.forEach((node) => {
+    ensureNodeSecurityShape(db, node);
+    ensureNodeGovernanceShape(node);
+  });
   return db;
 }
 
@@ -638,6 +675,7 @@ function publicNode(db, user, node, options = {}) {
     passwordEnabled: Boolean(node.passwordEnabled),
     passwordProtected: nodePasswordProtected(db, node),
     tags: node.tags || [],
+    review: publicReviewSettings(db, node),
     createdAt: node.createdAt,
     updatedAt: node.updatedAt,
     deletedAt: node.deletedAt || null,
@@ -775,6 +813,121 @@ function sanitizeWecomSettings(settings = {}) {
   };
 }
 
+function normalizeOfficePreviewSettings(input = {}, fallback = {}) {
+  const provider = String(input.provider ?? fallback.provider ?? DEFAULT_OFFICE_PREVIEW_SETTINGS.provider).trim().toLowerCase();
+  return {
+    ...DEFAULT_OFFICE_PREVIEW_SETTINGS,
+    ...fallback,
+    enabled: normalizeBoolean(input.enabled ?? fallback.enabled, DEFAULT_OFFICE_PREVIEW_SETTINGS.enabled),
+    provider: provider === 'onlyoffice' ? 'onlyoffice' : DEFAULT_OFFICE_PREVIEW_SETTINGS.provider,
+    documentServerUrl: String(input.documentServerUrl ?? fallback.documentServerUrl ?? '').trim().replace(/\/+$/, ''),
+    publicBaseUrl: String(input.publicBaseUrl ?? fallback.publicBaseUrl ?? '').trim().replace(/\/+$/, ''),
+    jwtSecret: String(input.jwtSecret ?? fallback.jwtSecret ?? '').trim(),
+    lastTestAt: input.lastTestAt ?? fallback.lastTestAt ?? null,
+    lastTestResult: input.lastTestResult ?? fallback.lastTestResult ?? null
+  };
+}
+
+function sanitizeOfficePreviewSettings(settings = {}) {
+  const normalized = normalizeOfficePreviewSettings(settings);
+  const { jwtSecret: _jwtSecret, ...safe } = normalized;
+  return {
+    ...safe,
+    hasJwtSecret: Boolean(normalized.jwtSecret)
+  };
+}
+
+function currentOfficePreviewSettings(db) {
+  db.settings = db.settings || {};
+  db.settings.officePreview = normalizeOfficePreviewSettings(db.settings.officePreview || {});
+  return db.settings.officePreview;
+}
+
+function joinUrl(base, suffix) {
+  return `${String(base || '').replace(/\/+$/, '')}/${String(suffix || '').replace(/^\/+/, '')}`;
+}
+
+function requestPublicBaseUrl(req, settings) {
+  const configured = String(settings.publicBaseUrl || '').trim().replace(/\/+$/, '');
+  if (configured) return configured;
+  return `${req.protocol}://${req.get('host')}`;
+}
+
+function officeDocumentType(extension) {
+  if (['doc', 'docx'].includes(extension)) return 'word';
+  if (['xls', 'xlsx'].includes(extension)) return 'cell';
+  if (['ppt', 'pptx'].includes(extension)) return 'slide';
+  return '';
+}
+
+function signOnlyOfficeToken(payload, secret) {
+  const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
+  const body = Buffer.from(JSON.stringify(payload)).toString('base64url');
+  const signature = crypto.createHmac('sha256', secret).update(`${header}.${body}`).digest('base64url');
+  return `${header}.${body}.${signature}`;
+}
+
+function officeDocumentKey(version) {
+  return String(`${version.id}-${version.md5 || version.createdAt || version.versionNo || ''}`)
+    .replace(/[^A-Za-z0-9_.=-]/g, '_')
+    .slice(0, 80);
+}
+
+function buildOnlyOfficePreview(req, node, version, extension) {
+  const settings = currentOfficePreviewSettings(req.db);
+  if (!settings.enabled || !settings.documentServerUrl) return null;
+  const documentType = officeDocumentType(extension);
+  if (!documentType) return null;
+  const previewToken = encodeURIComponent(signToken({
+    userId: req.user.id,
+    purpose: 'office-preview',
+    nodeId: node.id,
+    versionId: version.id
+  }, 30 * 60 * 1000));
+  const unlockTokenValue = unlockTokensFromRequest(req).join(',');
+  const unlockToken = unlockTokenValue ? `&unlockToken=${encodeURIComponent(unlockTokenValue)}` : '';
+  const rawUrl = `/storage/raw/${version.id}?token=${previewToken}${unlockToken}`;
+  const documentUrl = joinUrl(requestPublicBaseUrl(req, settings), rawUrl);
+  const editorConfig = {
+    type: 'desktop',
+    documentType,
+    document: {
+      title: version.originalFilename || node.name,
+      url: documentUrl,
+      fileType: extension,
+      key: officeDocumentKey(version),
+      permissions: {
+        edit: false,
+        download: false,
+        print: false,
+        copy: true,
+        comment: false,
+        review: false
+      }
+    },
+    editorConfig: {
+      mode: 'view',
+      lang: 'zh-CN',
+      user: {
+        id: req.user.id,
+        name: req.user.displayName || req.user.username
+      },
+      customization: {
+        compactHeader: true,
+        compactToolbar: true,
+        hideRightMenu: true,
+        toolbarNoTabs: true
+      }
+    }
+  };
+  if (settings.jwtSecret) editorConfig.token = signOnlyOfficeToken(editorConfig, settings.jwtSecret);
+  return {
+    provider: 'onlyoffice',
+    scriptUrl: joinUrl(settings.documentServerUrl, '/web-apps/apps/api/documents/api.js'),
+    config: editorConfig
+  };
+}
+
 function currentFilePolicy(db) {
   return {
     ...DEFAULT_FILE_POLICY,
@@ -793,6 +946,48 @@ function ensureNodeSecurityShape(db, node) {
   node.securityUpdatedBy = node.securityUpdatedBy || null;
   node.securityUpdatedAt = node.securityUpdatedAt || null;
   return node;
+}
+
+function ensureNodeGovernanceShape(node) {
+  if (!node) return null;
+  node.reviewEnabled = Boolean(node.reviewEnabled);
+  node.reviewCycleDays = Math.max(1, Math.min(3650, Number(node.reviewCycleDays || 365)));
+  node.reviewOwnerId = node.reviewOwnerId || null;
+  node.nextReviewAt = node.nextReviewAt || null;
+  node.lastReviewedAt = node.lastReviewedAt || null;
+  node.lastReviewedBy = node.lastReviewedBy || null;
+  node.lastReviewConclusion = String(node.lastReviewConclusion || '');
+  node.lastReviewNote = String(node.lastReviewNote || '');
+  return node;
+}
+
+function reviewStatusForNode(node, referenceTime = Date.now()) {
+  ensureNodeGovernanceShape(node);
+  if (!node.reviewEnabled || !node.nextReviewAt) return 'not_scheduled';
+  const dueAt = new Date(node.nextReviewAt).getTime();
+  if (!Number.isFinite(dueAt)) return 'not_scheduled';
+  if (dueAt < referenceTime) return 'overdue';
+  if (dueAt - referenceTime <= 30 * 24 * 60 * 60 * 1000) return 'due_soon';
+  return 'normal';
+}
+
+function publicReviewSettings(db, node) {
+  ensureNodeGovernanceShape(node);
+  const owner = node.reviewOwnerId ? db.users.find((item) => item.id === node.reviewOwnerId) : null;
+  const lastReviewer = node.lastReviewedBy ? db.users.find((item) => item.id === node.lastReviewedBy) : null;
+  return {
+    enabled: node.reviewEnabled,
+    cycleDays: node.reviewCycleDays,
+    ownerId: node.reviewOwnerId,
+    owner: owner ? pickPublicUser(owner) : null,
+    nextReviewAt: node.nextReviewAt,
+    status: reviewStatusForNode(node),
+    lastReviewedAt: node.lastReviewedAt,
+    lastReviewedBy: node.lastReviewedBy,
+    lastReviewer: lastReviewer ? pickPublicUser(lastReviewer) : null,
+    lastConclusion: node.lastReviewConclusion,
+    lastNote: node.lastReviewNote
+  };
 }
 
 function nodeSecuritySummary(db, node) {
@@ -1084,7 +1279,7 @@ async function createExternalVersion(db, node, entry, userId) {
   const versionId = newId('ver_');
   const mimeType = mime.lookup(entry.name) || 'application/octet-stream';
   const md5 = await fileMd5FromPath(entry.externalPath).catch(() => '');
-  const searchText = await extractSearchText(entry.externalPath, extension, mimeType);
+  const searchText = await extractSearchText(entry.externalPath, extension, mimeType, entry.name);
   const version = {
     id: versionId,
     nodeId: node.id,
@@ -1103,7 +1298,7 @@ async function createExternalVersion(db, node, entry, userId) {
     description: versionNo === 1 ? '服务器目录同步' : '服务器文件变更同步',
     searchText,
     previewStatus: ['pdf', 'png', 'jpg', 'jpeg', 'gif', 'txt', 'md'].includes(extension) || mimeType.startsWith('text/') ? 'ready' : 'unsupported',
-    indexStatus: 'ready',
+    indexStatus: indexStatusForSearchText(searchText, extension, mimeType, entry.name),
     createdBy: userId,
     createdAt: now()
   };
@@ -1313,9 +1508,37 @@ function ensureNodeMoveAllowed(db, node, targetParent) {
   ensureSiblingNameAvailable(db, targetParent.id, node.name, node.id);
 }
 
-async function extractSearchText(filePath, extension, mimeType) {
-  const textLike = ['txt', 'md', 'csv', 'json', 'xml', 'html', 'css', 'js', 'ts', 'log'];
-  if (mimeType?.startsWith('text/') || textLike.includes(extension)) {
+function decodeXmlText(value) {
+  return String(value || '')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function textFromOfficeXml(xml) {
+  const textNodes = [];
+  const textNodePattern = /<(?:[A-Za-z0-9]+:)?t(?:\s[^>]*)?>([\s\S]*?)<\/(?:[A-Za-z0-9]+:)?t>/g;
+  for (const match of xml.matchAll(textNodePattern)) {
+    const text = decodeXmlText(match[1]);
+    if (text) textNodes.push(text);
+  }
+  if (textNodes.length) return textNodes.join(' ');
+  return decodeXmlText(xml);
+}
+
+async function extractSearchText(filePath, extension, mimeType, filename = '') {
+  const normalizedFilename = path.basename(String(filename || filePath || '')).toLowerCase();
+  if (
+    mimeType?.startsWith('text/') ||
+    TEXT_PREVIEW_EXTENSIONS.has(extension) ||
+    JSON_PREVIEW_EXTENSIONS.has(extension) ||
+    TEXT_PREVIEW_FILENAMES.has(normalizedFilename)
+  ) {
     const raw = await fs.readFile(filePath, 'utf8');
     return raw.slice(0, 200000);
   }
@@ -1327,12 +1550,8 @@ async function extractSearchText(filePath, extension, mimeType) {
         .filter((entry) => !entry.isDirectory && entry.entryName.endsWith('.xml'))
         .filter((entry) => /word\/document|xl\/sharedStrings|xl\/worksheets|ppt\/slides/.test(entry.entryName));
       const text = xmlEntries
-        .map((entry) => entry.getData().toString('utf8'))
+        .map((entry) => textFromOfficeXml(entry.getData().toString('utf8')))
         .join('\n')
-        .replace(/<[^>]+>/g, ' ')
-        .replace(/&lt;/g, '<')
-        .replace(/&gt;/g, '>')
-        .replace(/&amp;/g, '&')
         .replace(/\s+/g, ' ')
         .trim();
       return text.slice(0, 200000);
@@ -1341,6 +1560,49 @@ async function extractSearchText(filePath, extension, mimeType) {
     }
   }
   return '';
+}
+
+function supportsSearchText(extension, mimeType, filename = '') {
+  const normalizedExtension = String(extension || '').replace(/^\./, '').toLowerCase();
+  const normalizedFilename = path.basename(String(filename || '')).toLowerCase();
+  return Boolean(
+    mimeType?.startsWith('text/') ||
+    TEXT_PREVIEW_EXTENSIONS.has(normalizedExtension) ||
+    JSON_PREVIEW_EXTENSIONS.has(normalizedExtension) ||
+    SEARCH_OFFICE_EXTENSIONS.has(normalizedExtension) ||
+    TEXT_PREVIEW_FILENAMES.has(normalizedFilename)
+  );
+}
+
+function indexStatusForSearchText(searchText, extension, mimeType, filename = '') {
+  if (String(searchText || '').trim()) return 'ready';
+  return supportsSearchText(extension, mimeType, filename) ? 'empty' : 'unsupported';
+}
+
+function trimPreviewContent(content) {
+  return String(content || '').replace(/\r\n/g, '\n').slice(0, 200000);
+}
+
+async function readPreviewText(version, node, db) {
+  const filePath = versionFilePath(version, node, db);
+  if (filePath && fsSync.existsSync(filePath)) {
+    try {
+      return trimPreviewContent(await fs.readFile(filePath, 'utf8'));
+    } catch {
+      return trimPreviewContent(version.searchText);
+    }
+  }
+  return trimPreviewContent(version.searchText);
+}
+
+function formatJsonPreview(content) {
+  const raw = trimPreviewContent(content);
+  if (!raw) return '';
+  try {
+    return JSON.stringify(JSON.parse(raw), null, 2);
+  } catch {
+    return raw;
+  }
 }
 
 function versionFilePath(version, node = null, db = null) {
@@ -1361,7 +1623,7 @@ async function createVersionFromUpload(db, node, file, userId, description = '')
   await fs.rename(file.path, storageKey);
   const md5 = await fileMd5FromPath(storageKey);
   const mimeType = file.mimetype || mime.lookup(file.originalname) || 'application/octet-stream';
-  const searchText = await extractSearchText(storageKey, extension, mimeType);
+  const searchText = await extractSearchText(storageKey, extension, mimeType, file.originalname);
   const version = {
     id: versionId,
     nodeId: node.id,
@@ -1375,7 +1637,7 @@ async function createVersionFromUpload(db, node, file, userId, description = '')
     description,
     searchText,
     previewStatus: ['pdf', 'png', 'jpg', 'jpeg', 'gif', 'txt', 'md'].includes(extension) || mimeType.startsWith('text/') ? 'ready' : 'unsupported',
-    indexStatus: 'ready',
+    indexStatus: indexStatusForSearchText(searchText, extension, mimeType, file.originalname),
     createdBy: userId,
     createdAt: now()
   };
@@ -2119,7 +2381,7 @@ function openApiDocument() {
     info: {
       title: '文档管理平台 API',
       version: '0.1.0',
-      description: '一期开发版 REST API 文档，支持 JWT 和 AccessKey/Secret 鉴权。'
+      description: '文档管理平台 REST API，支持 JWT 和 AccessKey/Secret 鉴权。'
     },
     servers: [{ url: '/api/v1' }],
     components: {
@@ -2152,6 +2414,18 @@ function openApiDocument() {
       '/nodes/batch-move': endpoint('批量移动', 'post'),
       '/nodes/batch-delete': endpoint('批量删除', 'post'),
       '/search/files': endpoint('文件搜索', 'post'),
+      '/search/suggestions': endpoint('搜索建议'),
+      '/search/index/status': endpoint('全文检索索引状态'),
+      '/search/index/rebuild': endpoint('重建全文检索索引', 'post'),
+      '/governance/dashboard': endpoint('知识治理工作台'),
+      '/governance/quality': endpoint('文档质量清单'),
+      '/governance/duplicates': endpoint('重复文件检测'),
+      '/governance/reviews': endpoint('文档复审清单'),
+      '/governance/search-analytics': endpoint('搜索运营分析'),
+      '/nodes/{id}/quality': endpoint('文档质量详情'),
+      '/nodes/{id}/review': endpoint('文档复审配置'),
+      '/nodes/{id}/review/complete': endpoint('完成文档复审', 'post'),
+      '/nodes/{id}/review-history': endpoint('文档复审历史'),
       '/categories/tree': endpoint('分类树'),
       '/categories/{id}/files': endpoint('分类文件列表'),
       '/permission-templates': endpoint('权限模板列表/新增'),
@@ -2186,6 +2460,8 @@ function openApiDocument() {
       '/system-settings/file-policy': endpoint('文件上传策略'),
       '/system-settings/security-policy': endpoint('文件安全策略'),
       '/system-settings/external-library': endpoint('服务器文档目录设置'),
+      '/system-settings/office-preview': endpoint('Office 在线预览配置'),
+      '/system-settings/office-preview/test': endpoint('测试 Office 在线预览配置', 'post'),
       '/system-settings/wecom': endpoint('企业微信配置'),
       '/system-settings/wecom/test': endpoint('测试企业微信配置', 'post'),
       '/system-settings/storage': endpoint('数据存储配置'),
@@ -2852,6 +3128,7 @@ app.delete('/api/v1/trash/:id', requireAuth, asyncRoute(async (req, res) => {
   req.db.attachments = req.db.attachments.filter((item) => !affectedIds.has(item.nodeId));
   req.db.fileRelations = req.db.fileRelations.filter((item) => !affectedIds.has(item.nodeId) && !affectedIds.has(item.relatedNodeId));
   req.db.documentApprovals = req.db.documentApprovals.filter((item) => !affectedIds.has(item.nodeId));
+  req.db.documentReviews = req.db.documentReviews.filter((item) => !affectedIds.has(item.nodeId));
   req.db.versionChangeLogs = req.db.versionChangeLogs.filter((item) => !affectedIds.has(item.nodeId));
   addAudit(req.db, req.user.id, 'node.destroy', 'node', node.id, { targetPath: node.fullPath, count: affectedIds.size }, req);
   await saveDb(req.db);
@@ -3022,7 +3299,7 @@ app.get('/api/v1/files/:id/download', requireAuth, asyncRoute(async (req, res) =
     sensitive: Boolean(node.sensitive)
   }, req);
   recordRecentAccess(req.db, req.user, node, 'download');
-  await saveDb(req.db);
+  void saveDbBestEffort(req.db, 'download access log');
   streamVersion(res, version, version.originalFilename || node.name, { db: req.db, node });
 }));
 
@@ -3043,14 +3320,37 @@ app.get('/api/v1/files/:id/preview', requireAuth, asyncRoute(async (req, res) =>
   if (!version) throw createError(404, 'NOT_FOUND', '版本不存在');
   if (version.nodeId !== node.id) throw createError(404, 'NOT_FOUND', '版本不存在');
   const extension = node.extension || extname(version.originalFilename);
+  const filename = String(version.originalFilename || node.name || '').toLowerCase();
   const token = encodeURIComponent(getBearer(req));
   const unlockTokenValue = unlockTokensFromRequest(req).join(',');
   const unlockToken = unlockTokenValue ? `&unlockToken=${encodeURIComponent(unlockTokenValue)}` : '';
   const rawUrl = `/storage/raw/${version.id}?token=${token}${unlockToken}`;
   let previewType = 'unsupported';
+  let content = '';
+  let officePreview = null;
   if (version.mimeType === 'application/pdf' || extension === 'pdf') previewType = 'pdf';
   else if (version.mimeType?.startsWith('image/')) previewType = 'image';
-  else if (version.mimeType?.startsWith('text/') || ['txt', 'md', 'csv', 'json', 'xml', 'html', 'log', 'docx', 'xlsx', 'pptx'].includes(extension)) previewType = 'text';
+  else if (OFFICE_PREVIEW_EXTENSIONS.has(extension)) {
+    previewType = 'office';
+    const officeText = await extractSearchText(versionFilePath(version, node, req.db), extension, version.mimeType, version.originalFilename).catch(() => '');
+    content = trimPreviewContent(officeText || version.searchText);
+    const nativePreview = buildOnlyOfficePreview(req, node, version, extension);
+    officePreview = {
+      status: nativePreview ? 'native_ready' : 'text_fallback',
+      provider: 'ONLYOFFICE Docs',
+      message: nativePreview
+        ? '正在使用 ONLYOFFICE 原版预览；加载失败时可查看提取文本。'
+        : '当前展示提取文本；原版排版预览需要在系统管理中配置 ONLYOFFICE Document Server。',
+      extension,
+      native: nativePreview
+    };
+  } else if (JSON_PREVIEW_EXTENSIONS.has(extension)) {
+    previewType = 'json';
+    content = formatJsonPreview(await readPreviewText(version, node, req.db));
+  } else if (version.mimeType?.startsWith('text/') || TEXT_PREVIEW_EXTENSIONS.has(extension) || TEXT_PREVIEW_FILENAMES.has(filename)) {
+    previewType = 'text';
+    content = await readPreviewText(version, node, req.db);
+  }
   const policy = currentSecurityPolicy(req.db);
   if (node.sensitive && policy.logSensitiveAccess) {
     addAudit(req.db, req.user.id, 'sensitive.preview', 'node', node.id, {
@@ -3061,11 +3361,11 @@ app.get('/api/v1/files/:id/preview', requireAuth, asyncRoute(async (req, res) =>
     }, req);
   }
   recordRecentAccess(req.db, req.user, node, 'preview');
-  await saveDb(req.db);
+  void saveDbBestEffort(req.db, 'preview access log');
   res.json(ok({
     previewType,
     rawUrl,
-    content: previewType === 'text' ? version.searchText || '' : '',
+    content,
     version: publicVersion(version),
     node: publicNode(req.db, req.user, node),
     watermark: {
@@ -3075,9 +3375,7 @@ app.get('/api/v1/files/:id/preview', requireAuth, asyncRoute(async (req, res) =>
       securityLevelLabel: SECURITY_LEVEL_LABELS[node.securityLevel] || node.securityLevel,
       sensitive: Boolean(node.sensitive)
     },
-    officePreview: ['doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx'].includes(extension)
-      ? { status: 'placeholder', provider: 'OnlyOffice/WPS WebOffice', message: '已预留 Office 原版预览服务接入位' }
-      : null
+    officePreview
   }));
 }));
 
@@ -3094,8 +3392,8 @@ app.post('/api/v1/files/:id/read-upload-messages', requireAuth, asyncRoute(async
       item.readAt = readAt;
       readCount += 1;
     });
-  if (readCount) await saveDb(req.db);
-  res.json(ok({ readCount }));
+  if (readCount) void saveDbBestEffort(req.db, 'upload message read state');
+  res.json(ok({ readCount, persisted: true }));
 }));
 
 app.post('/api/v1/files/batch-download', requireAuth, asyncRoute(async (req, res) => {
@@ -3562,14 +3860,491 @@ app.post('/api/v1/nodes/:id/password/verify', requireAuth, asyncRoute(async (req
   res.json(ok({ unlockToken, nodeId: protectedNode.id, expiresInSeconds: Math.floor(NODE_PASSWORD_UNLOCK_MS / 1000) }));
 }));
 
-app.post('/api/v1/search/files', requireAuth, (req, res) => {
-  const keyword = String(req.body.keyword || '').trim().toLowerCase();
+function searchCategoryText(db, node) {
+  return db.documentCategories
+    .filter((item) => item.nodeId === node.id)
+    .map((item) => db.categories.find((category) => category.id === item.categoryId)?.name || '')
+    .filter(Boolean)
+    .join(' ');
+}
+
+function searchPropertyText(db, node) {
+  return db.propertyValues
+    .filter((item) => item.nodeId === node.id)
+    .map((item) => item.value)
+    .filter(Boolean)
+    .join(' ');
+}
+
+function textSnippet(content, keyword, radius = 72) {
+  const source = String(content || '').replace(/\s+/g, ' ').trim();
+  const needle = String(keyword || '').trim();
+  if (!source || !needle) return '';
+  const index = source.toLowerCase().indexOf(needle.toLowerCase());
+  if (index < 0) return source.slice(0, radius * 2);
+  const start = Math.max(0, index - radius);
+  const end = Math.min(source.length, index + needle.length + radius);
+  return `${start > 0 ? '...' : ''}${source.slice(start, end)}${end < source.length ? '...' : ''}`;
+}
+
+function buildSearchMatch(req, db, node, version, keyword, cached = {}) {
+  const needle = String(keyword || '').trim();
+  if (!needle) return null;
+  const lowered = needle.toLowerCase();
+  const searchableContent = cached.searchableContent ?? (isNodePasswordAccessible(req, node) ? (version?.searchText || '') : '');
+  const categoryNames = cached.categoryNames ?? searchCategoryText(db, node);
+  const propertyText = cached.propertyText ?? searchPropertyText(db, node);
+  const tags = (node.tags || []).join(' ');
+  const checks = [
+    ['name', '文件名', node.name],
+    ['tag', '标签', tags],
+    ['category', '知识分类', categoryNames],
+    ['content', '正文内容', searchableContent],
+    ['path', '路径', node.fullPath],
+    ['property', '扩展属性', propertyText]
+  ];
+  const matched = checks.find(([, , value]) => String(value || '').toLowerCase().includes(lowered));
+  if (!matched) return null;
+  const [source, sourceLabel, value] = matched;
+  const score = searchRelevanceScore(req, node, version, needle, { searchableContent, categoryNames, propertyText, tags });
+  return {
+    keyword: needle,
+    source,
+    sourceLabel,
+    snippet: textSnippet(value, needle),
+    indexStatus: version?.indexStatus || '',
+    indexedChars: String(version?.searchText || '').length,
+    score
+  };
+}
+
+function searchRelevanceScore(req, node, version, keyword, cached = {}) {
+  const needle = String(keyword || '').trim().toLowerCase();
+  if (!needle) return 0;
+  const name = String(node.name || '').toLowerCase();
+  const fullPath = String(node.fullPath || '').toLowerCase();
+  const tags = String(cached.tags ?? (node.tags || []).join(' ')).toLowerCase();
+  const categoryNames = String(cached.categoryNames ?? searchCategoryText(req.db, node)).toLowerCase();
+  const propertyText = String(cached.propertyText ?? searchPropertyText(req.db, node)).toLowerCase();
+  const content = String(cached.searchableContent ?? (isNodePasswordAccessible(req, node) ? (version?.searchText || '') : '')).toLowerCase();
+  let score = 0;
+  if (name === needle) score += 220;
+  else if (name.startsWith(needle)) score += 180;
+  else if (name.includes(needle)) score += 145;
+  if (tags.includes(needle)) score += 120;
+  if (categoryNames.includes(needle)) score += 105;
+  if (content.includes(needle)) {
+    const firstIndex = content.indexOf(needle);
+    const occurrences = content.split(needle).length - 1;
+    score += 90 + Math.min(35, occurrences * 4);
+    if (firstIndex >= 0 && firstIndex < 500) score += 12;
+  }
+  if (fullPath.includes(needle)) score += 60;
+  if (propertyText.includes(needle)) score += 55;
+  const updatedAt = new Date(node.updatedAt || node.createdAt || 0).getTime();
+  if (updatedAt) {
+    const ageDays = Math.max(0, (Date.now() - updatedAt) / (24 * 60 * 60 * 1000));
+    score += Math.max(0, 24 - Math.min(24, ageDays / 7));
+  }
+  const recentAccess = (req.db.recentAccesses || []).find((item) => item.userId === req.user.id && item.nodeId === node.id);
+  if (recentAccess) score += 18;
+  const favorite = (req.db.favorites || []).find((item) => item.userId === req.user.id && item.nodeId === node.id);
+  if (favorite) score += 15;
+  if ((node.sourceType || 'local') === 'external') score += 2;
+  return Math.round(score);
+}
+
+function buildSearchSuggestions(req, keyword, pathPrefix = '', limit = 8) {
+  const normalizedKeyword = String(keyword || '').trim().toLowerCase();
+  if (!normalizedKeyword) return [];
+  const suggestions = [];
+  const seen = new Set();
+  const addSuggestion = (value, type, typeLabel, node, detail = '') => {
+    const normalizedValue = String(value || '').trim();
+    if (!normalizedValue) return;
+    const key = `${type}:${normalizedValue.toLowerCase()}:${node?.id || ''}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    suggestions.push({
+      value: normalizedValue,
+      type,
+      typeLabel,
+      nodeId: node?.id || '',
+      nodeName: node?.name || '',
+      fullPath: node?.fullPath || '',
+      detail: textSnippet(detail || node?.fullPath || node?.name || normalizedValue, normalizedKeyword, 42)
+    });
+  };
+  listVisibleDescendants(req.db, req.user)
+    .filter((node) => node.nodeType === 'file')
+    .filter((node) => !pathPrefix || node.fullPath.startsWith(pathPrefix))
+    .some((node) => {
+      const version = currentVersion(req.db, node);
+      const categoryNames = searchCategoryText(req.db, node);
+      const propertyText = searchPropertyText(req.db, node);
+      const searchableContent = isNodePasswordAccessible(req, node) ? (version?.searchText || '') : '';
+      if (String(node.name || '').toLowerCase().includes(normalizedKeyword)) addSuggestion(node.name, 'name', '文件名', node);
+      (node.tags || [])
+        .filter((tag) => String(tag || '').toLowerCase().includes(normalizedKeyword))
+        .forEach((tag) => addSuggestion(tag, 'tag', '标签', node));
+      categoryNames
+        .split(/\s+/)
+        .filter((name) => name.toLowerCase().includes(normalizedKeyword))
+        .forEach((name) => addSuggestion(name, 'category', '知识分类', node));
+      if (String(node.fullPath || '').toLowerCase().includes(normalizedKeyword)) addSuggestion(normalizedKeyword, 'path', '路径', node, node.fullPath);
+      if (propertyText.toLowerCase().includes(normalizedKeyword)) addSuggestion(normalizedKeyword, 'property', '扩展属性', node, propertyText);
+      if (searchableContent.toLowerCase().includes(normalizedKeyword)) addSuggestion(normalizedKeyword, 'content', '正文内容', node, searchableContent);
+      return suggestions.length >= limit * 2;
+    });
+  return suggestions
+    .sort((a, b) => {
+      const rank = { name: 1, content: 2, tag: 3, category: 4, path: 5, property: 6 };
+      return (rank[a.type] || 99) - (rank[b.type] || 99);
+    })
+    .slice(0, limit);
+}
+
+function searchIndexStatus(db) {
+  const counts = { ready: 0, empty: 0, unsupported: 0, failed: 0, pending: 0 };
+  let indexedChars = 0;
+  let lastIndexedAt = null;
+  const files = db.nodes.filter((node) => node.nodeType === 'file' && node.status !== 'deleted');
+  files.forEach((node) => {
+    const version = currentVersion(db, node);
+    if (!version) {
+      counts.pending += 1;
+      return;
+    }
+    const status = version.indexStatus || (version.searchText ? 'ready' : 'pending');
+    counts[status] = (counts[status] || 0) + 1;
+    indexedChars += String(version.searchText || '').length;
+    if (version.indexedAt && (!lastIndexedAt || new Date(version.indexedAt).getTime() > new Date(lastIndexedAt).getTime())) {
+      lastIndexedAt = version.indexedAt;
+    }
+  });
+  return {
+    total: files.length,
+    indexed: counts.ready,
+    indexedChars,
+    lastIndexedAt,
+    counts
+  };
+}
+
+const QUALITY_LEVEL_LABELS = {
+  excellent: '优秀',
+  good: '良好',
+  fair: '待完善',
+  poor: '较差'
+};
+
+const REVIEW_STATUS_LABELS = {
+  not_scheduled: '未设置',
+  normal: '正常',
+  due_soon: '即将到期',
+  overdue: '已逾期'
+};
+
+function qualityLevel(score) {
+  if (score >= 85) return 'excellent';
+  if (score >= 70) return 'good';
+  if (score >= 50) return 'fair';
+  return 'poor';
+}
+
+function documentQuality(db, node) {
+  const version = currentVersion(db, node);
+  const dimensions = [];
+  const suggestions = [];
+  const addDimension = (key, label, score, maxScore, detail, suggestion = '') => {
+    dimensions.push({ key, label, score, maxScore, detail });
+    if (score < maxScore && suggestion) suggestions.push({ key, label, priority: maxScore - score, suggestion });
+  };
+
+  const nameStem = path.parse(String(node.name || '')).name.trim();
+  const weakName = !nameStem || nameStem.length < 3 || /^(?:新建|未命名|副本|copy|document|file|文档|文件)?[\s_-]*\d*$/i.test(nameStem);
+  addDimension('name', '文件名称', weakName ? 0 : 15, 15, weakName ? '名称过短或属于默认名称' : '名称清晰', '使用能表达资料主题的文件名称');
+
+  const description = String(version?.description || '').trim();
+  const genericDescription = /^(?:初始版本|上传更新|服务器目录同步|服务器文件变更同步)$/i.test(description);
+  const descriptionScore = !description ? 0 : (genericDescription || description.length < 6 ? 8 : 15);
+  addDimension('version_description', '版本说明', descriptionScore, 15, descriptionScore === 15 ? '当前版本说明完整' : (description ? '当前说明较简单' : '当前版本没有说明'), '补充本次版本的变更内容或用途');
+
+  const tags = (node.tags || []).map((item) => String(item || '').trim()).filter(Boolean);
+  const tagScore = tags.length >= 2 ? 15 : (tags.length === 1 ? 8 : 0);
+  addDimension('tags', '标签', tagScore, 15, tags.length ? `已维护 ${tags.length} 个标签` : '未维护标签', '至少维护两个便于检索的业务标签');
+
+  const categoryCount = db.documentCategories.filter((item) => item.nodeId === node.id).length;
+  addDimension('category', '知识分类', categoryCount ? 15 : 0, 15, categoryCount ? `已关联 ${categoryCount} 个分类` : '未关联知识分类', '关联一个合适的知识分类');
+
+  const propertyCount = db.propertyValues.filter((item) => item.nodeId === node.id && String(item.value ?? '').trim()).length;
+  addDimension('properties', '扩展属性', propertyCount ? 10 : 0, 10, propertyCount ? `已维护 ${propertyCount} 个属性` : '未维护扩展属性', '补充适合该资料类型的扩展属性');
+
+  ensureNodeSecurityShape(db, node);
+  const securityScore = node.securityLevel && (!node.sensitive || String(node.sensitiveReason || '').trim()) ? 10 : 5;
+  addDimension('security', '安全信息', securityScore, 10, securityScore === 10 ? '密级和敏感信息完整' : '敏感文件缺少敏感原因', '补充敏感原因，便于审计和审批判断');
+
+  const indexReady = version?.indexStatus === 'ready';
+  addDimension('search_index', '可检索内容', indexReady ? 10 : 0, 10, indexReady ? '正文索引可用' : `索引状态：${version?.indexStatus || '未建立'}`, '重建全文索引或检查文件格式');
+
+  ensureNodeGovernanceShape(node);
+  const reviewReady = Boolean(node.reviewEnabled && node.reviewOwnerId && node.nextReviewAt);
+  addDimension('review_plan', '复审计划', reviewReady ? 10 : 0, 10, reviewReady ? '已设置负责人和复审时间' : '未设置完整复审计划', '为重要资料设置复审负责人和周期');
+
+  const score = dimensions.reduce((sum, item) => sum + item.score, 0);
+  const level = qualityLevel(score);
+  return {
+    nodeId: node.id,
+    score,
+    level,
+    levelLabel: QUALITY_LEVEL_LABELS[level],
+    dimensions,
+    suggestions: suggestions.sort((a, b) => b.priority - a.priority),
+    evaluatedAt: now()
+  };
+}
+
+function normalizeDuplicateName(filename) {
+  const stem = path.parse(String(filename || '').normalize('NFKC')).name.toLowerCase();
+  return stem
+    .replace(/(?:副本|copy)(?:\s*\d+)?/gi, '')
+    .replace(/[\s._\-—–()（）\[\]【】]+/g, '')
+    .trim();
+}
+
+function duplicateGroupId(type, key) {
+  return `dup_${type}_${crypto.createHash('sha1').update(key).digest('hex').slice(0, 12)}`;
+}
+
+function duplicateFileGroups(db, user) {
+  const files = db.nodes
+    .filter((node) => node.nodeType === 'file' && node.status !== 'deleted')
+    .map((node) => ({ node, version: currentVersion(db, node) }))
+    .filter((item) => item.version);
+  const exactBuckets = new Map();
+  files.forEach((item) => {
+    const md5 = String(item.version.md5 || '').trim();
+    if (!md5) return;
+    if (!exactBuckets.has(md5)) exactBuckets.set(md5, []);
+    exactBuckets.get(md5).push(item);
+  });
+  const exactNodeIds = new Set();
+  const exact = [...exactBuckets.entries()]
+    .filter(([, items]) => items.length > 1)
+    .map(([md5, items]) => {
+      items.forEach((item) => exactNodeIds.add(item.node.id));
+      const sizes = items.map((item) => Number(item.version.sizeBytes || 0));
+      return {
+        id: duplicateGroupId('exact', md5),
+        type: 'exact',
+        typeLabel: '完全重复',
+        confidence: 100,
+        fileCount: items.length,
+        wastedBytes: Math.max(0, sizes.reduce((sum, value) => sum + value, 0) - Math.max(...sizes)),
+        files: items.map(({ node, version }) => ({ ...publicNode(db, user, node), duplicateVersion: publicVersion(version) }))
+      };
+    });
+
+  const probableBuckets = new Map();
+  files.filter((item) => !exactNodeIds.has(item.node.id)).forEach((item) => {
+    const normalizedName = normalizeDuplicateName(item.node.name);
+    if (!normalizedName) return;
+    const key = `${normalizedName}|${item.node.extension || ''}`;
+    if (!probableBuckets.has(key)) probableBuckets.set(key, []);
+    probableBuckets.get(key).push(item);
+  });
+  const probable = [...probableBuckets.entries()]
+    .filter(([, items]) => items.length > 1)
+    .filter(([, items]) => {
+      const sizes = items.map((item) => Number(item.version.sizeBytes || 0));
+      const min = Math.min(...sizes);
+      const max = Math.max(...sizes);
+      return max - min <= Math.max(4096, max * 0.02);
+    })
+    .map(([key, items]) => {
+      const sizes = items.map((item) => Number(item.version.sizeBytes || 0));
+      return {
+        id: duplicateGroupId('probable', key),
+        type: 'probable',
+        typeLabel: '疑似重复',
+        confidence: 80,
+        fileCount: items.length,
+        wastedBytes: Math.max(0, sizes.reduce((sum, value) => sum + value, 0) - Math.max(...sizes)),
+        files: items.map(({ node, version }) => ({ ...publicNode(db, user, node), duplicateVersion: publicVersion(version) }))
+      };
+    });
+  return [...exact, ...probable].sort((a, b) => b.wastedBytes - a.wastedBytes || b.fileCount - a.fileCount);
+}
+
+function searchAnalytics(db, days = 30) {
+  const normalizedDays = Math.max(1, Math.min(365, Number(days || 30)));
+  const from = Date.now() - normalizedDays * 24 * 60 * 60 * 1000;
+  const events = (db.searchEvents || []).filter((item) => new Date(item.createdAt).getTime() >= from);
+  const keywordMap = new Map();
+  events.forEach((item) => {
+    const key = item.normalizedKeyword || String(item.keyword || '').trim().toLowerCase();
+    if (!key) return;
+    const current = keywordMap.get(key) || { keyword: item.keyword, count: 0, zeroResultCount: 0, totalResults: 0, lastSearchedAt: item.createdAt };
+    current.count += 1;
+    current.totalResults += Number(item.resultCount || 0);
+    if (!item.resultCount) current.zeroResultCount += 1;
+    if (String(item.createdAt || '') > String(current.lastSearchedAt || '')) {
+      current.keyword = item.keyword;
+      current.lastSearchedAt = item.createdAt;
+    }
+    keywordMap.set(key, current);
+  });
+  const popularKeywords = [...keywordMap.values()]
+    .map((item) => ({ ...item, averageResults: item.count ? Math.round(item.totalResults / item.count) : 0 }))
+    .sort((a, b) => b.count - a.count || b.lastSearchedAt.localeCompare(a.lastSearchedAt))
+    .slice(0, 12);
+  const zeroResultKeywords = [...keywordMap.values()]
+    .filter((item) => item.zeroResultCount > 0)
+    .sort((a, b) => b.zeroResultCount - a.zeroResultCount || b.count - a.count)
+    .slice(0, 12);
+  const zeroResultSearches = events.filter((item) => !item.resultCount).length;
+  return {
+    days: normalizedDays,
+    stats: {
+      totalSearches: events.length,
+      uniqueKeywords: keywordMap.size,
+      zeroResultSearches,
+      zeroResultRate: events.length ? Math.round((zeroResultSearches / events.length) * 1000) / 10 : 0
+    },
+    popularKeywords,
+    zeroResultKeywords,
+    recentSearches: events.slice(0, 20).map((item) => ({
+      ...item,
+      user: pickPublicUser(db.users.find((user) => user.id === item.userId))
+    }))
+  };
+}
+
+function governanceReviewCounts(files) {
+  return files.reduce((counts, node) => {
+    const status = reviewStatusForNode(node);
+    counts[status] = (counts[status] || 0) + 1;
+    return counts;
+  }, { not_scheduled: 0, normal: 0, due_soon: 0, overdue: 0 });
+}
+
+function governanceQualityCounts(qualities) {
+  return qualities.reduce((counts, quality) => {
+    counts[quality.level] = (counts[quality.level] || 0) + 1;
+    return counts;
+  }, { excellent: 0, good: 0, fair: 0, poor: 0 });
+}
+
+function governanceDashboard(req) {
+  const files = req.db.nodes.filter((node) => node.nodeType === 'file' && node.status !== 'deleted');
+  const qualityRows = files.map((node) => ({ node, quality: documentQuality(req.db, node) }));
+  const duplicateGroups = duplicateFileGroups(req.db, req.user);
+  const duplicateNodeIds = new Set(duplicateGroups.flatMap((group) => group.files.map((file) => file.id)));
+  const reviews = governanceReviewCounts(files);
+  const qualityDistribution = governanceQualityCounts(qualityRows.map((item) => item.quality));
+  const averageQualityScore = qualityRows.length
+    ? Math.round(qualityRows.reduce((sum, item) => sum + item.quality.score, 0) / qualityRows.length)
+    : 0;
+  const issueRows = qualityRows
+    .map(({ node, quality }) => {
+      const reviewStatus = reviewStatusForNode(node);
+      const issueTypes = [];
+      if (quality.score < 70) issueTypes.push('quality');
+      if (reviewStatus === 'due_soon') issueTypes.push('review_due_soon');
+      if (reviewStatus === 'overdue') issueTypes.push('review_overdue');
+      if (duplicateNodeIds.has(node.id)) issueTypes.push('duplicate');
+      return { node, quality, reviewStatus, issueTypes };
+    })
+    .filter((item) => item.issueTypes.length)
+    .sort((a, b) => {
+      const severity = (item) => (item.issueTypes.includes('review_overdue') ? 1000 : 0) + (item.issueTypes.includes('duplicate') ? 300 : 0) + (100 - item.quality.score);
+      return severity(b) - severity(a);
+    })
+    .slice(0, 40)
+    .map((item) => ({
+      ...publicNode(req.db, req.user, item.node),
+      quality: item.quality,
+      reviewStatus: item.reviewStatus,
+      reviewStatusLabel: REVIEW_STATUS_LABELS[item.reviewStatus],
+      issueTypes: item.issueTypes
+    }));
+
+  const accessCounts = new Map();
+  (req.db.recentAccesses || []).forEach((item) => accessCounts.set(item.nodeId, (accessCounts.get(item.nodeId) || 0) + 1));
+  const popularDocuments = [...accessCounts.entries()]
+    .map(([nodeId, accessCount]) => ({ node: nodeById(req.db, nodeId), accessCount }))
+    .filter((item) => item.node?.nodeType === 'file')
+    .sort((a, b) => b.accessCount - a.accessCount)
+    .slice(0, 10)
+    .map((item) => ({ ...publicNode(req.db, req.user, item.node), accessCount: item.accessCount }));
+  const analytics = searchAnalytics(req.db, 30);
+  return {
+    stats: {
+      files: files.length,
+      averageQualityScore,
+      lowQualityFiles: qualityRows.filter((item) => item.quality.score < 70).length,
+      dueSoonReviews: reviews.due_soon,
+      overdueReviews: reviews.overdue,
+      duplicateGroups: duplicateGroups.length,
+      duplicateFiles: duplicateNodeIds.size,
+      duplicateWastedBytes: duplicateGroups.reduce((sum, group) => sum + group.wastedBytes, 0),
+      zeroResultSearches: analytics.stats.zeroResultSearches,
+      zeroResultRate: analytics.stats.zeroResultRate
+    },
+    qualityDistribution,
+    reviewDistribution: reviews,
+    issues: issueRows,
+    popularKeywords: analytics.popularKeywords,
+    zeroResultKeywords: analytics.zeroResultKeywords,
+    popularDocuments,
+    generatedAt: now()
+  };
+}
+
+async function rebuildSearchIndexForNode(db, node) {
+  const version = currentVersion(db, node);
+  if (!version) return { status: 'failed', error: '当前版本不存在' };
+  const extension = node.extension || extname(version.originalFilename || node.name || '');
+  const filename = version.originalFilename || node.name || '';
+  const mimeType = version.mimeType || mime.lookup(filename) || 'application/octet-stream';
+  version.indexedAt = now();
+  if (!supportsSearchText(extension, mimeType, filename)) {
+    version.searchText = '';
+    version.indexStatus = 'unsupported';
+    version.indexError = '';
+    return { status: 'unsupported' };
+  }
+  const filePath = versionFilePath(version, node, db);
+  if (!filePath || !fsSync.existsSync(filePath)) {
+    version.indexStatus = 'failed';
+    version.indexError = '文件不存在';
+    return { status: 'failed', error: version.indexError };
+  }
+  try {
+    const searchText = await extractSearchText(filePath, extension, mimeType, filename);
+    version.searchText = searchText;
+    version.indexStatus = indexStatusForSearchText(searchText, extension, mimeType, filename);
+    version.indexError = '';
+    return { status: version.indexStatus };
+  } catch (error) {
+    version.indexStatus = 'failed';
+    version.indexError = error.message || '索引失败';
+    return { status: 'failed', error: version.indexError };
+  }
+}
+
+app.post('/api/v1/search/files', requireAuth, asyncRoute(async (req, res) => {
+  const keyword = String(req.body.keyword || '').trim();
+  const normalizedKeyword = keyword.toLowerCase();
   const fileTypes = req.body.fileTypes || [];
   const pathPrefix = req.body.pathPrefix || '';
   const creatorId = req.body.creatorId || '';
   const updatedFrom = req.body.updatedFrom ? new Date(req.body.updatedFrom).getTime() : null;
   const updatedTo = req.body.updatedTo ? new Date(req.body.updatedTo).getTime() : null;
-  const sortBy = ['name', 'fullPath', 'createdAt', 'updatedAt', 'extension', 'sizeBytes'].includes(req.body.sortBy) ? req.body.sortBy : 'updatedAt';
+  const requestedSortBy = String(req.body.sortBy || '').trim();
+  const sortBy = ['relevance', 'name', 'fullPath', 'createdAt', 'updatedAt', 'extension', 'sizeBytes'].includes(requestedSortBy)
+    ? requestedSortBy
+    : (normalizedKeyword ? 'relevance' : 'updatedAt');
   const sortDir = req.body.sortDir === 'asc' ? 'asc' : 'desc';
   const unreadUploadCounts = unreadUploadCountsByNode(req.db, req.user);
   const results = listVisibleDescendants(req.db, req.user)
@@ -3579,30 +4354,254 @@ app.post('/api/v1/search/files', requireAuth, (req, res) => {
     .filter((node) => !creatorId || node.createdBy === creatorId)
     .filter((node) => !updatedFrom || new Date(node.updatedAt).getTime() >= updatedFrom)
     .filter((node) => !updatedTo || new Date(node.updatedAt).getTime() <= updatedTo)
-    .map((node) => ({ node, version: currentVersion(req.db, node) }))
-    .filter(({ node, version }) => {
-      if (!keyword) return true;
-      const categoryNames = req.db.documentCategories
-        .filter((item) => item.nodeId === node.id)
-        .map((item) => req.db.categories.find((category) => category.id === item.categoryId)?.name || '')
-        .join(' ');
-      const propertyText = req.db.propertyValues.filter((item) => item.nodeId === node.id).map((item) => item.value).join(' ');
+    .map((node) => {
+      const version = currentVersion(req.db, node);
+      const categoryNames = searchCategoryText(req.db, node);
+      const propertyText = searchPropertyText(req.db, node);
       const searchableContent = isNodePasswordAccessible(req, node) ? (version?.searchText || '') : '';
+      const searchMatch = buildSearchMatch(req, req.db, node, version, keyword, { categoryNames, propertyText, searchableContent });
+      return { node, version, categoryNames, propertyText, searchableContent, searchMatch };
+    })
+    .filter(({ node, version, categoryNames, propertyText, searchableContent }) => {
+      if (!normalizedKeyword) return true;
       const haystack = `${node.name} ${node.fullPath} ${(node.tags || []).join(' ')} ${categoryNames} ${propertyText} ${searchableContent}`.toLowerCase();
-      return haystack.includes(keyword);
+      return haystack.includes(normalizedKeyword);
     })
     .sort((a, b) => {
+      if (sortBy === 'relevance') {
+        const scoreDiff = Number(a.searchMatch?.score || 0) - Number(b.searchMatch?.score || 0);
+        if (scoreDiff !== 0) return sortDir === 'asc' ? scoreDiff : -scoreDiff;
+        const updatedDiff = new Date(a.node.updatedAt || 0).getTime() - new Date(b.node.updatedAt || 0).getTime();
+        if (updatedDiff !== 0) return -updatedDiff;
+        return String(a.node.name || '').localeCompare(String(b.node.name || ''), 'zh-Hans-CN');
+      }
       const left = sortBy === 'sizeBytes' ? Number(a.version?.sizeBytes || 0) : String(a.node[sortBy] || '');
       const right = sortBy === 'sizeBytes' ? Number(b.version?.sizeBytes || 0) : String(b.node[sortBy] || '');
       const result = typeof left === 'number' ? left - right : left.localeCompare(right, 'zh-Hans-CN');
       return sortDir === 'asc' ? result : -result;
     })
-    .map(({ node, version }) => ({
+    .map(({ node, searchMatch }) => ({
       ...publicNode(req.db, req.user, node, { unreadUploadCounts }),
       matchedKeyword: keyword,
-      highlight: keyword && isNodePasswordAccessible(req, node) && (version?.searchText || '').toLowerCase().includes(keyword) ? keyword : ''
+      highlight: searchMatch?.source === 'content' ? keyword : '',
+      searchMatch
     }));
+  if (keyword) {
+    req.db.searchEvents.unshift({
+      id: newId('search_'),
+      userId: req.user.id,
+      keyword,
+      normalizedKeyword,
+      resultCount: results.length,
+      pathPrefix,
+      filters: {
+        fileTypes,
+        creatorId,
+        updatedFrom: req.body.updatedFrom || null,
+        updatedTo: req.body.updatedTo || null,
+        sortBy,
+        sortDir
+      },
+      createdAt: now()
+    });
+    req.db.searchEvents = req.db.searchEvents.slice(0, 5000);
+    void saveDbBestEffort(req.db, 'search event');
+  }
   sendPage(res, results, req.body.page, req.body.pageSize);
+}));
+
+app.get('/api/v1/search/suggestions', requireAuth, (req, res) => {
+  const keyword = String(req.query.keyword || req.query.q || '').trim();
+  const pathPrefix = String(req.query.pathPrefix || '');
+  const limit = Math.max(1, Math.min(20, Number(req.query.limit || 8)));
+  res.json(ok(buildSearchSuggestions(req, keyword, pathPrefix, limit)));
+});
+
+app.get('/api/v1/search/index/status', requireAuth, (req, res) => {
+  if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以查看全文索引状态');
+  res.json(ok(searchIndexStatus(req.db)));
+});
+
+app.post('/api/v1/search/index/rebuild', requireAuth, asyncRoute(async (req, res) => {
+  if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以重建全文索引');
+  const files = req.db.nodes.filter((node) => node.nodeType === 'file' && node.status !== 'deleted');
+  const summary = { total: files.length, rebuilt: 0, failed: 0, empty: 0, unsupported: 0 };
+  for (const node of files) {
+    const result = await rebuildSearchIndexForNode(req.db, node);
+    if (result.status === 'ready') summary.rebuilt += 1;
+    else if (result.status === 'empty') summary.empty += 1;
+    else if (result.status === 'unsupported') summary.unsupported += 1;
+    else summary.failed += 1;
+  }
+  addAudit(req.db, req.user.id, 'search.index.rebuild', 'system_setting', 'search_index', summary, req);
+  await saveDb(req.db);
+  res.json(ok({ ...summary, status: searchIndexStatus(req.db) }));
+}));
+
+app.get('/api/v1/governance/dashboard', requireAuth, (req, res) => {
+  if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以查看知识治理工作台');
+  res.json(ok(governanceDashboard(req)));
+});
+
+app.get('/api/v1/governance/quality', requireAuth, (req, res) => {
+  if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以查看全库质量清单');
+  const level = String(req.query.level || '');
+  const maxScore = req.query.maxScore === undefined ? null : Number(req.query.maxScore);
+  const keyword = String(req.query.keyword || '').trim().toLowerCase();
+  let rows = req.db.nodes
+    .filter((node) => node.nodeType === 'file' && node.status !== 'deleted')
+    .map((node) => ({ ...publicNode(req.db, req.user, node), quality: documentQuality(req.db, node) }))
+    .filter((item) => !level || item.quality.level === level)
+    .filter((item) => maxScore === null || item.quality.score <= maxScore)
+    .filter((item) => !keyword || `${item.name} ${item.fullPath}`.toLowerCase().includes(keyword))
+    .sort((a, b) => a.quality.score - b.quality.score || String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')));
+  sendPage(res, rows, req.query.page, req.query.pageSize || 100);
+});
+
+app.get('/api/v1/governance/duplicates', requireAuth, (req, res) => {
+  if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以查看重复文件检测结果');
+  const type = String(req.query.type || '');
+  const groups = duplicateFileGroups(req.db, req.user).filter((item) => !type || item.type === type);
+  res.json(ok({
+    groups,
+    summary: {
+      groupCount: groups.length,
+      fileCount: new Set(groups.flatMap((group) => group.files.map((file) => file.id))).size,
+      exactGroups: groups.filter((item) => item.type === 'exact').length,
+      probableGroups: groups.filter((item) => item.type === 'probable').length,
+      wastedBytes: groups.reduce((sum, group) => sum + group.wastedBytes, 0)
+    }
+  }));
+});
+
+app.get('/api/v1/governance/reviews', requireAuth, (req, res) => {
+  if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以查看全库复审清单');
+  const status = String(req.query.status || '');
+  const ownerId = String(req.query.ownerId || '');
+  const keyword = String(req.query.keyword || '').trim().toLowerCase();
+  const rows = req.db.nodes
+    .filter((node) => node.nodeType === 'file' && node.status !== 'deleted')
+    .map((node) => ({ ...publicNode(req.db, req.user, node), reviewStatus: reviewStatusForNode(node), reviewStatusLabel: REVIEW_STATUS_LABELS[reviewStatusForNode(node)] }))
+    .filter((item) => !status || item.reviewStatus === status)
+    .filter((item) => !ownerId || item.review.ownerId === ownerId)
+    .filter((item) => !keyword || `${item.name} ${item.fullPath}`.toLowerCase().includes(keyword))
+    .sort((a, b) => {
+      const rank = { overdue: 0, due_soon: 1, normal: 2, not_scheduled: 3 };
+      return (rank[a.reviewStatus] ?? 9) - (rank[b.reviewStatus] ?? 9) || String(a.review.nextReviewAt || '9999').localeCompare(String(b.review.nextReviewAt || '9999'));
+    });
+  sendPage(res, rows, req.query.page, req.query.pageSize || 100);
+});
+
+app.get('/api/v1/governance/search-analytics', requireAuth, (req, res) => {
+  if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以查看搜索运营分析');
+  res.json(ok(searchAnalytics(req.db, req.query.days || 30)));
+});
+
+app.get('/api/v1/nodes/:id/quality', requireAuth, (req, res) => {
+  const node = nodeById(req.db, req.params.id);
+  requireNodeAction(req, node, 'visible');
+  requireNodePasswordAccess(req, node);
+  if (node.nodeType !== 'file') throw createError(400, 'VALIDATION_ERROR', '只有文件可以进行质量评估');
+  res.json(ok({ node: publicNode(req.db, req.user, node), quality: documentQuality(req.db, node) }));
+});
+
+app.get('/api/v1/nodes/:id/review', requireAuth, (req, res) => {
+  const node = nodeById(req.db, req.params.id);
+  requireNodeAction(req, node, 'visible');
+  requireNodePasswordAccess(req, node);
+  if (node.nodeType !== 'file') throw createError(400, 'VALIDATION_ERROR', '只有文件可以设置复审');
+  res.json(ok({
+    node: publicNode(req.db, req.user, node),
+    review: publicReviewSettings(req.db, node),
+    canConfigure: isAdmin(req.user) || hasAction(req.db, req.user, node, 'file:update'),
+    canComplete: isAdmin(req.user) || node.reviewOwnerId === req.user.id
+  }));
+});
+
+app.put('/api/v1/nodes/:id/review', requireAuth, asyncRoute(async (req, res) => {
+  const node = nodeById(req.db, req.params.id);
+  requireNodeAction(req, node, 'file:update');
+  requireNodePasswordAccess(req, node);
+  if (node.nodeType !== 'file') throw createError(400, 'VALIDATION_ERROR', '只有文件可以设置复审');
+  const enabled = Boolean(req.body.enabled);
+  const cycleDays = Math.max(1, Math.min(3650, Number(req.body.cycleDays || req.body.reviewCycleDays || node.reviewCycleDays || 365)));
+  const ownerId = enabled ? String(req.body.ownerId || req.body.reviewOwnerId || '').trim() : null;
+  const owner = ownerId ? req.db.users.find((item) => item.id === ownerId && item.status === 'enabled') : null;
+  if (enabled && !owner) throw createError(400, 'VALIDATION_ERROR', '启用复审时请选择有效的复审负责人');
+  let nextReviewAt = enabled ? String(req.body.nextReviewAt || '').trim() : null;
+  if (enabled && !nextReviewAt) nextReviewAt = new Date(Date.now() + cycleDays * 24 * 60 * 60 * 1000).toISOString();
+  if (nextReviewAt && !Number.isFinite(new Date(nextReviewAt).getTime())) throw createError(400, 'VALIDATION_ERROR', '下次复审时间格式无效');
+  node.reviewEnabled = enabled;
+  node.reviewCycleDays = cycleDays;
+  node.reviewOwnerId = ownerId;
+  node.nextReviewAt = nextReviewAt ? new Date(nextReviewAt).toISOString() : null;
+  node.updatedBy = req.user.id;
+  node.updatedAt = now();
+  addAudit(req.db, req.user.id, 'node.review.update', 'node', node.id, {
+    targetPath: node.fullPath,
+    enabled,
+    cycleDays,
+    ownerId,
+    nextReviewAt: node.nextReviewAt
+  }, req);
+  if (enabled && ownerId && ownerId !== req.user.id) {
+    addMessage(req.db, ownerId, 'document.review.assigned', '文档复审任务', `请在 ${node.nextReviewAt.slice(0, 10)} 前复审 ${node.fullPath}`, node.id);
+  }
+  await saveDb(req.db);
+  res.json(ok({ node: publicNode(req.db, req.user, node), review: publicReviewSettings(req.db, node) }));
+}));
+
+app.post('/api/v1/nodes/:id/review/complete', requireAuth, asyncRoute(async (req, res) => {
+  const node = nodeById(req.db, req.params.id);
+  requireNodeAction(req, node, 'visible');
+  requireNodePasswordAccess(req, node);
+  if (node.nodeType !== 'file') throw createError(400, 'VALIDATION_ERROR', '只有文件可以完成复审');
+  ensureNodeGovernanceShape(node);
+  if (!node.reviewEnabled) throw createError(409, 'CONFLICT', '该文件尚未启用复审计划');
+  if (!isAdmin(req.user) && node.reviewOwnerId !== req.user.id) throw createError(403, 'FORBIDDEN', '只有复审负责人或管理员可以完成复审');
+  const conclusion = String(req.body.conclusion || 'valid').trim();
+  if (!['valid', 'needs_update', 'retire'].includes(conclusion)) throw createError(400, 'VALIDATION_ERROR', '复审结论无效');
+  const note = String(req.body.note || '').trim();
+  const reviewedAt = now();
+  let nextReviewAt = String(req.body.nextReviewAt || '').trim();
+  if (!nextReviewAt) nextReviewAt = new Date(Date.now() + node.reviewCycleDays * 24 * 60 * 60 * 1000).toISOString();
+  if (!Number.isFinite(new Date(nextReviewAt).getTime())) throw createError(400, 'VALIDATION_ERROR', '下次复审时间格式无效');
+  const review = {
+    id: newId('review_'),
+    nodeId: node.id,
+    reviewerId: req.user.id,
+    conclusion,
+    note,
+    previousReviewAt: node.nextReviewAt,
+    nextReviewAt: new Date(nextReviewAt).toISOString(),
+    createdAt: reviewedAt
+  };
+  req.db.documentReviews.unshift(review);
+  node.lastReviewedAt = reviewedAt;
+  node.lastReviewedBy = req.user.id;
+  node.lastReviewConclusion = conclusion;
+  node.lastReviewNote = note;
+  node.nextReviewAt = review.nextReviewAt;
+  node.updatedBy = req.user.id;
+  node.updatedAt = reviewedAt;
+  addAudit(req.db, req.user.id, 'node.review.complete', 'node', node.id, {
+    targetPath: node.fullPath,
+    conclusion,
+    nextReviewAt: node.nextReviewAt
+  }, req);
+  await saveDb(req.db);
+  res.json(ok({ review, settings: publicReviewSettings(req.db, node), quality: documentQuality(req.db, node) }));
+}));
+
+app.get('/api/v1/nodes/:id/review-history', requireAuth, (req, res) => {
+  const node = nodeById(req.db, req.params.id);
+  requireNodeAction(req, node, 'visible');
+  requireNodePasswordAccess(req, node);
+  const rows = req.db.documentReviews
+    .filter((item) => item.nodeId === node.id)
+    .sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')))
+    .map((item) => ({ ...item, reviewer: pickPublicUser(req.db.users.find((user) => user.id === item.reviewerId)) }));
+  sendPage(res, rows, req.query.page, req.query.pageSize || 100);
 });
 
 app.post('/api/v1/search/folders', requireAuth, (req, res) => {
@@ -4335,6 +5334,57 @@ app.put('/api/v1/system-settings/external-library', requireAuth, asyncRoute(asyn
   res.json(ok(req.db.settings.externalLibrary));
 }));
 
+app.get('/api/v1/system-settings/office-preview', requireAuth, (req, res) => {
+  if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以查看系统设置');
+  res.json(ok(sanitizeOfficePreviewSettings(req.db.settings.officePreview || {})));
+});
+
+app.put('/api/v1/system-settings/office-preview', requireAuth, asyncRoute(async (req, res) => {
+  if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以维护系统设置');
+  const existing = normalizeOfficePreviewSettings(req.db.settings.officePreview || {});
+  const incoming = { ...req.body };
+  if (!String(incoming.jwtSecret || '').trim()) incoming.jwtSecret = existing.jwtSecret;
+  const normalized = normalizeOfficePreviewSettings(incoming, existing);
+  if (normalized.enabled && !normalized.documentServerUrl) {
+    throw createError(400, 'VALIDATION_ERROR', '启用 Office 原版预览前，请填写 Document Server 地址');
+  }
+  req.db.settings.officePreview = normalized;
+  addAudit(req.db, req.user.id, 'system.office_preview.update', 'system_setting', 'office_preview', sanitizeOfficePreviewSettings(normalized), req);
+  await saveDb(req.db);
+  res.json(ok(sanitizeOfficePreviewSettings(req.db.settings.officePreview)));
+}));
+
+app.post('/api/v1/system-settings/office-preview/test', requireAuth, asyncRoute(async (req, res) => {
+  if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以测试 Office 在线预览配置');
+  const existing = normalizeOfficePreviewSettings(req.db.settings.officePreview || {});
+  const incoming = req.body && Object.keys(req.body).length ? { ...req.body } : null;
+  if (incoming && !String(incoming.jwtSecret || '').trim()) incoming.jwtSecret = existing.jwtSecret;
+  const settings = incoming ? normalizeOfficePreviewSettings(incoming, existing) : existing;
+  const missing = [];
+  if (!settings.enabled) missing.push('启用状态');
+  if (!settings.documentServerUrl) missing.push('Document Server 地址');
+  const result = {
+    ok: missing.length === 0,
+    message: missing.length ? `缺少 ${missing.join('、')}` : '配置项完整，等待 Document Server 联通验证',
+    checkedAt: now(),
+    scriptUrl: settings.documentServerUrl ? joinUrl(settings.documentServerUrl, '/web-apps/apps/api/documents/api.js') : ''
+  };
+  if (!missing.length) {
+    try {
+      const response = await fetch(result.scriptUrl, { method: 'GET', signal: AbortSignal.timeout(5000) });
+      result.ok = response.ok;
+      result.message = response.ok ? 'Document Server API 可访问' : `Document Server API 返回 HTTP ${response.status}`;
+    } catch (error) {
+      result.ok = false;
+      result.message = `Document Server API 不可访问：${error.message}`;
+    }
+  }
+  req.db.settings.officePreview = { ...existing, lastTestAt: result.checkedAt, lastTestResult: result };
+  addAudit(req.db, req.user.id, 'system.office_preview.test', 'system_setting', 'office_preview', result, req);
+  await saveDb(req.db);
+  res.json(ok(result));
+}));
+
 app.get('/api/v1/system-settings/wecom', requireAuth, (req, res) => {
   if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以查看系统设置');
   res.json(ok(sanitizeWecomSettings(req.db.settings.wecom || {})));
@@ -4585,7 +5635,11 @@ app.post('/api/v1/sso/tickets', requireAuth, asyncRoute(async (req, res) => {
   req.db.loginTickets.unshift(ticket);
   addAudit(req.db, req.user.id, 'sso.ticket.create', 'login_ticket', ticket.id, { userId: targetUser.id, expiresAt: ticket.expiresAt }, req);
   await saveDb(req.db);
-  res.json(ok({ ...ticket, loginUrl: `/api/v1/sso/consume?ticket=${encodeURIComponent(ticket.id)}` }));
+  res.json(ok({
+    ...ticket,
+    loginUrl: `/api/v1/sso/consume?ticket=${encodeURIComponent(ticket.id)}`,
+    frontendLoginUrl: `?ssoTicket=${encodeURIComponent(ticket.id)}`
+  }));
 }));
 
 app.get('/api/v1/sso/consume', asyncRoute(async (req, res) => {

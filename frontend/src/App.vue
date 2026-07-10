@@ -2,7 +2,7 @@
   <div v-if="!token || !user" class="login-shell">
     <section class="login-panel" aria-label="登录">
       <h1 class="login-title">文档管理平台</h1>
-      <p class="login-subtitle">B/S 架构一期开发版</p>
+      <p class="login-subtitle">B/S 架构三期开发版</p>
       <el-form label-position="top" @submit.prevent="login">
         <el-form-item label="账号">
           <el-input v-model="loginForm.username" size="large" autocomplete="username" />
@@ -28,7 +28,7 @@
         <div class="brand-mark">文</div>
         <div class="brand-copy">
           <strong>文档管理平台</strong>
-          <span>Phase 1</span>
+          <span>Phase 3</span>
         </div>
         <el-button
           class="sidebar-toggle"
@@ -81,6 +81,8 @@
           :is-admin="isAdminUser"
           :enable-sync="true"
           :recent-accesses="recentAccesses"
+          storage-scope="docs"
+          :suggest-search="suggestSearchFiles"
           @select-folder="selectFolder"
           @create-folder="openFolderDialog"
           @upload="openUploadDialog"
@@ -112,6 +114,7 @@
           @workflow="openWorkflowDialog"
           @security="openSecurityDialog"
           @request-download="openDownloadApprovalDialog"
+          @governance="openGovernanceDialog"
         />
         <DocsViewPanel
           v-if="activeView === 'drive'"
@@ -128,6 +131,8 @@
           :is-admin="false"
           :enable-sync="false"
           :recent-accesses="recentAccesses"
+          storage-scope="drive"
+          :suggest-search="suggestSearchDriveFiles"
           @select-folder="selectDriveFolder"
           @create-folder="openFolderDialog"
           @upload="openUploadDialog"
@@ -158,6 +163,7 @@
           @workflow="openWorkflowDialog"
           @security="openSecurityDialog"
           @request-download="openDownloadApprovalDialog"
+          @governance="openGovernanceDialog"
         />
         <UsersViewPanel v-if="activeView === 'users'" :users="users" :departments="flatDepartments" :roles="flatRoles" @create="openUserDialog" @edit="openUserDialog" @reset="resetPassword" />
         <OrgViewPanel
@@ -244,6 +250,21 @@
           @disable="disableCredential"
           @edit-file-policy="openFilePolicyDialog"
         />
+        <GovernanceViewPanel
+          v-if="activeView === 'governance'"
+          :dashboard="governanceDashboard"
+          :quality-items="governanceQualityItems"
+          :duplicate-data="governanceDuplicateData"
+          :review-items="governanceReviewItems"
+          :search-analytics="governanceSearchAnalytics"
+          :users="users"
+          :format-date="formatDate"
+          :format-size="formatSize"
+          @preview="previewNode"
+          @manage="openGovernanceDialog"
+          @refresh="loadGovernance"
+          @change-search-days="loadGovernanceSearchAnalytics"
+        />
         <SystemManagementViewPanel
           v-if="activeView === 'system'"
           :dashboard="dashboard"
@@ -253,6 +274,8 @@
           :storage-settings="storageSettings"
           :security-policy="securityPolicy"
           :wecom-settings="wecomSettings"
+          :office-preview-settings="officePreviewSettings"
+          :search-index-status="searchIndexStatus"
           :runtime-status="runtimeStatus"
           :audit-report="auditReport"
           :format-date="formatDate"
@@ -261,6 +284,9 @@
           @edit-storage="openStorageDialog"
           @sync-storage="syncStorageToMysql"
           @edit-security-policy="openSecurityPolicyDialog"
+          @edit-office-preview="openOfficePreviewDialog"
+          @test-office-preview="testOfficePreviewSettings"
+          @rebuild-search-index="rebuildSearchIndex"
           @edit-wecom="openWecomDialog"
           @test-wecom="testWecomSettings"
           @export-audit="exportAuditLogs"
@@ -672,6 +698,141 @@
         <el-button @click="storageDialog.visible = false">取消</el-button>
         <el-button v-if="storageDialog.form.provider === 'mysql'" :loading="storageDialog.testing" @click="testStorageConnection">测试连接</el-button>
         <el-button type="primary" :loading="loading" @click="saveStorageSettings">保存配置</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="governanceDialog.visible" title="文档质量与复审" width="860px" class="tall-dialog">
+      <div class="governance-dialog-heading">
+        <strong>{{ governanceDialog.node?.name || '-' }}</strong>
+        <span>{{ governanceDialog.node?.fullPath || '-' }}</span>
+      </div>
+      <el-tabs v-model="governanceDialog.activeTab">
+        <el-tab-pane label="质量评分" name="quality">
+          <div class="quality-summary-panel">
+            <div class="quality-total-score">
+              <strong>{{ governanceDialog.quality?.score ?? '-' }}</strong>
+              <span>质量分 / 100</span>
+              <el-tag :type="qualityTagType(governanceDialog.quality?.level)">{{ governanceDialog.quality?.levelLabel || '-' }}</el-tag>
+            </div>
+            <div class="quality-dimension-list">
+              <div v-for="item in governanceDialog.quality?.dimensions || []" :key="item.key" class="quality-dimension-row">
+                <div><strong>{{ item.label }}</strong><span>{{ item.detail }}</span></div>
+                <el-progress :percentage="Math.round((item.score / item.maxScore) * 100)" :stroke-width="8" :show-text="false" />
+                <b>{{ item.score }}/{{ item.maxScore }}</b>
+              </div>
+            </div>
+          </div>
+          <div class="governance-suggestions">
+            <h3>改进建议</h3>
+            <el-empty v-if="!governanceDialog.quality?.suggestions?.length" description="当前没有需要改进的项目" :image-size="72" />
+            <div v-else class="suggestion-list">
+              <div v-for="item in governanceDialog.quality.suggestions" :key="item.key">
+                <el-tag size="small" type="warning" effect="plain">{{ item.label }}</el-tag>
+                <span>{{ item.suggestion }}</span>
+              </div>
+            </div>
+          </div>
+        </el-tab-pane>
+        <el-tab-pane label="复审计划" name="review">
+          <el-form label-position="top" class="governance-review-form">
+            <div class="form-grid">
+              <el-form-item label="启用复审">
+                <el-switch v-model="governanceDialog.reviewForm.enabled" :disabled="!governanceDialog.canConfigure" active-text="启用" inactive-text="关闭" />
+              </el-form-item>
+              <el-form-item label="当前状态">
+                <el-tag :type="reviewTagType(governanceDialog.review?.status)">{{ reviewStatusLabel(governanceDialog.review?.status) }}</el-tag>
+              </el-form-item>
+              <el-form-item label="复审负责人">
+                <el-select v-model="governanceDialog.reviewForm.ownerId" :disabled="!governanceDialog.canConfigure || !governanceDialog.reviewForm.enabled" filterable clearable style="width: 100%">
+                  <el-option v-for="item in users" :key="item.id" :label="item.displayName || item.username" :value="item.id" />
+                </el-select>
+              </el-form-item>
+              <el-form-item label="复审周期（天）">
+                <el-input-number v-model="governanceDialog.reviewForm.cycleDays" :disabled="!governanceDialog.canConfigure || !governanceDialog.reviewForm.enabled" :min="1" :max="3650" style="width: 100%" />
+              </el-form-item>
+              <el-form-item label="下次复审时间">
+                <el-date-picker v-model="governanceDialog.reviewForm.nextReviewAt" :disabled="!governanceDialog.canConfigure || !governanceDialog.reviewForm.enabled" type="datetime" value-format="YYYY-MM-DDTHH:mm:ss.SSSZ" style="width: 100%" />
+              </el-form-item>
+              <el-form-item label="上次复审">
+                <el-input :model-value="formatDate(governanceDialog.review?.lastReviewedAt)" disabled />
+              </el-form-item>
+            </div>
+            <div v-if="governanceDialog.canComplete && governanceDialog.reviewForm.enabled" class="review-complete-box">
+              <h3>提交本次复审</h3>
+              <div class="form-grid">
+                <el-form-item label="复审结论">
+                  <el-select v-model="governanceDialog.completeForm.conclusion" style="width: 100%">
+                    <el-option label="内容有效" value="valid" />
+                    <el-option label="需要更新" value="needs_update" />
+                    <el-option label="停止使用" value="retire" />
+                  </el-select>
+                </el-form-item>
+                <el-form-item label="下次复审时间（可选）">
+                  <el-date-picker v-model="governanceDialog.completeForm.nextReviewAt" type="datetime" clearable value-format="YYYY-MM-DDTHH:mm:ss.SSSZ" style="width: 100%" />
+                </el-form-item>
+              </div>
+              <el-form-item label="复审备注">
+                <el-input v-model="governanceDialog.completeForm.note" type="textarea" :rows="3" placeholder="记录本次核查结论和后续处理事项" />
+              </el-form-item>
+              <el-button type="primary" :loading="governanceDialog.saving" @click="completeDocumentReview">完成复审</el-button>
+            </div>
+          </el-form>
+          <div class="review-history-block">
+            <h3>复审历史</h3>
+            <el-table :data="governanceDialog.history" border max-height="260" empty-text="暂无复审记录">
+              <el-table-column label="结论" width="110"><template #default="{ row }">{{ reviewConclusionLabel(row.conclusion) }}</template></el-table-column>
+              <el-table-column label="复审人" width="130"><template #default="{ row }">{{ row.reviewer?.displayName || row.reviewer?.username || row.reviewerId }}</template></el-table-column>
+              <el-table-column prop="note" label="备注" min-width="240" />
+              <el-table-column label="时间" width="170"><template #default="{ row }">{{ formatDate(row.createdAt) }}</template></el-table-column>
+            </el-table>
+          </div>
+        </el-tab-pane>
+      </el-tabs>
+      <template #footer>
+        <el-button @click="governanceDialog.visible = false">关闭</el-button>
+        <el-button v-if="governanceDialog.activeTab === 'review' && governanceDialog.canConfigure" type="primary" :loading="governanceDialog.saving" @click="saveDocumentReviewSettings">保存复审计划</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="officePreviewDialog.visible" title="Office 原版预览配置" width="700px">
+      <el-form label-position="top">
+        <div class="form-grid">
+          <el-form-item label="启用原版预览">
+            <el-switch v-model="officePreviewDialog.form.enabled" active-text="启用" inactive-text="关闭" />
+          </el-form-item>
+          <el-form-item label="预览服务">
+            <el-select v-model="officePreviewDialog.form.provider" disabled style="width: 100%">
+              <el-option label="ONLYOFFICE Docs" value="onlyoffice" />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="Document Server 地址">
+            <el-input v-model="officePreviewDialog.form.documentServerUrl" placeholder="例如 http://127.0.0.1:8080" />
+          </el-form-item>
+          <el-form-item label="平台外部访问地址">
+            <el-input v-model="officePreviewDialog.form.publicBaseUrl" placeholder="例如 http://服务器IP:3000，留空自动使用当前访问地址" />
+          </el-form-item>
+          <el-form-item label="JWT Secret">
+            <el-input
+              v-model="officePreviewDialog.form.jwtSecret"
+              type="password"
+              show-password
+              autocomplete="new-password"
+              :placeholder="officePreviewSettings?.hasJwtSecret ? '留空表示不修改' : '与 Document Server JWT 密钥一致，可留空'"
+            />
+          </el-form-item>
+        </div>
+        <el-alert
+          type="info"
+          :closable="false"
+          show-icon
+          title="说明"
+          description="原版预览依赖独立的 ONLYOFFICE Document Server。未启用或加载失败时，系统仍会展示提取文本兜底预览。"
+        />
+      </el-form>
+      <template #footer>
+        <el-button @click="officePreviewDialog.visible = false">取消</el-button>
+        <el-button @click="testOfficePreviewSettings">测试配置</el-button>
+        <el-button type="primary" :loading="loading" @click="saveOfficePreviewSettings">保存配置</el-button>
       </template>
     </el-dialog>
 
@@ -1296,9 +1457,130 @@
 
     <el-dialog v-model="previewDialog.visible" :title="previewDialog.node?.name || '预览'" width="80%">
       <div class="preview-box" :class="{ 'has-watermark': previewDialog.data?.watermark?.enabled }">
-        <iframe v-if="previewDialog.data?.previewType === 'pdf'" class="preview-frame" :src="previewDialog.data.rawUrl" title="PDF预览" />
+        <div v-if="previewDialog.loading" class="preview-loading">正在加载预览...</div>
+        <iframe v-else-if="previewDialog.data?.previewType === 'pdf'" class="preview-frame" :src="previewDialog.data.rawUrl" title="PDF预览" />
         <img v-else-if="previewDialog.data?.previewType === 'image'" class="preview-image" :src="previewDialog.data.rawUrl" alt="文件预览" />
-        <pre v-else-if="previewDialog.data?.previewType === 'text'" class="preview-text">{{ previewDialog.data.content }}</pre>
+        <div v-else-if="['text', 'json'].includes(previewDialog.data?.previewType)" class="preview-document">
+          <div class="preview-toolbar">
+            <div class="preview-toolbar-title">
+              <span>{{ previewModeLabel }}</span>
+              <small v-if="previewLineSummary">{{ previewLineSummary }}</small>
+            </div>
+            <div class="preview-toolbar-actions">
+              <el-radio-group v-if="isMarkdownPreview" v-model="previewSettings.markdownMode" size="small">
+                <el-radio-button label="render">
+                  <Eye :size="14" />
+                  渲染
+                </el-radio-button>
+                <el-radio-button label="source">
+                  <Code2 :size="14" />
+                  源码
+                </el-radio-button>
+              </el-radio-group>
+              <template v-if="isCodePreview && !isRenderedMarkdown">
+                <el-checkbox v-model="previewSettings.lineNumbers" size="small">
+                  <ListOrdered :size="14" />
+                  行号
+                </el-checkbox>
+                <el-checkbox v-model="previewSettings.wrap" size="small">
+                  <WrapText :size="14" />
+                  换行
+                </el-checkbox>
+                <el-tooltip content="减小字号" placement="top">
+                  <el-button size="small" :icon="ZoomOut" circle aria-label="减小字号" @click="adjustPreviewFontSize(-1)" />
+                </el-tooltip>
+                <span class="preview-font-size">{{ previewSettings.fontSize }}px</span>
+                <el-tooltip content="增大字号" placement="top">
+                  <el-button size="small" :icon="ZoomIn" circle aria-label="增大字号" @click="adjustPreviewFontSize(1)" />
+                </el-tooltip>
+              </template>
+              <el-input
+                v-model.trim="previewSettings.searchKeyword"
+                class="preview-search-input"
+                size="small"
+                clearable
+                placeholder="搜索当前预览"
+                :prefix-icon="Search"
+              />
+              <span v-if="previewSettings.searchKeyword" class="preview-search-count">{{ previewSearchMatchCount }} 处</span>
+              <el-button size="small" :icon="Copy" @click="copyPreviewContent">复制</el-button>
+              <el-button size="small" :icon="Download" @click="downloadNode(previewDialog.node)">下载原文件</el-button>
+            </div>
+          </div>
+          <div v-if="isRenderedMarkdown" class="preview-markdown" v-html="renderedMarkdownHtml"></div>
+          <div
+            v-else-if="isCodePreview"
+            class="preview-code-shell"
+            :class="{ 'is-wrap': previewSettings.wrap, 'has-line-numbers': previewSettings.lineNumbers }"
+            :style="previewCodeStyle"
+          >
+            <div v-if="previewSettings.lineNumbers" class="preview-line-numbers" aria-hidden="true">
+              <span v-for="lineNumber in previewLineNumbers" :key="lineNumber">{{ lineNumber }}</span>
+            </div>
+            <pre class="preview-text is-code"><code class="preview-code" :class="'language-' + previewLanguage" v-html="highlightedPreviewHtml"></code></pre>
+          </div>
+          <pre v-else class="preview-text" v-html="plainPreviewHtml"></pre>
+          <div v-if="previewHasMore" class="preview-chunk-bar">
+            <span>为保证打开速度，当前只显示 {{ previewVisibleSummary }}，共 {{ previewTotalSummary }}。</span>
+            <div>
+              <el-button size="small" @click="loadMorePreviewContent">加载更多</el-button>
+              <el-button size="small" type="primary" plain @click="showAllPreviewContent">显示全部</el-button>
+            </div>
+          </div>
+        </div>
+        <div v-else-if="previewDialog.data?.previewType === 'office'" class="preview-office">
+          <div class="preview-office-card">
+            <div>
+              <strong>Office 文件预览</strong>
+              <p>{{ previewDialog.data.officePreview?.message || '当前展示提取文本，原版排版预览需要接入 Office 在线预览服务。' }}</p>
+            </div>
+            <div class="preview-office-actions">
+              <el-tag v-if="isOfficeNativePreview" type="success" effect="light">原版预览</el-tag>
+              <el-tag v-else type="info" effect="light">文本兜底</el-tag>
+              <el-button :icon="Download" type="primary" @click="downloadNode(previewDialog.node)">下载原文件</el-button>
+            </div>
+          </div>
+          <div v-if="isOfficeNativePreview" class="preview-office-native">
+            <div v-if="officeNativeState.loading" class="preview-office-loading">正在加载 Office 原版预览...</div>
+            <el-alert
+              v-if="officeNativeState.error"
+              type="warning"
+              :closable="false"
+              show-icon
+              title="原版预览暂不可用"
+              :description="officeNativeState.error"
+            />
+            <div ref="officeEditorHost" class="preview-office-editor"></div>
+          </div>
+          <div v-if="previewDialog.data.content && (!isOfficeNativePreview || officeNativeState.error)" class="preview-document">
+            <div class="preview-toolbar">
+              <div class="preview-toolbar-title">
+                <span>{{ isOfficeNativePreview ? '提取文本备用预览' : '提取文本' }}</span>
+                <small v-if="previewLineSummary">{{ previewLineSummary }}</small>
+              </div>
+              <div class="preview-toolbar-actions">
+                <el-input
+                  v-model.trim="previewSettings.searchKeyword"
+                  class="preview-search-input"
+                  size="small"
+                  clearable
+                  placeholder="搜索当前预览"
+                  :prefix-icon="Search"
+                />
+                <span v-if="previewSettings.searchKeyword" class="preview-search-count">{{ previewSearchMatchCount }} 处</span>
+              </div>
+            </div>
+            <pre class="preview-text is-document" v-html="plainPreviewHtml"></pre>
+            <div v-if="previewHasMore" class="preview-chunk-bar">
+              <span>为保证打开速度，当前只显示 {{ previewVisibleSummary }}，共 {{ previewTotalSummary }}。</span>
+              <div>
+                <el-button size="small" @click="loadMorePreviewContent">加载更多</el-button>
+                <el-button size="small" type="primary" plain @click="showAllPreviewContent">显示全部</el-button>
+              </div>
+            </div>
+          </div>
+          <el-empty v-else description="暂未提取到文本内容，请下载原文件查看" />
+        </div>
         <el-empty v-else description="该格式暂不支持浏览器预览，请下载后查看">
           <el-button :icon="Download" type="primary" @click="downloadNode(previewDialog.node)">下载文件</el-button>
         </el-empty>
@@ -1308,9 +1590,6 @@
           aria-hidden="true"
         >
           <span v-for="index in 36" :key="index">{{ previewDialog.data.watermark.text }}</span>
-        </div>
-        <div v-if="previewDialog.data?.officePreview" class="preview-service-note">
-          {{ previewDialog.data.officePreview.message }}
         </div>
       </div>
     </el-dialog>
@@ -1410,19 +1689,24 @@
 </template>
 
 <script setup>
-import { computed, nextTick, onMounted, reactive, ref } from 'vue';
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import {
   Bell,
   BookOpen,
+  ChartNoAxesCombined,
   CheckCircle2,
   ClipboardCheck,
+  Code2,
+  Copy,
   Download,
+  Eye,
   FileArchive,
   FileText,
   Folder,
   Gauge,
   History,
+  ListOrdered,
   Lock,
   LogOut,
   PanelLeftClose,
@@ -1439,6 +1723,9 @@ import {
   Trash2,
   Unlock,
   UploadCloud,
+  WrapText,
+  ZoomIn,
+  ZoomOut,
   UserRound,
   UsersRound
 } from 'lucide-vue-next';
@@ -1451,6 +1738,7 @@ import {
   CollaborationView as CollaborationViewPanel,
   DashboardView as DashboardViewPanel,
   DocsView as DocsViewPanel,
+  GovernanceView as GovernanceViewPanel,
   KnowledgeView as KnowledgeViewPanel,
   MessagesView as MessagesViewPanel,
   OrgView as OrgViewPanel,
@@ -1498,12 +1786,20 @@ const externalLibrary = ref({ rootPath: '', lastSyncedAt: null, lastSyncSummary:
 const storageSettings = ref(null);
 const securityPolicy = ref(null);
 const wecomSettings = ref(null);
+const officePreviewSettings = ref(null);
+const searchIndexStatus = ref(null);
 const approvalTodo = ref([]);
 const approvalMine = ref([]);
 const approvalAll = ref([]);
 const recentAccesses = ref([]);
 const runtimeStatus = ref(null);
 const auditReport = ref(null);
+const governanceDashboard = ref(null);
+const governanceQualityItems = ref([]);
+const governanceDuplicateData = ref({ groups: [], summary: {} });
+const governanceReviewItems = ref([]);
+const governanceSearchAnalytics = ref(null);
+const governanceSearchDays = ref(30);
 const nodeUnlockTokens = reactive({});
 
 const folderDialog = reactive({ visible: false, name: '' });
@@ -1531,7 +1827,106 @@ const permissionDialog = reactive({
     condition: { filenameContains: '', pathPrefix: '', extensions: '', businessStatus: '' }
   }
 });
-const previewDialog = reactive({ visible: false, node: null, data: null });
+const PREVIEW_INITIAL_LINES = 800;
+const PREVIEW_LOAD_LINES = 800;
+const PREVIEW_INITIAL_CHARS = 60000;
+const PREVIEW_LOAD_CHARS = 60000;
+const previewDialog = reactive({ visible: false, node: null, data: null, loading: false });
+const previewSettings = reactive({
+  lineNumbers: true,
+  wrap: false,
+  fontSize: 13,
+  markdownMode: 'render',
+  visibleLines: PREVIEW_INITIAL_LINES,
+  visibleChars: PREVIEW_INITIAL_CHARS,
+  searchKeyword: ''
+});
+const officeEditorHost = ref(null);
+const officeNativeState = reactive({ loading: false, error: '' });
+let officeEditorInstance = null;
+let officeApiScriptPromise = null;
+let officeApiScriptUrl = '';
+const CODE_LANGUAGE_BY_EXTENSION = {
+  html: 'html',
+  htm: 'html',
+  xml: 'html',
+  vue: 'html',
+  css: 'css',
+  scss: 'css',
+  less: 'css',
+  js: 'javascript',
+  mjs: 'javascript',
+  cjs: 'javascript',
+  jsx: 'javascript',
+  ts: 'typescript',
+  tsx: 'typescript',
+  json: 'json',
+  jsonl: 'json',
+  py: 'python',
+  pyw: 'python',
+  sh: 'shell',
+  bash: 'shell',
+  zsh: 'shell',
+  fish: 'shell',
+  yml: 'yaml',
+  yaml: 'yaml',
+  toml: 'ini',
+  ini: 'ini',
+  conf: 'ini',
+  config: 'ini',
+  properties: 'ini',
+  env: 'ini',
+  sql: 'sql',
+  md: 'markdown',
+  java: 'java',
+  kt: 'java',
+  kts: 'java',
+  go: 'go',
+  rs: 'rust',
+  php: 'php',
+  rb: 'ruby',
+  c: 'c',
+  h: 'c',
+  cpp: 'cpp',
+  hpp: 'cpp',
+  cs: 'csharp',
+  swift: 'swift'
+};
+const CODE_LANGUAGE_BY_FILENAME = {
+  '.env': 'ini',
+  '.gitignore': 'ini',
+  '.dockerignore': 'ini',
+  '.npmrc': 'ini',
+  '.nvmrc': 'ini',
+  dockerfile: 'dockerfile',
+  makefile: 'makefile',
+  readme: 'markdown',
+  license: 'markdown'
+};
+const CODE_LANGUAGE_LABELS = {
+  html: 'HTML',
+  css: 'CSS',
+  javascript: 'JavaScript',
+  typescript: 'TypeScript',
+  json: 'JSON',
+  python: 'Python',
+  shell: 'Shell',
+  yaml: 'YAML',
+  ini: '配置文件',
+  sql: 'SQL',
+  markdown: 'Markdown',
+  java: 'Java/Kotlin',
+  go: 'Go',
+  rust: 'Rust',
+  php: 'PHP',
+  ruby: 'Ruby',
+  c: 'C',
+  cpp: 'C++',
+  csharp: 'C#',
+  swift: 'Swift',
+  dockerfile: 'Dockerfile',
+  makefile: 'Makefile'
+};
 const userDialog = reactive({ visible: false, form: {} });
 const departmentDialog = reactive({ visible: false, form: {} });
 const roleDialog = reactive({ visible: false, form: {} });
@@ -1568,6 +1963,19 @@ const storageDialog = reactive({
   testResult: null,
   form: { provider: 'json', host: '', port: 3306, database: '', user: '', password: '', ssl: false }
 });
+const governanceDialog = reactive({
+  visible: false,
+  activeTab: 'quality',
+  node: null,
+  quality: null,
+  review: null,
+  history: [],
+  canConfigure: false,
+  canComplete: false,
+  saving: false,
+  reviewForm: { enabled: false, ownerId: '', cycleDays: 365, nextReviewAt: '' },
+  completeForm: { conclusion: 'valid', note: '', nextReviewAt: '' }
+});
 const securityDialog = reactive({ visible: false, node: null, form: { securityLevel: 'internal', sensitive: false, sensitiveReason: '' } });
 const securityPolicyDialog = reactive({
   visible: false,
@@ -1595,6 +2003,16 @@ const wecomDialog = reactive({
     syncDepartments: true,
     syncUsers: true,
     pushMessages: false
+  }
+});
+const officePreviewDialog = reactive({
+  visible: false,
+  form: {
+    enabled: false,
+    provider: 'onlyoffice',
+    documentServerUrl: '',
+    publicBaseUrl: '',
+    jwtSecret: ''
   }
 });
 const approvalRequestDialog = reactive({
@@ -1629,7 +2047,8 @@ const navItems = [
   { key: 'profile', label: '个人中心', icon: UserRound },
   { key: 'users', label: '用户管理', icon: UserRound },
   { key: 'org', label: '组织角色', icon: UsersRound },
-  { key: 'knowledge', label: '知识地图', icon: BookOpen },
+  { key: 'knowledge', label: '知识分类', icon: BookOpen },
+  { key: 'governance', label: '知识治理', icon: ChartNoAxesCombined },
   { key: 'trash', label: '回收站', icon: Trash2 },
   { key: 'messages', label: '消息中心', icon: Bell },
   { key: 'collaboration', label: '协作中心', icon: Share2 },
@@ -1639,7 +2058,7 @@ const navItems = [
   { key: 'system', label: '系统管理', icon: Settings },
   { key: 'audit', label: '审计日志', icon: History }
 ];
-const adminOnlyViews = new Set(['users', 'org', 'announcements', 'api', 'system', 'audit']);
+const adminOnlyViews = new Set(['users', 'org', 'governance', 'announcements', 'api', 'system', 'audit']);
 const isAdminUser = computed(() => (user.value?.roleIds || []).includes('r_admin'));
 const visibleNavItems = computed(() => navItems.filter((item) => !adminOnlyViews.has(item.key) || isAdminUser.value));
 
@@ -1714,6 +2133,133 @@ const announcementSubjectOptions = computed(() => {
   if (announcementDialog.audienceType === 'user') return users.value;
   return [];
 });
+const previewLanguage = computed(() => detectPreviewLanguage(previewDialog.node, previewDialog.data));
+const isCodePreview = computed(() => Boolean(previewLanguage.value && ['text', 'json'].includes(previewDialog.data?.previewType)));
+const isMarkdownPreview = computed(() => previewLanguage.value === 'markdown' && ['text', 'json'].includes(previewDialog.data?.previewType));
+const isRenderedMarkdown = computed(() => isMarkdownPreview.value && previewSettings.markdownMode === 'render');
+const isOfficeNativePreview = computed(() => Boolean(previewDialog.data?.officePreview?.status === 'native_ready' && previewDialog.data?.officePreview?.native));
+const previewModeLabel = computed(() => {
+  if (isRenderedMarkdown.value) return 'Markdown 渲染预览';
+  if (isCodePreview.value) return `${CODE_LANGUAGE_LABELS[previewLanguage.value] || '代码'} 预览`;
+  return previewDialog.data?.previewType === 'json' ? 'JSON 预览' : '文本预览';
+});
+const previewRawContent = computed(() => String(previewDialog.data?.content ?? ''));
+const previewNormalizedContent = computed(() => previewRawContent.value.replace(/\r\n/g, '\n').replace(/\r/g, '\n'));
+const previewAllLines = computed(() => previewNormalizedContent.value ? previewNormalizedContent.value.split('\n') : []);
+const previewLineCount = computed(() => previewAllLines.value.length);
+const previewTotalCharCount = computed(() => previewNormalizedContent.value.length);
+const previewContentForRender = computed(() => {
+  if (!previewNormalizedContent.value) return '';
+  const lineLimit = Math.max(1, previewSettings.visibleLines);
+  const charLimit = Math.max(1, previewSettings.visibleChars);
+  const lineChunk = previewAllLines.value.slice(0, lineLimit).join('\n');
+  return lineChunk.length > charLimit ? lineChunk.slice(0, charLimit) : lineChunk;
+});
+const previewVisibleLineCount = computed(() => previewContentForRender.value ? previewContentForRender.value.split('\n').length : 0);
+const previewVisibleCharCount = computed(() => previewContentForRender.value.length);
+const previewHasMore = computed(() => previewVisibleCharCount.value < previewTotalCharCount.value);
+const previewLineSummary = computed(() => {
+  if (!previewTotalCharCount.value) return '';
+  if (previewHasMore.value) {
+    if (previewLineCount.value <= 1) return `已显示 ${formatPreviewCount(previewVisibleCharCount.value)} / ${formatPreviewCount(previewTotalCharCount.value)} 字`;
+    return `已显示 ${formatPreviewCount(previewVisibleLineCount.value)} / ${formatPreviewCount(previewLineCount.value)} 行`;
+  }
+  return `${formatPreviewCount(previewLineCount.value)} 行`;
+});
+const previewVisibleSummary = computed(() => {
+  if (previewLineCount.value <= 1) return `${formatPreviewCount(previewVisibleCharCount.value)} 字`;
+  return `${formatPreviewCount(previewVisibleLineCount.value)} 行`;
+});
+const previewTotalSummary = computed(() => {
+  if (previewLineCount.value <= 1) return `${formatPreviewCount(previewTotalCharCount.value)} 字`;
+  return `${formatPreviewCount(previewLineCount.value)} 行`;
+});
+const previewSearchMatchCount = computed(() => countTextMatches(previewContentForRender.value, previewSettings.searchKeyword));
+const highlightedPreviewHtml = computed(() => highlightSearchInHtml(highlightCode(previewContentForRender.value || '暂无可预览内容', previewLanguage.value), previewSettings.searchKeyword));
+const renderedMarkdownHtml = computed(() => highlightSearchInHtml(renderMarkdown(previewContentForRender.value || ''), previewSettings.searchKeyword));
+const plainPreviewHtml = computed(() => highlightSearchInHtml(escapeHtml(previewContentForRender.value || '暂无可预览内容'), previewSettings.searchKeyword));
+const previewLineNumbers = computed(() => Array.from({ length: previewVisibleLineCount.value || 1 }, (_, index) => index + 1));
+const previewCodeStyle = computed(() => ({ '--preview-code-font-size': `${previewSettings.fontSize}px` }));
+
+function resetPreviewViewport() {
+  previewSettings.visibleLines = PREVIEW_INITIAL_LINES;
+  previewSettings.visibleChars = PREVIEW_INITIAL_CHARS;
+  previewSettings.searchKeyword = '';
+  officeNativeState.error = '';
+  destroyOfficeEditor();
+}
+
+function loadMorePreviewContent() {
+  previewSettings.visibleLines = Math.min(previewLineCount.value || PREVIEW_INITIAL_LINES, previewSettings.visibleLines + PREVIEW_LOAD_LINES);
+  previewSettings.visibleChars = Math.min(previewTotalCharCount.value || PREVIEW_INITIAL_CHARS, previewSettings.visibleChars + PREVIEW_LOAD_CHARS);
+}
+
+function showAllPreviewContent() {
+  previewSettings.visibleLines = Math.max(previewLineCount.value, 1);
+  previewSettings.visibleChars = Math.max(previewTotalCharCount.value, 1);
+}
+
+function destroyOfficeEditor() {
+  try {
+    officeEditorInstance?.destroyEditor?.();
+  } catch {
+    // ONLYOFFICE cleanup is best-effort because external script versions differ.
+  }
+  officeEditorInstance = null;
+  officeNativeState.loading = false;
+  if (officeEditorHost.value) officeEditorHost.value.innerHTML = '';
+}
+
+function loadOfficeApi(scriptUrl) {
+  if (window.DocsAPI?.DocEditor && officeApiScriptUrl === scriptUrl) return Promise.resolve();
+  if (officeApiScriptPromise && officeApiScriptUrl === scriptUrl) return officeApiScriptPromise;
+  officeApiScriptUrl = scriptUrl;
+  officeApiScriptPromise = new Promise((resolve, reject) => {
+    const script = document.createElement('script');
+    const timeout = window.setTimeout(() => {
+      reject(new Error('Document Server API 加载超时，请检查 Office 预览服务地址和网络连通性'));
+    }, 8000);
+    script.src = scriptUrl;
+    script.async = true;
+    script.onload = () => {
+      window.clearTimeout(timeout);
+      window.DocsAPI?.DocEditor ? resolve() : reject(new Error('Document Server API 加载后未找到 DocsAPI'));
+    };
+    script.onerror = () => {
+      window.clearTimeout(timeout);
+      reject(new Error('无法加载 Document Server API，请检查系统管理中的 Office 预览地址'));
+    };
+    document.head.appendChild(script);
+  });
+  officeApiScriptPromise.catch(() => {
+    if (officeApiScriptUrl === scriptUrl) officeApiScriptPromise = null;
+  });
+  return officeApiScriptPromise;
+}
+
+async function mountOfficeEditor() {
+  const native = previewDialog.data?.officePreview?.native;
+  destroyOfficeEditor();
+  officeNativeState.error = '';
+  if (!previewDialog.visible || !native?.scriptUrl || !native?.config) return;
+  officeNativeState.loading = true;
+  try {
+    await loadOfficeApi(native.scriptUrl);
+    await nextTick();
+    if (!officeEditorHost.value || previewDialog.data?.officePreview?.native !== native) return;
+    const editorId = `office-editor-${Date.now()}`;
+    officeEditorHost.value.innerHTML = `<div id="${editorId}" class="preview-office-editor-host"></div>`;
+    officeEditorInstance = new window.DocsAPI.DocEditor(editorId, native.config);
+  } catch (error) {
+    officeNativeState.error = error.message || 'Office 原版预览加载失败，请检查 Document Server 是否可访问';
+  } finally {
+    officeNativeState.loading = false;
+  }
+}
+
+function formatPreviewCount(value) {
+  return Number(value || 0).toLocaleString('zh-CN');
+}
 
 function flattenTree(items = []) {
   const result = [];
@@ -1725,6 +2271,282 @@ function flattenTree(items = []) {
   };
   walk(items);
   return result;
+}
+
+function nodeFilename(node) {
+  return String(node?.name || node?.currentVersion?.originalFilename || '').trim();
+}
+
+function nodeExtension(node) {
+  const explicit = String(node?.extension || '').replace(/^\./, '').toLowerCase();
+  if (explicit) return explicit;
+  const name = nodeFilename(node);
+  const index = name.lastIndexOf('.');
+  return index > -1 ? name.slice(index + 1).toLowerCase() : '';
+}
+
+function detectPreviewLanguage(node, data) {
+  if (!data || !['text', 'json'].includes(data.previewType)) return '';
+  if (data.previewType === 'json') return 'json';
+  const name = nodeFilename(node).toLowerCase();
+  return CODE_LANGUAGE_BY_FILENAME[name] || CODE_LANGUAGE_BY_EXTENSION[nodeExtension(node)] || '';
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function countTextMatches(content, keyword) {
+  const needle = String(keyword || '').trim();
+  if (!needle || !content) return 0;
+  const matches = String(content).match(new RegExp(escapeRegExp(needle), 'gi'));
+  return matches?.length || 0;
+}
+
+function highlightSearchInHtml(html, keyword) {
+  const needle = String(keyword || '').trim();
+  if (!needle) return html;
+  const escapedNeedle = escapeHtml(needle);
+  const regex = new RegExp(escapeRegExp(escapedNeedle), 'gi');
+  return String(html)
+    .split(/(<[^>]+>)/g)
+    .map((part) => part.startsWith('<') ? part : part.replace(regex, '<mark class="preview-search-mark">$&</mark>'))
+    .join('');
+}
+
+function keywordPattern(words, flags = 'y') {
+  return { className: 'keyword', regex: new RegExp(`\\b(${words.join('|')})\\b`, flags) };
+}
+
+function commonStringPatterns() {
+  return [
+    { className: 'string', regex: /&quot;(?:\\.|(?!&quot;)[\s\S])*?&quot;/y },
+    { className: 'string', regex: /&#39;(?:\\.|(?!&#39;)[\s\S])*?&#39;/y },
+    { className: 'string', regex: /`(?:\\.|[^`])*`/y }
+  ];
+}
+
+function highlightPatterns(language) {
+  if (language === 'html') {
+    return [
+      { className: 'comment', regex: /&lt;!--[\s\S]*?--&gt;/y },
+      { className: 'tag', regex: /&lt;\/?[\w!:-]+(?:\s+[\w:-]+(?:=(?:&quot;[\s\S]*?&quot;|&#39;[\s\S]*?&#39;|[^\s&]+))?)*\s*\/?&gt;/y },
+      ...commonStringPatterns()
+    ];
+  }
+  if (language === 'json') {
+    return [
+      { className: 'property', regex: /&quot;(?:\\.|(?!&quot;)[\s\S])*?&quot;(?=\s*:)/y },
+      ...commonStringPatterns(),
+      keywordPattern(['true', 'false', 'null']),
+      { className: 'number', regex: /-?\b\d+(?:\.\d+)?(?:e[+-]?\d+)?\b/iy }
+    ];
+  }
+  if (language === 'markdown') {
+    return [
+      { className: 'comment', regex: /```[\s\S]*?```/y },
+      { className: 'keyword', regex: /^#{1,6}\s.*$/my },
+      { className: 'string', regex: /\[[^\]]+\]\([^)]+\)/y },
+      { className: 'number', regex: /^\s*(?:[-*+]|\d+\.)\s+/my },
+      ...commonStringPatterns()
+    ];
+  }
+  const lineComment = ['python', 'shell', 'yaml', 'ini', 'ruby'].includes(language)
+    ? { className: 'comment', regex: /#.*/y }
+    : language === 'sql'
+      ? { className: 'comment', regex: /--.*/y }
+      : { className: 'comment', regex: /\/\/.*/y };
+  const keywords = {
+    javascript: ['async', 'await', 'break', 'case', 'catch', 'class', 'const', 'continue', 'default', 'else', 'export', 'extends', 'false', 'finally', 'for', 'from', 'function', 'if', 'import', 'in', 'instanceof', 'let', 'new', 'null', 'of', 'return', 'super', 'switch', 'this', 'throw', 'true', 'try', 'typeof', 'undefined', 'var', 'while'],
+    typescript: ['abstract', 'any', 'as', 'async', 'await', 'boolean', 'break', 'case', 'catch', 'class', 'const', 'continue', 'default', 'else', 'enum', 'export', 'extends', 'false', 'finally', 'for', 'from', 'function', 'if', 'implements', 'import', 'in', 'interface', 'keyof', 'let', 'namespace', 'new', 'null', 'number', 'private', 'protected', 'public', 'readonly', 'return', 'string', 'super', 'switch', 'this', 'throw', 'true', 'try', 'type', 'undefined', 'while'],
+    python: ['and', 'as', 'async', 'await', 'break', 'class', 'continue', 'def', 'elif', 'else', 'except', 'False', 'finally', 'for', 'from', 'if', 'import', 'in', 'is', 'lambda', 'None', 'not', 'or', 'pass', 'raise', 'return', 'True', 'try', 'while', 'with', 'yield'],
+    shell: ['case', 'do', 'done', 'elif', 'else', 'esac', 'export', 'fi', 'for', 'function', 'if', 'in', 'local', 'then', 'while'],
+    sql: ['SELECT', 'FROM', 'WHERE', 'JOIN', 'LEFT', 'RIGHT', 'INNER', 'OUTER', 'INSERT', 'INTO', 'UPDATE', 'DELETE', 'CREATE', 'ALTER', 'DROP', 'TABLE', 'VIEW', 'INDEX', 'VALUES', 'SET', 'AND', 'OR', 'NOT', 'NULL', 'IS', 'IN', 'LIKE', 'GROUP', 'BY', 'ORDER', 'LIMIT', 'OFFSET', 'HAVING', 'AS', 'ON'],
+    java: ['abstract', 'break', 'case', 'catch', 'class', 'const', 'continue', 'data', 'default', 'do', 'else', 'enum', 'extends', 'false', 'final', 'finally', 'for', 'fun', 'if', 'implements', 'import', 'interface', 'new', 'null', 'object', 'override', 'package', 'private', 'protected', 'public', 'return', 'static', 'super', 'switch', 'this', 'throw', 'throws', 'true', 'try', 'val', 'var', 'void', 'when', 'while'],
+    go: ['break', 'case', 'chan', 'const', 'continue', 'defer', 'else', 'fallthrough', 'for', 'func', 'go', 'goto', 'if', 'import', 'interface', 'map', 'package', 'range', 'return', 'select', 'struct', 'switch', 'type', 'var'],
+    rust: ['as', 'async', 'await', 'break', 'const', 'continue', 'crate', 'else', 'enum', 'extern', 'false', 'fn', 'for', 'if', 'impl', 'in', 'let', 'loop', 'match', 'mod', 'move', 'mut', 'pub', 'ref', 'return', 'self', 'Self', 'static', 'struct', 'super', 'trait', 'true', 'type', 'unsafe', 'use', 'where', 'while'],
+    php: ['abstract', 'array', 'as', 'break', 'case', 'catch', 'class', 'const', 'continue', 'default', 'echo', 'else', 'elseif', 'extends', 'false', 'final', 'finally', 'foreach', 'function', 'if', 'implements', 'interface', 'namespace', 'new', 'null', 'private', 'protected', 'public', 'return', 'static', 'switch', 'throw', 'trait', 'true', 'try', 'use', 'var', 'while'],
+    ruby: ['BEGIN', 'END', 'alias', 'and', 'begin', 'break', 'case', 'class', 'def', 'defined', 'do', 'else', 'elsif', 'end', 'ensure', 'false', 'for', 'if', 'in', 'module', 'next', 'nil', 'not', 'or', 'redo', 'rescue', 'retry', 'return', 'self', 'super', 'then', 'true', 'undef', 'unless', 'until', 'when', 'while', 'yield'],
+    c: ['auto', 'break', 'case', 'char', 'const', 'continue', 'default', 'do', 'double', 'else', 'enum', 'extern', 'float', 'for', 'if', 'int', 'long', 'register', 'return', 'short', 'signed', 'sizeof', 'static', 'struct', 'switch', 'typedef', 'union', 'unsigned', 'void', 'volatile', 'while'],
+    cpp: ['auto', 'bool', 'break', 'case', 'catch', 'class', 'const', 'constexpr', 'continue', 'default', 'delete', 'do', 'double', 'else', 'enum', 'explicit', 'false', 'float', 'for', 'friend', 'if', 'inline', 'int', 'long', 'namespace', 'new', 'nullptr', 'private', 'protected', 'public', 'return', 'short', 'static', 'struct', 'switch', 'template', 'this', 'throw', 'true', 'try', 'typedef', 'typename', 'using', 'virtual', 'void', 'while'],
+    csharp: ['abstract', 'as', 'async', 'await', 'base', 'bool', 'break', 'case', 'catch', 'class', 'const', 'continue', 'decimal', 'default', 'delegate', 'do', 'double', 'else', 'enum', 'event', 'false', 'finally', 'for', 'foreach', 'if', 'in', 'int', 'interface', 'internal', 'is', 'namespace', 'new', 'null', 'object', 'out', 'override', 'private', 'protected', 'public', 'readonly', 'return', 'static', 'string', 'struct', 'switch', 'this', 'throw', 'true', 'try', 'using', 'var', 'virtual', 'void', 'while'],
+    swift: ['as', 'associatedtype', 'break', 'case', 'catch', 'class', 'continue', 'default', 'defer', 'do', 'else', 'enum', 'extension', 'false', 'for', 'func', 'guard', 'if', 'import', 'in', 'init', 'let', 'nil', 'private', 'protocol', 'public', 'return', 'self', 'static', 'struct', 'switch', 'throw', 'throws', 'true', 'try', 'typealias', 'var', 'where', 'while']
+  }[language] || [];
+  return [
+    { className: 'comment', regex: /\/\*[\s\S]*?\*\//y },
+    lineComment,
+    ...commonStringPatterns(),
+    ...(keywords.length ? [keywordPattern(keywords, language === 'sql' ? 'iy' : 'y')] : []),
+    { className: 'number', regex: /\b\d+(?:\.\d+)?\b/y }
+  ];
+}
+
+function highlightCode(content, language) {
+  const escaped = escapeHtml(content || '暂无可预览内容');
+  if (!language) return escaped;
+  const patterns = highlightPatterns(language);
+  let index = 0;
+  let result = '';
+  while (index < escaped.length) {
+    let matched = false;
+    for (const pattern of patterns) {
+      pattern.regex.lastIndex = index;
+      const match = pattern.regex.exec(escaped);
+      if (match) {
+        result += `<span class="token ${pattern.className}">${match[0]}</span>`;
+        index += match[0].length;
+        matched = true;
+        break;
+      }
+    }
+    if (!matched) {
+      result += escaped[index];
+      index += 1;
+    }
+  }
+  return result;
+}
+
+function renderMarkdownInline(value) {
+  let html = escapeHtml(value);
+  html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+  html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  html = html.replace(/__([^_]+)__/g, '<strong>$1</strong>');
+  html = html.replace(/\*([^*\n]+)\*/g, '<em>$1</em>');
+  html = html.replace(/_([^_\n]+)_/g, '<em>$1</em>');
+  html = html.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, (_match, label, href) => {
+    const safeHref = escapeHtml(href);
+    return `<a href="${safeHref}" target="_blank" rel="noreferrer">${label}</a>`;
+  });
+  return html;
+}
+
+function renderMarkdown(content) {
+  const lines = String(content || '暂无可预览内容').replace(/\r\n/g, '\n').split('\n');
+  const blocks = [];
+  let paragraph = [];
+  let list = null;
+  let codeFence = null;
+
+  const flushParagraph = () => {
+    if (!paragraph.length) return;
+    blocks.push(`<p>${renderMarkdownInline(paragraph.join(' '))}</p>`);
+    paragraph = [];
+  };
+  const flushList = () => {
+    if (!list) return;
+    const tag = list.type === 'ol' ? 'ol' : 'ul';
+    blocks.push(`<${tag}>${list.items.map((item) => `<li>${renderMarkdownInline(item)}</li>`).join('')}</${tag}>`);
+    list = null;
+  };
+  const flushCode = () => {
+    if (!codeFence) return;
+    const language = CODE_LANGUAGE_BY_EXTENSION[codeFence.language] || codeFence.language || '';
+    const code = codeFence.lines.join('\n');
+    const highlighted = language ? highlightCode(code, language) : escapeHtml(code);
+    blocks.push(`<pre><code class="${language ? `language-${language}` : ''}">${highlighted}</code></pre>`);
+    codeFence = null;
+  };
+  const flushFlow = () => {
+    flushParagraph();
+    flushList();
+  };
+
+  for (const rawLine of lines) {
+    const line = rawLine.replace(/\t/g, '  ');
+    const fence = line.match(/^```(\w+)?\s*$/);
+    if (fence) {
+      if (codeFence) {
+        flushCode();
+      } else {
+        flushFlow();
+        codeFence = { language: (fence[1] || '').toLowerCase(), lines: [] };
+      }
+      continue;
+    }
+    if (codeFence) {
+      codeFence.lines.push(rawLine);
+      continue;
+    }
+    if (!line.trim()) {
+      flushFlow();
+      continue;
+    }
+    const heading = line.match(/^(#{1,6})\s+(.+)$/);
+    if (heading) {
+      flushFlow();
+      const level = heading[1].length;
+      blocks.push(`<h${level}>${renderMarkdownInline(heading[2])}</h${level}>`);
+      continue;
+    }
+    if (/^---+$/.test(line.trim())) {
+      flushFlow();
+      blocks.push('<hr>');
+      continue;
+    }
+    const quote = line.match(/^>\s?(.*)$/);
+    if (quote) {
+      flushFlow();
+      blocks.push(`<blockquote>${renderMarkdownInline(quote[1])}</blockquote>`);
+      continue;
+    }
+    const unordered = line.match(/^\s*[-*+]\s+(.+)$/);
+    if (unordered) {
+      flushParagraph();
+      if (!list || list.type !== 'ul') flushList();
+      if (!list) list = { type: 'ul', items: [] };
+      list.items.push(unordered[1]);
+      continue;
+    }
+    const ordered = line.match(/^\s*\d+\.\s+(.+)$/);
+    if (ordered) {
+      flushParagraph();
+      if (!list || list.type !== 'ol') flushList();
+      if (!list) list = { type: 'ol', items: [] };
+      list.items.push(ordered[1]);
+      continue;
+    }
+    flushList();
+    paragraph.push(line.trim());
+  }
+  flushFlow();
+  flushCode();
+  return blocks.join('');
+}
+
+async function copyPreviewContent() {
+  const text = previewDialog.data?.content || '';
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+    } else {
+      const textarea = document.createElement('textarea');
+      textarea.value = text;
+      textarea.setAttribute('readonly', '');
+      textarea.style.position = 'fixed';
+      textarea.style.opacity = '0';
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      textarea.remove();
+    }
+    ElMessage.success('已复制预览内容');
+  } catch {
+    ElMessage.error('复制失败，请手动选择复制');
+  }
+}
+
+function adjustPreviewFontSize(delta) {
+  previewSettings.fontSize = Math.max(11, Math.min(18, previewSettings.fontSize + delta));
 }
 
 function formatDate(value) {
@@ -1742,6 +2564,22 @@ function formatSize(bytes) {
     index += 1;
   }
   return `${size.toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
+}
+
+function qualityTagType(level) {
+  return { excellent: 'success', good: 'primary', fair: 'warning', poor: 'danger' }[level] || 'info';
+}
+
+function reviewTagType(status) {
+  return { normal: 'success', due_soon: 'warning', overdue: 'danger', not_scheduled: 'info' }[status] || 'info';
+}
+
+function reviewStatusLabel(status) {
+  return { normal: '正常', due_soon: '即将到期', overdue: '已逾期', not_scheduled: '未设置' }[status] || '-';
+}
+
+function reviewConclusionLabel(conclusion) {
+  return { valid: '内容有效', needs_update: '需要更新', retire: '停止使用' }[conclusion] || conclusion || '-';
 }
 
 function userName(userId) {
@@ -1855,6 +2693,28 @@ async function loadCaptcha() {
   captcha.value = data;
   loginForm.captchaId = data.id;
   loginForm.captchaAnswer = '';
+}
+
+async function consumeSsoTicketFromUrl() {
+  const currentUrl = new URL(window.location.href);
+  const ticket = currentUrl.searchParams.get('ssoTicket');
+  if (!ticket) return false;
+  try {
+    const data = await api(`/sso/consume?ticket=${encodeURIComponent(ticket)}`);
+    setToken(data.token);
+    token.value = data.token;
+    user.value = data.user;
+    currentUrl.searchParams.delete('ssoTicket');
+    window.history.replaceState({}, '', `${currentUrl.pathname}${currentUrl.search}${currentUrl.hash}`);
+    await bootstrap();
+    ElMessage.success('单点登录成功');
+    return true;
+  } catch (error) {
+    currentUrl.searchParams.delete('ssoTicket');
+    window.history.replaceState({}, '', `${currentUrl.pathname}${currentUrl.search}${currentUrl.hash}`);
+    ElMessage.error(error.message || '单点登录失败，请使用账号密码登录');
+    return false;
+  }
 }
 
 async function logout() {
@@ -2015,6 +2875,16 @@ async function loadWecomSettings() {
   wecomSettings.value = await api('/system-settings/wecom');
 }
 
+async function loadOfficePreviewSettings() {
+  if (!isAdminUser.value) return;
+  officePreviewSettings.value = await api('/system-settings/office-preview');
+}
+
+async function loadSearchIndexStatus() {
+  if (!isAdminUser.value) return;
+  searchIndexStatus.value = await api('/search/index/status');
+}
+
 async function loadRuntimeStatus() {
   if (!isAdminUser.value) return;
   runtimeStatus.value = await api('/system/runtime-status');
@@ -2023,6 +2893,28 @@ async function loadRuntimeStatus() {
 async function loadAuditReport() {
   if (!isAdminUser.value) return;
   auditReport.value = await api('/audit-logs/report');
+}
+
+async function loadGovernanceSearchAnalytics(days = 30) {
+  if (!isAdminUser.value) return;
+  governanceSearchDays.value = Number(days || 30);
+  governanceSearchAnalytics.value = await api(`/governance/search-analytics?days=${encodeURIComponent(governanceSearchDays.value)}`);
+}
+
+async function loadGovernance() {
+  if (!isAdminUser.value) return;
+  const [summary, qualityPage, duplicateResult, reviewPage, analytics] = await Promise.all([
+    api('/governance/dashboard'),
+    api('/governance/quality?pageSize=500'),
+    api('/governance/duplicates'),
+    api('/governance/reviews?pageSize=500'),
+    api(`/governance/search-analytics?days=${encodeURIComponent(governanceSearchDays.value)}`)
+  ]);
+  governanceDashboard.value = summary;
+  governanceQualityItems.value = qualityPage.items || [];
+  governanceDuplicateData.value = duplicateResult;
+  governanceReviewItems.value = reviewPage.items || [];
+  governanceSearchAnalytics.value = analytics;
 }
 
 async function loadApprovals() {
@@ -2051,6 +2943,8 @@ async function loadSystemManagement() {
     loadStorageSettings(),
     loadSecurityPolicy(),
     loadWecomSettings(),
+    loadOfficePreviewSettings(),
+    loadSearchIndexStatus(),
     loadRuntimeStatus(),
     loadAuditReport()
   ]);
@@ -2086,6 +2980,7 @@ async function refreshCurrent() {
     await loadUsers();
     await loadApiManagement();
   }
+  if (activeView.value === 'governance' && isAdminUser.value) await loadGovernance();
   if (activeView.value === 'system' && isAdminUser.value) await loadSystemManagement();
   if (activeView.value === 'audit' && isAdminUser.value) await loadAudit();
   if (activeView.value === 'profile') {
@@ -2288,15 +3183,35 @@ async function batchDelete(rows) {
   await refreshCurrent();
 }
 
-async function previewNode(node, versionId = null) {
+function applyPreviewSearchKeyword(keyword) {
+  const searchKeyword = String(keyword || '').trim();
+  if (!searchKeyword) return;
+  previewSettings.searchKeyword = searchKeyword;
+  const visibleContent = previewContentForRender.value.toLowerCase();
+  if (!visibleContent.includes(searchKeyword.toLowerCase())) showAllPreviewContent();
+}
+
+async function previewNode(node, versionId = null, options = {}) {
   if (!node) return;
   await runWithPasswordUnlock(node, async () => {
     previewDialog.node = node;
-    const suffix = versionId ? `?versionId=${encodeURIComponent(versionId)}` : '';
-    previewDialog.data = await api(`/files/${node.id}/preview${suffix}`, { headers: nodeUnlockHeaders() });
+    previewDialog.data = null;
+    previewDialog.loading = true;
     previewDialog.visible = true;
-    await markUploadMessagesRead(node);
-    await loadRecentAccess();
+    resetPreviewViewport();
+    const suffix = versionId ? `?versionId=${encodeURIComponent(versionId)}` : '';
+    try {
+      previewDialog.data = await api(`/files/${node.id}/preview${suffix}`, { headers: nodeUnlockHeaders() });
+      await nextTick();
+      applyPreviewSearchKeyword(options.searchKeyword || node.searchMatch?.keyword || '');
+      previewDialog.loading = false;
+      void Promise.allSettled([markUploadMessagesRead(node), loadRecentAccess()]);
+    } catch (error) {
+      previewDialog.visible = false;
+      throw error;
+    } finally {
+      previewDialog.loading = false;
+    }
   });
 }
 
@@ -2807,6 +3722,80 @@ async function saveNodeSecurity() {
   }
 }
 
+async function refreshGovernanceDialogData() {
+  const node = governanceDialog.node;
+  if (!node) return;
+  const [qualityResult, reviewResult, historyPage] = await runWithPasswordUnlock(node, () => Promise.all([
+    api(`/nodes/${node.id}/quality`, { headers: nodeUnlockHeaders() }),
+    api(`/nodes/${node.id}/review`, { headers: nodeUnlockHeaders() }),
+    api(`/nodes/${node.id}/review-history?pageSize=100`, { headers: nodeUnlockHeaders() })
+  ]));
+  governanceDialog.node = reviewResult.node || qualityResult.node || node;
+  governanceDialog.quality = qualityResult.quality;
+  governanceDialog.review = reviewResult.review;
+  governanceDialog.history = historyPage.items || [];
+  governanceDialog.canConfigure = Boolean(reviewResult.canConfigure);
+  governanceDialog.canComplete = Boolean(reviewResult.canComplete);
+  governanceDialog.reviewForm = {
+    enabled: Boolean(reviewResult.review?.enabled),
+    ownerId: reviewResult.review?.ownerId || '',
+    cycleDays: reviewResult.review?.cycleDays || 365,
+    nextReviewAt: reviewResult.review?.nextReviewAt || ''
+  };
+}
+
+async function openGovernanceDialog(node, activeTab = 'quality') {
+  if (!node || node.nodeType !== 'file') return ElMessage.warning('请选择文件');
+  governanceDialog.node = node;
+  governanceDialog.activeTab = activeTab;
+  governanceDialog.completeForm = { conclusion: 'valid', note: '', nextReviewAt: '' };
+  loading.value = true;
+  try {
+    await refreshGovernanceDialogData();
+    governanceDialog.visible = true;
+  } finally {
+    loading.value = false;
+  }
+}
+
+async function saveDocumentReviewSettings() {
+  if (!governanceDialog.node) return;
+  if (governanceDialog.reviewForm.enabled && !governanceDialog.reviewForm.ownerId) return ElMessage.warning('请选择复审负责人');
+  governanceDialog.saving = true;
+  try {
+    await api(`/nodes/${governanceDialog.node.id}/review`, {
+      method: 'PUT',
+      headers: nodeUnlockHeaders(),
+      body: governanceDialog.reviewForm
+    });
+    ElMessage.success('复审计划已保存');
+    await refreshGovernanceDialogData();
+    if (activeView.value === 'governance') await loadGovernance();
+    else await refreshCurrent();
+  } finally {
+    governanceDialog.saving = false;
+  }
+}
+
+async function completeDocumentReview() {
+  if (!governanceDialog.node) return;
+  governanceDialog.saving = true;
+  try {
+    await api(`/nodes/${governanceDialog.node.id}/review/complete`, {
+      method: 'POST',
+      headers: nodeUnlockHeaders(),
+      body: governanceDialog.completeForm
+    });
+    governanceDialog.completeForm = { conclusion: 'valid', note: '', nextReviewAt: '' };
+    ElMessage.success('本次复审已完成');
+    await refreshGovernanceDialogData();
+    if (activeView.value === 'governance') await loadGovernance();
+    else await refreshCurrent();
+  } finally {
+    governanceDialog.saving = false;
+  }
+}
+
 async function openSecurityPolicyDialog() {
   await loadSecurityPolicy();
   securityPolicyDialog.form = { ...securityPolicyDialog.form, ...(securityPolicy.value || {}) };
@@ -2856,6 +3845,50 @@ async function testWecomSettings() {
   const result = await api('/system-settings/wecom/test', { method: 'POST' });
   ElMessage[result.ok ? 'success' : 'warning'](result.message);
   await loadWecomSettings();
+}
+
+async function openOfficePreviewDialog() {
+  await loadOfficePreviewSettings();
+  officePreviewDialog.form = {
+    enabled: Boolean(officePreviewSettings.value?.enabled),
+    provider: officePreviewSettings.value?.provider || 'onlyoffice',
+    documentServerUrl: officePreviewSettings.value?.documentServerUrl || '',
+    publicBaseUrl: officePreviewSettings.value?.publicBaseUrl || '',
+    jwtSecret: ''
+  };
+  officePreviewDialog.visible = true;
+}
+
+async function saveOfficePreviewSettings() {
+  loading.value = true;
+  try {
+    officePreviewSettings.value = await api('/system-settings/office-preview', { method: 'PUT', body: officePreviewDialog.form });
+    officePreviewDialog.visible = false;
+    ElMessage.success('Office 原版预览配置已保存');
+    await loadSystemManagement();
+  } finally {
+    loading.value = false;
+  }
+}
+
+async function testOfficePreviewSettings() {
+  const body = officePreviewDialog.visible ? officePreviewDialog.form : {};
+  const result = await api('/system-settings/office-preview/test', { method: 'POST', body });
+  ElMessage[result.ok ? 'success' : 'warning'](result.message);
+  await loadOfficePreviewSettings();
+}
+
+async function rebuildSearchIndex() {
+  await ElMessageBox.confirm('确定重新读取当前所有文件并重建全文检索索引吗？', '重建索引', { type: 'warning' });
+  loading.value = true;
+  try {
+    const result = await api('/search/index/rebuild', { method: 'POST' });
+    searchIndexStatus.value = result.status;
+    ElMessage.success(`索引重建完成：已索引 ${result.rebuilt} 个，空内容 ${result.empty} 个，失败 ${result.failed} 个`);
+    await Promise.all([loadSearchIndexStatus(), loadAudit()]);
+  } finally {
+    loading.value = false;
+  }
 }
 
 async function syncExternalLibrary() {
@@ -2948,9 +3981,19 @@ function conditionLabel(condition) {
   return parts.join('；') || '无';
 }
 
+function hasSearchCriteria(criteria) {
+  return Boolean(
+    String(criteria.keyword || '').trim() ||
+    criteria.fileTypes?.length ||
+    criteria.creatorId ||
+    criteria.updatedFrom ||
+    criteria.updatedTo
+  );
+}
+
 async function searchFiles(keyword) {
   const criteria = typeof keyword === 'object' ? keyword : { keyword };
-  if (!criteria.keyword && !criteria.fileTypes?.length && !criteria.creatorId) return refreshCurrent();
+  if (!hasSearchCriteria(criteria)) return refreshCurrent();
   const page = await api('/search/files', {
     method: 'POST',
     body: { ...criteria, pathPrefix: selectedFolder.value?.fullPath || '', page: 1, pageSize: 100 }
@@ -2960,12 +4003,24 @@ async function searchFiles(keyword) {
 
 async function searchDriveFiles(keyword) {
   const criteria = typeof keyword === 'object' ? keyword : { keyword };
-  if (!criteria.keyword && !criteria.fileTypes?.length && !criteria.creatorId) return refreshCurrent();
+  if (!hasSearchCriteria(criteria)) return refreshCurrent();
   const page = await api('/search/files', {
     method: 'POST',
     body: { ...criteria, pathPrefix: selectedDriveFolder.value?.fullPath || '', page: 1, pageSize: 100 }
   });
   driveChildren.value = page.items;
+}
+
+async function suggestSearchFiles(keyword) {
+  const query = String(keyword || '').trim();
+  if (!query) return [];
+  return api(`/search/suggestions?keyword=${encodeURIComponent(query)}&pathPrefix=${encodeURIComponent(selectedFolder.value?.fullPath || '')}&limit=8`);
+}
+
+async function suggestSearchDriveFiles(keyword) {
+  const query = String(keyword || '').trim();
+  if (!query) return [];
+  return api(`/search/suggestions?keyword=${encodeURIComponent(query)}&pathPrefix=${encodeURIComponent(selectedDriveFolder.value?.fullPath || '')}&limit=8`);
 }
 
 function openShareDialog(node, type = 'share') {
@@ -3204,6 +4259,8 @@ async function saveCategory() {
 async function deleteCategory(row) {
   await ElMessageBox.confirm(`确定删除分类“${row.name}”及其下级分类吗？`, '删除分类', { type: 'warning' });
   await api(`/categories/${row.id}`, { method: 'DELETE' });
+  selectedCategory.value = null;
+  categoryFiles.value = [];
   ElMessage.success('分类已删除');
   await loadKnowledge();
 }
@@ -3545,8 +4602,27 @@ async function saveFilePolicy() {
   ElMessage.success('上传策略已保存');
 }
 
+watch(
+  () => previewDialog.data?.officePreview?.native,
+  () => {
+    void mountOfficeEditor();
+  }
+);
+
+watch(
+  () => previewDialog.visible,
+  (visible) => {
+    if (!visible) destroyOfficeEditor();
+  }
+);
+
+onBeforeUnmount(() => {
+  destroyOfficeEditor();
+});
+
 onMounted(async () => {
   await loadCaptcha();
+  if (await consumeSsoTicketFromUrl()) return;
   if (token.value) {
     try {
       await bootstrap();
