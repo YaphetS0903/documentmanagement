@@ -12,23 +12,24 @@ export function setToken(token) {
 }
 
 export async function api(path, options = {}) {
-  const headers = { ...(options.headers || {}) };
+  const { silentError = false, blob = false, ...requestOptions } = options;
+  const headers = { ...(requestOptions.headers || {}) };
   const token = getToken();
   if (token) headers.Authorization = `Bearer ${token}`;
-  let body = options.body;
+  let body = requestOptions.body;
   if (body && !(body instanceof FormData) && typeof body !== 'string') {
     headers['Content-Type'] = 'application/json';
     body = JSON.stringify(body);
   }
-  const response = await fetch(`${API_PREFIX}${path}`, { ...options, headers, body });
-  if (options.blob) {
+  const response = await fetch(`${API_PREFIX}${path}`, { ...requestOptions, headers, body });
+  if (blob) {
     if (!response.ok) throw new Error('下载失败');
     return response.blob();
   }
   const payload = await response.json().catch(() => ({}));
   if (!response.ok || payload.code !== 'OK') {
     const message = payload.message || '请求失败';
-    if (payload.code !== 'NODE_PASSWORD_REQUIRED') ElMessage.error(message);
+    if (!silentError && payload.code !== 'NODE_PASSWORD_REQUIRED') ElMessage.error(message);
     const error = new Error(message);
     error.status = response.status;
     error.code = payload.code;

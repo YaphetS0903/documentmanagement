@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
+import http from 'node:http';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 
 const testPort = '3100';
+const officeTestPort = '3180';
 const base = `http://localhost:${testPort}/api/v1`;
 const root = process.cwd();
 const testRuntimeRoot = path.join(root, 'backend', 'tmp', 'api-smoke-runtime');
@@ -45,6 +47,12 @@ async function loginPayload(username, password) {
 }
 
 await fs.rm(testRuntimeRoot, { recursive: true, force: true });
+
+const officeServer = http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'application/javascript' });
+  res.end(`window.__officeProxyPath = ${JSON.stringify(req.url)};`);
+});
+await new Promise((resolve) => officeServer.listen(Number(officeTestPort), '127.0.0.1', resolve));
 
 const server = spawn('node', ['backend/src/server.js'], {
   cwd: root,
@@ -123,6 +131,12 @@ try {
 
   const openapi = await request(`${base}/openapi.json`);
   assert.equal(openapi.openapi, '3.0.3');
+  const malformedToken = await requestRaw(`${base}/auth/me`, {
+    headers: { Authorization: 'Bearer malformed.short' }
+  });
+  assert.equal(malformedToken.res.status, 401);
+  const healthAfterMalformedToken = await request(`${base}/health`);
+  assert.equal(healthAfterMalformedToken.data.status, 'up');
   assert.ok(openapi.paths['/system-settings/file-policy']);
   assert.ok(openapi.paths['/system-settings/external-library']);
   assert.ok(openapi.paths['/external-library/sync']);
@@ -141,6 +155,7 @@ try {
   assert.ok(openapi.paths['/search/suggestions']);
   assert.ok(openapi.paths['/search/index/status']);
   assert.ok(openapi.paths['/search/index/rebuild']);
+  assert.ok(openapi.paths['/governance/workspace']);
   assert.ok(openapi.paths['/governance/dashboard']);
   assert.ok(openapi.paths['/governance/quality']);
   assert.ok(openapi.paths['/governance/duplicates']);
@@ -416,6 +431,14 @@ try {
     headers: { Authorization: `Bearer ${token}` }
   });
   assert.ok(governanceQuality.data.items.some((item) => item.id === upload.data.id));
+  const governanceWorkspace = await request(`${base}/governance/workspace?pageSize=100&days=30`, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  assert.equal(governanceWorkspace.data.dashboard.stats.files, governanceDashboard.data.stats.files);
+  assert.equal(governanceWorkspace.data.quality.total, governanceQuality.data.total);
+  assert.equal(governanceWorkspace.data.duplicates.summary.groupCount, duplicateGroups.data.summary.groupCount);
+  assert.ok(governanceWorkspace.data.reviews.items.some((item) => item.id === upload.data.id));
+  assert.equal(governanceWorkspace.data.searchAnalytics.stats.totalSearches, searchAnalytics.data.stats.totalSearches);
   const forbiddenGovernance = await requestRaw(`${base}/governance/dashboard`, {
     headers: { Authorization: `Bearer ${demoLoginForPrivateDrive.data.token}` }
   });
@@ -467,13 +490,29 @@ try {
   });
   assert.equal(officePreview.data.previewType, 'office');
   assert.equal(officePreview.data.officePreview.status, 'text_fallback');
+  await request(`${base}/system-settings/office-preview`, {
+    method: 'PUT',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      enabled: true,
+      provider: 'onlyoffice',
+      documentServerUrl: `http://127.0.0.1:${officeTestPort}`,
+      publicBaseUrl: `http://127.0.0.1:${officeTestPort}`,
+      jwtSecret: 'office-smoke-secret'
+    })
+  });
+  const invalidOfficePreview = await request(`${base}/files/${officeUpload.data.id}/preview`, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  assert.equal(invalidOfficePreview.data.officePreview.status, 'configuration_error');
+  assert.match(invalidOfficePreview.data.officePreview.message, /不能填写 ONLYOFFICE/);
   const officePreviewSettings = await request(`${base}/system-settings/office-preview`, {
     method: 'PUT',
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({
       enabled: true,
       provider: 'onlyoffice',
-      documentServerUrl: 'http://127.0.0.1:8080',
+      documentServerUrl: `http://127.0.0.1:${officeTestPort}`,
       publicBaseUrl: `http://localhost:${testPort}`,
       jwtSecret: 'office-smoke-secret'
     })
@@ -484,10 +523,25 @@ try {
     headers: { Authorization: `Bearer ${token}` }
   });
   assert.equal(nativeOfficePreview.data.officePreview.status, 'native_ready');
-  assert.match(nativeOfficePreview.data.officePreview.native.scriptUrl, /web-apps\/apps\/api\/documents\/api\.js$/);
+  assert.equal(nativeOfficePreview.data.officePreview.native.scriptUrl, '/web-apps/apps/api/documents/api.js');
   assert.equal(nativeOfficePreview.data.officePreview.native.config.documentType, 'slide');
   assert.ok(nativeOfficePreview.data.officePreview.native.config.document.url.startsWith(`http://localhost:${testPort}/storage/raw/`));
+  assert.ok(nativeOfficePreview.data.officePreview.native.config.document.key.includes('-'));
   assert.ok(nativeOfficePreview.data.officePreview.native.config.token);
+  const repeatedNativeOfficePreview = await request(`${base}/files/${officeUpload.data.id}/preview`, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  assert.equal(
+    repeatedNativeOfficePreview.data.officePreview.native.config.document.key,
+    nativeOfficePreview.data.officePreview.native.config.document.key
+  );
+  const rawOfficeWithOnlyOfficeAuth = await requestRaw(nativeOfficePreview.data.officePreview.native.config.document.url, {
+    headers: { Authorization: 'Bearer onlyoffice.outbox.token' }
+  });
+  assert.equal(rawOfficeWithOnlyOfficeAuth.res.status, 200);
+  const proxiedOfficeScript = await fetch(`http://localhost:${testPort}${nativeOfficePreview.data.officePreview.native.scriptUrl}`);
+  assert.equal(proxiedOfficeScript.status, 200);
+  assert.match(await proxiedOfficeScript.text(), /web-apps\/apps\/api\/documents\/api\.js/);
 
   const demoUnreadChildren = await request(`${base}/nodes/n_root/children`, {
     headers: { Authorization: `Bearer ${demoLoginForPrivateDrive.data.token}` }
@@ -1326,4 +1380,5 @@ try {
 } finally {
   await fs.chmod(path.join(externalRoot, '无权限目录'), 0o700).catch(() => {});
   server.kill('SIGTERM');
+  officeServer.close();
 }

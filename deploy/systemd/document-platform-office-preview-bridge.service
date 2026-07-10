@@ -1,0 +1,19 @@
+[Unit]
+Description=Document Platform ONLYOFFICE Preview Bridge
+Requires=docker.service
+After=docker.service network-online.target
+
+[Service]
+Type=simple
+Environment=OFFICE_BRIDGE_LISTEN_HOST=172.17.0.1
+Environment=OFFICE_BRIDGE_LISTEN_PORT=18092
+Environment=OFFICE_BRIDGE_TARGET_HOST=127.0.0.1
+Environment=OFFICE_BRIDGE_TARGET_PORT=18091
+ExecStart=/usr/bin/python /usr/local/libexec/document-platform-office-preview-bridge.py
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -2,6 +2,7 @@ import {
   ClipboardCheck as ClipboardCheckIcon,
   Download as DownloadIcon,
   BellRing as BellRingIcon,
+  Building2 as Building2Icon,
   Clock as ClockIcon,
   FileText as FileTextIcon,
   Folder as FolderIcon,
@@ -9,11 +10,13 @@ import {
   Lock as LockIcon,
   MoreHorizontal as MoreHorizontalIcon,
   Paperclip as PaperclipIcon,
+  Pencil as PencilIcon,
   Plus as PlusIcon,
   RefreshCw as RefreshCwIcon,
   Search as SearchIcon,
   Share2 as Share2Icon,
   Shield as ShieldIcon,
+  ShieldCheck as ShieldCheckIcon,
   Star as StarIcon,
   Tags as TagsIcon,
   Trash2 as Trash2Icon,
@@ -89,6 +92,13 @@ export const DocsView = {
   props: ['tree', 'children', 'selectedFolder', 'users', 'departments', 'roles', 'formatDate', 'formatSize', 'actions', 'spaceSummary', 'isAdmin', 'enableSync', 'recentAccesses', 'storageScope', 'suggestSearch'],
   emits: ['select-folder', 'create-folder', 'upload', 'rename', 'delete', 'download', 'preview', 'versions', 'lock', 'unlock', 'favorite', 'permissions', 'view-access', 'node-password', 'sync-external', 'search', 'batch-download', 'batch-move', 'batch-delete', 'batch-metadata', 'move', 'copy', 'copy-enterprise', 'share', 'subscribe', 'reminder', 'metadata', 'links', 'workflow', 'security', 'request-download', 'governance'],
   data: () => ({
+    Download: DownloadIcon,
+    MoreHorizontal: MoreHorizontalIcon,
+    Plus: PlusIcon,
+    RefreshCw: RefreshCwIcon,
+    Search: SearchIcon,
+    Trash2: Trash2Icon,
+    UploadCloud: UploadCloudIcon,
     keyword: '',
     treeKeyword: '',
     selection: [],
@@ -713,7 +723,7 @@ export const CollaborationView = {
 export const ApprovalCenterView = {
   props: ['todo', 'mine', 'all', 'formatDate'],
   emits: ['approve', 'reject', 'refresh'],
-  data: () => ({ activeTab: 'todo' }),
+  data: () => ({ activeTab: 'todo', RefreshCwIcon }),
   components: { RefreshCwIcon },
   methods: {
     statusLabel(status) {
@@ -850,40 +860,63 @@ export const ProfileView = {
 export const OrgView = {
   props: ['departments', 'roles'],
   emits: ['create-department', 'edit-department', 'delete-department', 'create-role', 'edit-role', 'delete-role'],
+  components: { Building2Icon, PencilIcon, PlusIcon, ShieldCheckIcon, Trash2Icon },
+  data: () => ({ PencilIcon, PlusIcon, Trash2Icon }),
+  methods: {
+    countNodes(items) {
+      return (items || []).reduce((total, item) => total + 1 + this.countNodes(item.children), 0);
+    }
+  },
   template: `
-    <div class="split-layout">
-      <section class="section">
-        <div class="section-header">
-          <h2 class="section-title">部门树</h2>
-          <el-button type="primary" @click="$emit('create-department', null)">新建部门</el-button>
+    <div class="org-layout">
+      <section class="section org-panel">
+        <div class="org-panel-header">
+          <div>
+            <h2 class="section-title">部门管理</h2>
+            <p>按企业层级维护部门和下级组织</p>
+          </div>
+          <el-button type="primary" :icon="PlusIcon" @click="$emit('create-department', null)">新建部门</el-button>
         </div>
-        <el-tree :data="departments" node-key="id" default-expand-all :expand-on-click-node="false" :props="{ label: 'name', children: 'children' }">
+        <div class="org-panel-summary"><Building2Icon /><span>共 {{ countNodes(departments) }} 个部门</span></div>
+        <el-empty v-if="!departments?.length" description="暂无部门" :image-size="84" />
+        <el-tree v-else class="org-tree" :data="departments" node-key="id" default-expand-all :expand-on-click-node="false" :props="{ label: 'name', children: 'children' }">
           <template #default="{ data }">
-            <div class="tree-row">
-              <span>{{ data.name }}</span>
-              <span class="tree-actions">
-                <el-button size="small" @click.stop="$emit('create-department', data)">新建下级</el-button>
-                <el-button size="small" @click.stop="$emit('edit-department', data)">编辑</el-button>
-                <el-button size="small" type="danger" @click.stop="$emit('delete-department', data)">删除</el-button>
-              </span>
+            <div class="org-tree-row">
+              <div class="org-tree-identity">
+                <Building2Icon class="org-tree-icon" />
+                <span class="org-tree-copy"><strong>{{ data.name }}</strong><small v-if="data.code">{{ data.code }}</small></span>
+              </div>
+              <div class="org-tree-actions">
+                <el-tooltip content="新建下级部门" placement="top"><el-button text circle :icon="PlusIcon" aria-label="新建下级部门" @click.stop="$emit('create-department', data)" /></el-tooltip>
+                <el-tooltip content="编辑部门" placement="top"><el-button text circle :icon="PencilIcon" aria-label="编辑部门" @click.stop="$emit('edit-department', data)" /></el-tooltip>
+                <el-tooltip content="删除部门" placement="top"><el-button text circle type="danger" :icon="Trash2Icon" aria-label="删除部门" @click.stop="$emit('delete-department', data)" /></el-tooltip>
+              </div>
             </div>
           </template>
         </el-tree>
       </section>
-      <section class="section">
-        <div class="section-header">
-          <h2 class="section-title">角色树</h2>
-          <el-button type="primary" @click="$emit('create-role', null)">新建角色</el-button>
+      <section class="section org-panel">
+        <div class="org-panel-header">
+          <div>
+            <h2 class="section-title">角色管理</h2>
+            <p>维护角色层级及成员权限范围</p>
+          </div>
+          <el-button type="primary" :icon="PlusIcon" @click="$emit('create-role', null)">新建角色</el-button>
         </div>
-        <el-tree :data="roles" node-key="id" default-expand-all :expand-on-click-node="false" :props="{ label: 'name', children: 'children' }">
+        <div class="org-panel-summary"><ShieldCheckIcon /><span>共 {{ countNodes(roles) }} 个角色</span></div>
+        <el-empty v-if="!roles?.length" description="暂无角色" :image-size="84" />
+        <el-tree v-else class="org-tree" :data="roles" node-key="id" default-expand-all :expand-on-click-node="false" :props="{ label: 'name', children: 'children' }">
           <template #default="{ data }">
-            <div class="tree-row">
-              <span>{{ data.name }}</span>
-              <span class="tree-actions">
-                <el-button size="small" @click.stop="$emit('create-role', data)">新建下级</el-button>
-                <el-button size="small" @click.stop="$emit('edit-role', data)">编辑</el-button>
-                <el-button size="small" type="danger" :disabled="data.id === 'r_admin'" @click.stop="$emit('delete-role', data)">删除</el-button>
-              </span>
+            <div class="org-tree-row">
+              <div class="org-tree-identity">
+                <ShieldCheckIcon class="org-tree-icon role" />
+                <span class="org-tree-copy"><strong>{{ data.name }}</strong><small v-if="data.code">{{ data.code }}</small></span>
+              </div>
+              <div class="org-tree-actions">
+                <el-tooltip content="新建下级角色" placement="top"><el-button text circle :icon="PlusIcon" aria-label="新建下级角色" @click.stop="$emit('create-role', data)" /></el-tooltip>
+                <el-tooltip content="编辑角色" placement="top"><el-button text circle :icon="PencilIcon" aria-label="编辑角色" @click.stop="$emit('edit-role', data)" /></el-tooltip>
+                <el-tooltip :content="data.id === 'r_admin' ? '系统管理员角色不能删除' : '删除角色'" placement="top"><el-button text circle type="danger" :icon="Trash2Icon" :disabled="data.id === 'r_admin'" aria-label="删除角色" @click.stop="$emit('delete-role', data)" /></el-tooltip>
+              </div>
             </div>
           </template>
         </el-tree>
@@ -1165,7 +1198,7 @@ export const ApiManagementView = {
 };
 
 export const GovernanceView = {
-  props: ['dashboard', 'qualityItems', 'duplicateData', 'reviewItems', 'searchAnalytics', 'users', 'formatDate', 'formatSize'],
+  props: ['dashboard', 'qualityItems', 'duplicateData', 'reviewItems', 'searchAnalytics', 'users', 'formatDate', 'formatSize', 'loading'],
   emits: ['preview', 'manage', 'refresh', 'change-search-days'],
   data: () => ({
     activeTab: 'overview',
@@ -1235,7 +1268,7 @@ export const GovernanceView = {
           <h2>知识治理</h2>
           <p>文档质量、重复资料、复审任务和搜索运营</p>
         </div>
-        <el-button type="primary" @click="$emit('refresh')">刷新数据</el-button>
+        <el-button type="primary" :loading="loading" :disabled="loading" @click="$emit('refresh')">刷新数据</el-button>
       </div>
       <div class="governance-metrics">
         <div class="governance-metric"><span>文档总数</span><strong>{{ stats.files || 0 }}</strong><small>当前有效文件</small></div>
@@ -1286,7 +1319,7 @@ export const GovernanceView = {
             </el-table>
           </el-tab-pane>
 
-          <el-tab-pane label="质量清单" name="quality">
+          <el-tab-pane label="质量清单" name="quality" lazy>
             <div class="governance-filter-row">
               <el-select v-model="qualityLevel" style="width: 160px">
                 <el-option label="全部等级" value="all" />
@@ -1307,7 +1340,7 @@ export const GovernanceView = {
             </el-table>
           </el-tab-pane>
 
-          <el-tab-pane label="重复文件" name="duplicates">
+          <el-tab-pane label="重复文件" name="duplicates" lazy>
             <div class="duplicate-summary-row">
               <span>重复组 <strong>{{ duplicateData?.summary?.groupCount || 0 }}</strong></span>
               <span>涉及文件 <strong>{{ duplicateData?.summary?.fileCount || 0 }}</strong></span>
@@ -1328,7 +1361,7 @@ export const GovernanceView = {
             </el-collapse>
           </el-tab-pane>
 
-          <el-tab-pane label="复审任务" name="reviews">
+          <el-tab-pane label="复审任务" name="reviews" lazy>
             <div class="governance-filter-row">
               <el-select v-model="reviewStatus" style="width: 160px">
                 <el-option label="全部状态" value="all" />
@@ -1350,7 +1383,7 @@ export const GovernanceView = {
             </el-table>
           </el-tab-pane>
 
-          <el-tab-pane label="搜索运营" name="search">
+          <el-tab-pane label="搜索运营" name="search" lazy>
             <div class="governance-filter-row">
               <el-radio-group v-model="searchDays" size="small" @change="changeSearchDays">
                 <el-radio-button :value="7">近 7 天</el-radio-button>

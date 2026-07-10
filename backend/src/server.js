@@ -1,6 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
+import http from 'node:http';
 import fs from 'node:fs/promises';
 import fsSync from 'node:fs';
 import path from 'node:path';
@@ -8,6 +9,7 @@ import crypto from 'node:crypto';
 import mime from 'mime-types';
 import archiver from 'archiver';
 import AdmZip from 'adm-zip';
+import httpProxy from 'http-proxy';
 import { config } from './config.js';
 import { addAudit, addMessage, ACTIONS, fullActions, loadDb, reloadDb, resetDb, saveDb } from './db.js';
 import {
@@ -41,6 +43,7 @@ await loadDb();
 
 const upload = multer({ dest: config.tmpDir, limits: { fileSize: 1024 * 1024 * 300 } });
 const app = express();
+const onlyOfficeProxy = httpProxy.createProxyServer({ changeOrigin: true, xfwd: true, ws: true });
 const DEFAULT_FILE_POLICY = {
   allowedExtensions: ['doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'pdf', 'txt', 'md', 'csv', 'json', 'xml', 'html', 'png', 'jpg', 'jpeg', 'gif', 'zip'],
   maxSizeMb: 300
@@ -122,6 +125,59 @@ app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 
+function onlyOfficeProxyTarget(db) {
+  const settings = currentOfficePreviewSettings(db);
+  if (!settings.enabled || !settings.documentServerUrl) {
+    throw createError(503, 'OFFICE_PREVIEW_UNAVAILABLE', 'Office 原版预览服务未启用');
+  }
+  let target;
+  try {
+    target = new URL(settings.documentServerUrl);
+  } catch {
+    throw createError(503, 'OFFICE_PREVIEW_UNAVAILABLE', 'Office 原版预览服务地址无效');
+  }
+  if (!['http:', 'https:'].includes(target.protocol)) {
+    throw createError(503, 'OFFICE_PREVIEW_UNAVAILABLE', 'Office 原版预览服务地址仅支持 HTTP 或 HTTPS');
+  }
+  return target.toString().replace(/\/+$/, '');
+}
+
+function onlyOfficeProxyHeaders(req, forwardedPath = '') {
+  const forwardedProto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim();
+  const headers = {
+    'X-Forwarded-Host': req.headers.host || `localhost:${config.port}`,
+    'X-Forwarded-Proto': forwardedProto || (req.socket.encrypted ? 'https' : 'http')
+  };
+  if (forwardedPath) headers['X-Forwarded-Path'] = forwardedPath;
+  return headers;
+}
+
+function isOnlyOfficeRootPath(url = '') {
+  const pathname = String(url).split('?')[0];
+  return /^(?:\/\d+\.\d+\.\d+[.-][\w-]+)?\/(?:web-apps|sdkjs|sdkjs-plugins|fonts|dictionaries|cache|internal|info|coauthoring|doc)(?:\/|$)/i.test(pathname)
+    || /^\/(?:ConvertService|CommandService|healthcheck)(?:\.ashx)?(?:\/|$)/i.test(pathname);
+}
+
+function proxyOnlyOfficeRequest(req, res, next, forwardedPath = '') {
+  Promise.resolve(loadDb())
+    .then((db) => {
+      const target = onlyOfficeProxyTarget(db);
+      onlyOfficeProxy.web(req, res, { target, headers: onlyOfficeProxyHeaders(req, forwardedPath) }, (error) => {
+        next(createError(502, 'OFFICE_PREVIEW_PROXY_ERROR', `Office 原版预览代理失败：${error.message}`));
+      });
+    })
+    .catch(next);
+}
+
+app.use((req, res, next) => {
+  if (!isOnlyOfficeRootPath(req.url)) return next();
+  return proxyOnlyOfficeRequest(req, res, next);
+});
+
+app.use('/onlyoffice', (req, res, next) => {
+  return proxyOnlyOfficeRequest(req, res, next, '/onlyoffice');
+});
+
 function asyncRoute(fn) {
   return (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 }
@@ -137,9 +193,11 @@ async function saveDbBestEffort(db, label) {
 }
 
 function getBearer(req) {
+  const queryToken = Array.isArray(req.query.token) ? req.query.token[0] : req.query.token;
+  if (queryToken) return String(queryToken);
   const auth = req.headers.authorization || '';
   if (auth.startsWith('Bearer ')) return auth.slice(7);
-  return req.query.token || null;
+  return null;
 }
 
 function attachApiCallLogger(req, res) {
@@ -853,6 +911,26 @@ function requestPublicBaseUrl(req, settings) {
   return `${req.protocol}://${req.get('host')}`;
 }
 
+function officePreviewConfigurationIssue(req, settings) {
+  const documentServerUrl = String(settings.documentServerUrl || '').trim().replace(/\/+$/, '');
+  const publicBaseUrl = requestPublicBaseUrl(req, settings);
+  if (!documentServerUrl || !publicBaseUrl) return '';
+  if (documentServerUrl === publicBaseUrl) {
+    return '平台外部访问地址不能填写 ONLYOFFICE Document Server 地址；该地址必须指向文档管理平台后端。';
+  }
+  try {
+    const documentServerHost = new URL(documentServerUrl).hostname;
+    const publicBaseHost = new URL(publicBaseUrl).hostname;
+    const localHosts = new Set(['localhost', '127.0.0.1', '::1']);
+    if (!localHosts.has(documentServerHost) && localHosts.has(publicBaseHost)) {
+      return '远程 ONLYOFFICE 无法访问本机 localhost；请填写 Document Server 可回连的平台公网地址或建立预览通道。';
+    }
+  } catch {
+    return '请检查 Document Server 地址和平台外部访问地址的 URL 格式。';
+  }
+  return '';
+}
+
 function officeDocumentType(extension) {
   if (['doc', 'docx'].includes(extension)) return 'word';
   if (['xls', 'xlsx'].includes(extension)) return 'cell';
@@ -867,8 +945,18 @@ function signOnlyOfficeToken(payload, secret) {
   return `${header}.${body}.${signature}`;
 }
 
-function officeDocumentKey(version) {
-  return String(`${version.id}-${version.md5 || version.createdAt || version.versionNo || ''}`)
+function officeDocumentKey(version, documentUrl = '') {
+  let stableDocumentUrl = String(documentUrl || '');
+  try {
+    const parsed = new URL(stableDocumentUrl);
+    parsed.search = '';
+    parsed.hash = '';
+    stableDocumentUrl = parsed.toString();
+  } catch {
+    stableDocumentUrl = stableDocumentUrl.split(/[?#]/)[0];
+  }
+  const sourceKey = crypto.createHash('sha1').update(`raw-token-v3|${stableDocumentUrl}`).digest('hex').slice(0, 10);
+  return String(`${version.id}-${version.md5 || version.createdAt || version.versionNo || ''}-${sourceKey}`)
     .replace(/[^A-Za-z0-9_.=-]/g, '_')
     .slice(0, 80);
 }
@@ -895,7 +983,7 @@ function buildOnlyOfficePreview(req, node, version, extension) {
       title: version.originalFilename || node.name,
       url: documentUrl,
       fileType: extension,
-      key: officeDocumentKey(version),
+      key: officeDocumentKey(version, documentUrl),
       permissions: {
         edit: false,
         download: false,
@@ -923,7 +1011,7 @@ function buildOnlyOfficePreview(req, node, version, extension) {
   if (settings.jwtSecret) editorConfig.token = signOnlyOfficeToken(editorConfig, settings.jwtSecret);
   return {
     provider: 'onlyoffice',
-    scriptUrl: joinUrl(settings.documentServerUrl, '/web-apps/apps/api/documents/api.js'),
+    scriptUrl: '/web-apps/apps/api/documents/api.js',
     config: editorConfig
   };
 }
@@ -1691,11 +1779,15 @@ function listVisibleDescendants(db, user) {
   return db.nodes.filter((node) => node.status !== 'deleted' && hasAction(db, user, node, 'visible'));
 }
 
-function sendPage(res, items, page = 1, pageSize = 20) {
+function pageData(items, page = 1, pageSize = 20) {
   const p = Math.max(Number(page) || 1, 1);
   const ps = Math.max(Number(pageSize) || 20, 1);
   const start = (p - 1) * ps;
-  res.json(ok({ items: items.slice(start, start + ps), page: p, pageSize: ps, total: items.length }));
+  return { items: items.slice(start, start + ps), page: p, pageSize: ps, total: items.length };
+}
+
+function sendPage(res, items, page = 1, pageSize = 20) {
+  res.json(ok(pageData(items, page, pageSize)));
 }
 
 function csvCell(value) {
@@ -2417,6 +2509,7 @@ function openApiDocument() {
       '/search/suggestions': endpoint('搜索建议'),
       '/search/index/status': endpoint('全文检索索引状态'),
       '/search/index/rebuild': endpoint('重建全文检索索引', 'post'),
+      '/governance/workspace': endpoint('知识治理聚合工作台'),
       '/governance/dashboard': endpoint('知识治理工作台'),
       '/governance/quality': endpoint('文档质量清单'),
       '/governance/duplicates': endpoint('重复文件检测'),
@@ -3334,13 +3427,15 @@ app.get('/api/v1/files/:id/preview', requireAuth, asyncRoute(async (req, res) =>
     previewType = 'office';
     const officeText = await extractSearchText(versionFilePath(version, node, req.db), extension, version.mimeType, version.originalFilename).catch(() => '');
     content = trimPreviewContent(officeText || version.searchText);
-    const nativePreview = buildOnlyOfficePreview(req, node, version, extension);
+    const officeSettings = currentOfficePreviewSettings(req.db);
+    const configurationIssue = officePreviewConfigurationIssue(req, officeSettings);
+    const nativePreview = configurationIssue ? null : buildOnlyOfficePreview(req, node, version, extension);
     officePreview = {
-      status: nativePreview ? 'native_ready' : 'text_fallback',
+      status: configurationIssue ? 'configuration_error' : (nativePreview ? 'native_ready' : 'text_fallback'),
       provider: 'ONLYOFFICE Docs',
-      message: nativePreview
+      message: configurationIssue || (nativePreview
         ? '正在使用 ONLYOFFICE 原版预览；加载失败时可查看提取文本。'
-        : '当前展示提取文本；原版排版预览需要在系统管理中配置 ONLYOFFICE Document Server。',
+        : '当前展示提取文本；原版排版预览需要在系统管理中配置 ONLYOFFICE Document Server。'),
       extension,
       native: nativePreview
     };
@@ -4116,7 +4211,7 @@ function duplicateGroupId(type, key) {
   return `dup_${type}_${crypto.createHash('sha1').update(key).digest('hex').slice(0, 12)}`;
 }
 
-function duplicateFileGroups(db, user) {
+function duplicateFileGroups(db, user, unreadUploadCounts = unreadUploadCountsByNode(db, user)) {
   const files = db.nodes
     .filter((node) => node.nodeType === 'file' && node.status !== 'deleted')
     .map((node) => ({ node, version: currentVersion(db, node) }))
@@ -4141,7 +4236,7 @@ function duplicateFileGroups(db, user) {
         confidence: 100,
         fileCount: items.length,
         wastedBytes: Math.max(0, sizes.reduce((sum, value) => sum + value, 0) - Math.max(...sizes)),
-        files: items.map(({ node, version }) => ({ ...publicNode(db, user, node), duplicateVersion: publicVersion(version) }))
+        files: items.map(({ node, version }) => ({ ...publicNode(db, user, node, { unreadUploadCounts }), duplicateVersion: publicVersion(version) }))
       };
     });
 
@@ -4170,7 +4265,7 @@ function duplicateFileGroups(db, user) {
         confidence: 80,
         fileCount: items.length,
         wastedBytes: Math.max(0, sizes.reduce((sum, value) => sum + value, 0) - Math.max(...sizes)),
-        files: items.map(({ node, version }) => ({ ...publicNode(db, user, node), duplicateVersion: publicVersion(version) }))
+        files: items.map(({ node, version }) => ({ ...publicNode(db, user, node, { unreadUploadCounts }), duplicateVersion: publicVersion(version) }))
       };
     });
   return [...exact, ...probable].sort((a, b) => b.wastedBytes - a.wastedBytes || b.fileCount - a.fileCount);
@@ -4235,10 +4330,19 @@ function governanceQualityCounts(qualities) {
   }, { excellent: 0, good: 0, fair: 0, poor: 0 });
 }
 
-function governanceDashboard(req) {
+function governanceAnalysis(req) {
   const files = req.db.nodes.filter((node) => node.nodeType === 'file' && node.status !== 'deleted');
-  const qualityRows = files.map((node) => ({ node, quality: documentQuality(req.db, node) }));
-  const duplicateGroups = duplicateFileGroups(req.db, req.user);
+  const unreadUploadCounts = unreadUploadCountsByNode(req.db, req.user);
+  return {
+    files,
+    qualityRows: files.map((node) => ({ node, quality: documentQuality(req.db, node) })),
+    duplicateGroups: duplicateFileGroups(req.db, req.user, unreadUploadCounts),
+    unreadUploadCounts
+  };
+}
+
+function governanceDashboard(req, analysis = governanceAnalysis(req), analytics = searchAnalytics(req.db, 30)) {
+  const { files, qualityRows, duplicateGroups, unreadUploadCounts } = analysis;
   const duplicateNodeIds = new Set(duplicateGroups.flatMap((group) => group.files.map((file) => file.id)));
   const reviews = governanceReviewCounts(files);
   const qualityDistribution = governanceQualityCounts(qualityRows.map((item) => item.quality));
@@ -4262,7 +4366,7 @@ function governanceDashboard(req) {
     })
     .slice(0, 40)
     .map((item) => ({
-      ...publicNode(req.db, req.user, item.node),
+      ...publicNode(req.db, req.user, item.node, { unreadUploadCounts }),
       quality: item.quality,
       reviewStatus: item.reviewStatus,
       reviewStatusLabel: REVIEW_STATUS_LABELS[item.reviewStatus],
@@ -4276,8 +4380,7 @@ function governanceDashboard(req) {
     .filter((item) => item.node?.nodeType === 'file')
     .sort((a, b) => b.accessCount - a.accessCount)
     .slice(0, 10)
-    .map((item) => ({ ...publicNode(req.db, req.user, item.node), accessCount: item.accessCount }));
-  const analytics = searchAnalytics(req.db, 30);
+    .map((item) => ({ ...publicNode(req.db, req.user, item.node, { unreadUploadCounts }), accessCount: item.accessCount }));
   return {
     stats: {
       files: files.length,
@@ -4443,26 +4546,31 @@ app.get('/api/v1/governance/dashboard', requireAuth, (req, res) => {
   res.json(ok(governanceDashboard(req)));
 });
 
-app.get('/api/v1/governance/quality', requireAuth, (req, res) => {
-  if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以查看全库质量清单');
-  const level = String(req.query.level || '');
-  const maxScore = req.query.maxScore === undefined ? null : Number(req.query.maxScore);
-  const keyword = String(req.query.keyword || '').trim().toLowerCase();
-  let rows = req.db.nodes
+function governanceQualityRows(req, query = req.query, analysis = null) {
+  const level = String(query.level || '');
+  const maxScore = query.maxScore === undefined ? null : Number(query.maxScore);
+  const keyword = String(query.keyword || '').trim().toLowerCase();
+  const qualityRows = analysis?.qualityRows || req.db.nodes
     .filter((node) => node.nodeType === 'file' && node.status !== 'deleted')
-    .map((node) => ({ ...publicNode(req.db, req.user, node), quality: documentQuality(req.db, node) }))
+    .map((node) => ({ node, quality: documentQuality(req.db, node) }));
+  const unreadUploadCounts = analysis?.unreadUploadCounts || unreadUploadCountsByNode(req.db, req.user);
+  return qualityRows
+    .map(({ node, quality }) => ({ ...publicNode(req.db, req.user, node, { unreadUploadCounts }), quality }))
     .filter((item) => !level || item.quality.level === level)
     .filter((item) => maxScore === null || item.quality.score <= maxScore)
     .filter((item) => !keyword || `${item.name} ${item.fullPath}`.toLowerCase().includes(keyword))
     .sort((a, b) => a.quality.score - b.quality.score || String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')));
-  sendPage(res, rows, req.query.page, req.query.pageSize || 100);
+}
+
+app.get('/api/v1/governance/quality', requireAuth, (req, res) => {
+  if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以查看全库质量清单');
+  sendPage(res, governanceQualityRows(req), req.query.page, req.query.pageSize || 100);
 });
 
-app.get('/api/v1/governance/duplicates', requireAuth, (req, res) => {
-  if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以查看重复文件检测结果');
-  const type = String(req.query.type || '');
-  const groups = duplicateFileGroups(req.db, req.user).filter((item) => !type || item.type === type);
-  res.json(ok({
+function governanceDuplicateData(req, type = '', analysis = null) {
+  const groups = (analysis?.duplicateGroups || duplicateFileGroups(req.db, req.user))
+    .filter((item) => !type || item.type === type);
+  return {
     groups,
     summary: {
       groupCount: groups.length,
@@ -4471,17 +4579,23 @@ app.get('/api/v1/governance/duplicates', requireAuth, (req, res) => {
       probableGroups: groups.filter((item) => item.type === 'probable').length,
       wastedBytes: groups.reduce((sum, group) => sum + group.wastedBytes, 0)
     }
-  }));
+  };
+}
+
+app.get('/api/v1/governance/duplicates', requireAuth, (req, res) => {
+  if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以查看重复文件检测结果');
+  const type = String(req.query.type || '');
+  res.json(ok(governanceDuplicateData(req, type)));
 });
 
-app.get('/api/v1/governance/reviews', requireAuth, (req, res) => {
-  if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以查看全库复审清单');
-  const status = String(req.query.status || '');
-  const ownerId = String(req.query.ownerId || '');
-  const keyword = String(req.query.keyword || '').trim().toLowerCase();
-  const rows = req.db.nodes
-    .filter((node) => node.nodeType === 'file' && node.status !== 'deleted')
-    .map((node) => ({ ...publicNode(req.db, req.user, node), reviewStatus: reviewStatusForNode(node), reviewStatusLabel: REVIEW_STATUS_LABELS[reviewStatusForNode(node)] }))
+function governanceReviewRows(req, query = req.query, analysis = null) {
+  const status = String(query.status || '');
+  const ownerId = String(query.ownerId || '');
+  const keyword = String(query.keyword || '').trim().toLowerCase();
+  const files = analysis?.files || req.db.nodes.filter((node) => node.nodeType === 'file' && node.status !== 'deleted');
+  const unreadUploadCounts = analysis?.unreadUploadCounts || unreadUploadCountsByNode(req.db, req.user);
+  return files
+    .map((node) => ({ ...publicNode(req.db, req.user, node, { unreadUploadCounts }), reviewStatus: reviewStatusForNode(node), reviewStatusLabel: REVIEW_STATUS_LABELS[reviewStatusForNode(node)] }))
     .filter((item) => !status || item.reviewStatus === status)
     .filter((item) => !ownerId || item.review.ownerId === ownerId)
     .filter((item) => !keyword || `${item.name} ${item.fullPath}`.toLowerCase().includes(keyword))
@@ -4489,12 +4603,29 @@ app.get('/api/v1/governance/reviews', requireAuth, (req, res) => {
       const rank = { overdue: 0, due_soon: 1, normal: 2, not_scheduled: 3 };
       return (rank[a.reviewStatus] ?? 9) - (rank[b.reviewStatus] ?? 9) || String(a.review.nextReviewAt || '9999').localeCompare(String(b.review.nextReviewAt || '9999'));
     });
-  sendPage(res, rows, req.query.page, req.query.pageSize || 100);
+}
+
+app.get('/api/v1/governance/reviews', requireAuth, (req, res) => {
+  if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以查看全库复审清单');
+  sendPage(res, governanceReviewRows(req), req.query.page, req.query.pageSize || 100);
 });
 
 app.get('/api/v1/governance/search-analytics', requireAuth, (req, res) => {
   if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以查看搜索运营分析');
   res.json(ok(searchAnalytics(req.db, req.query.days || 30)));
+});
+
+app.get('/api/v1/governance/workspace', requireAuth, (req, res) => {
+  if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以查看知识治理工作台');
+  const analysis = governanceAnalysis(req);
+  const analytics = searchAnalytics(req.db, req.query.days || 30);
+  res.json(ok({
+    dashboard: governanceDashboard(req, analysis, analytics),
+    quality: pageData(governanceQualityRows(req, req.query, analysis), req.query.page, req.query.pageSize || 100),
+    duplicates: governanceDuplicateData(req, String(req.query.type || ''), analysis),
+    reviews: pageData(governanceReviewRows(req, req.query, analysis), req.query.page, req.query.pageSize || 100),
+    searchAnalytics: analytics
+  }));
 });
 
 app.get('/api/v1/nodes/:id/quality', requireAuth, (req, res) => {
@@ -5363,13 +5494,14 @@ app.post('/api/v1/system-settings/office-preview/test', requireAuth, asyncRoute(
   const missing = [];
   if (!settings.enabled) missing.push('启用状态');
   if (!settings.documentServerUrl) missing.push('Document Server 地址');
+  const configurationIssue = missing.length ? '' : officePreviewConfigurationIssue(req, settings);
   const result = {
-    ok: missing.length === 0,
-    message: missing.length ? `缺少 ${missing.join('、')}` : '配置项完整，等待 Document Server 联通验证',
+    ok: missing.length === 0 && !configurationIssue,
+    message: missing.length ? `缺少 ${missing.join('、')}` : (configurationIssue || '配置项完整，等待 Document Server 联通验证'),
     checkedAt: now(),
     scriptUrl: settings.documentServerUrl ? joinUrl(settings.documentServerUrl, '/web-apps/apps/api/documents/api.js') : ''
   };
-  if (!missing.length) {
+  if (!missing.length && !configurationIssue) {
     try {
       const response = await fetch(result.scriptUrl, { method: 'GET', signal: AbortSignal.timeout(5000) });
       result.ok = response.ok;
@@ -5705,7 +5837,27 @@ app.use((err, _req, res, _next) => {
   res.status(status).json({ code, message: err.message || '服务异常', data: err.data ?? null });
 });
 
-app.listen(config.port, () => {
+const server = http.createServer(app);
+
+server.on('upgrade', (req, socket, head) => {
+  const prefixed = String(req.url || '').startsWith('/onlyoffice/');
+  if (!prefixed && !isOnlyOfficeRootPath(req.url)) {
+    socket.destroy();
+    return;
+  }
+  Promise.resolve(loadDb())
+    .then((db) => {
+      const target = onlyOfficeProxyTarget(db);
+      if (prefixed) req.url = String(req.url || '').slice('/onlyoffice'.length) || '/';
+      onlyOfficeProxy.ws(req, socket, head, {
+        target,
+        headers: onlyOfficeProxyHeaders(req, prefixed ? '/onlyoffice' : '')
+      }, () => socket.destroy());
+    })
+    .catch(() => socket.destroy());
+});
+
+server.listen(config.port, () => {
   console.log(`Document platform API running at http://localhost:${config.port}`);
   console.log('Default accounts: admin/admin123, demo/user123');
 });

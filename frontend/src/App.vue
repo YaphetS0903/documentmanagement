@@ -260,6 +260,7 @@
           :users="users"
           :format-date="formatDate"
           :format-size="formatSize"
+          :loading="governanceLoading"
           @preview="previewNode"
           @manage="openGovernanceDialog"
           @refresh="loadGovernance"
@@ -1455,7 +1456,7 @@
       </template>
     </el-dialog>
 
-    <el-dialog v-model="previewDialog.visible" :title="previewDialog.node?.name || '预览'" width="80%">
+    <el-dialog v-model="previewDialog.visible" :title="previewDialog.node?.name || '预览'" width="80%" class="preview-dialog" align-center>
       <div class="preview-box" :class="{ 'has-watermark': previewDialog.data?.watermark?.enabled }">
         <div v-if="previewDialog.loading" class="preview-loading">正在加载预览...</div>
         <iframe v-else-if="previewDialog.data?.previewType === 'pdf'" class="preview-frame" :src="previewDialog.data.rawUrl" title="PDF预览" />
@@ -1550,7 +1551,11 @@
               title="原版预览暂不可用"
               :description="officeNativeState.error"
             />
-            <div ref="officeEditorHost" class="preview-office-editor"></div>
+            <div
+              :key="previewDialog.data?.version?.id || previewDialog.data?.officePreview?.native?.config?.document?.key"
+              ref="officeEditorHost"
+              class="preview-office-editor"
+            ></div>
           </div>
           <div v-if="previewDialog.data.content && (!isOfficeNativePreview || officeNativeState.error)" class="preview-document">
             <div class="preview-toolbar">
@@ -1800,6 +1805,7 @@ const governanceDuplicateData = ref({ groups: [], summary: {} });
 const governanceReviewItems = ref([]);
 const governanceSearchAnalytics = ref(null);
 const governanceSearchDays = ref(30);
+const governanceLoading = ref(false);
 const nodeUnlockTokens = reactive({});
 
 const folderDialog = reactive({ visible: false, name: '' });
@@ -1844,8 +1850,10 @@ const previewSettings = reactive({
 const officeEditorHost = ref(null);
 const officeNativeState = reactive({ loading: false, error: '' });
 let officeEditorInstance = null;
+let officeEditorInstanceHost = null;
 let officeApiScriptPromise = null;
 let officeApiScriptUrl = '';
+let officeEditorMountVersion = 0;
 const CODE_LANGUAGE_BY_EXTENSION = {
   html: 'html',
   htm: 'html',
@@ -2200,14 +2208,18 @@ function showAllPreviewContent() {
 }
 
 function destroyOfficeEditor() {
+  officeEditorMountVersion += 1;
+  const instance = officeEditorInstance;
+  const host = officeEditorInstanceHost || officeEditorHost.value;
+  officeEditorInstance = null;
+  officeEditorInstanceHost = null;
+  officeNativeState.loading = false;
   try {
-    officeEditorInstance?.destroyEditor?.();
+    instance?.destroyEditor?.();
   } catch {
     // ONLYOFFICE cleanup is best-effort because external script versions differ.
   }
-  officeEditorInstance = null;
-  officeNativeState.loading = false;
-  if (officeEditorHost.value) officeEditorHost.value.innerHTML = '';
+  host?.replaceChildren();
 }
 
 function loadOfficeApi(scriptUrl) {
@@ -2240,20 +2252,41 @@ function loadOfficeApi(scriptUrl) {
 async function mountOfficeEditor() {
   const native = previewDialog.data?.officePreview?.native;
   destroyOfficeEditor();
+  const mountVersion = officeEditorMountVersion;
   officeNativeState.error = '';
   if (!previewDialog.visible || !native?.scriptUrl || !native?.config) return;
   officeNativeState.loading = true;
   try {
     await loadOfficeApi(native.scriptUrl);
     await nextTick();
-    if (!officeEditorHost.value || previewDialog.data?.officePreview?.native !== native) return;
-    const editorId = `office-editor-${Date.now()}`;
-    officeEditorHost.value.innerHTML = `<div id="${editorId}" class="preview-office-editor-host"></div>`;
-    officeEditorInstance = new window.DocsAPI.DocEditor(editorId, native.config);
+    const host = officeEditorHost.value;
+    if (mountVersion !== officeEditorMountVersion || !previewDialog.visible || !host) return;
+    const editorId = `office-editor-${mountVersion}-${Date.now()}`;
+    const editorElement = document.createElement('div');
+    editorElement.id = editorId;
+    editorElement.className = 'preview-office-editor-host';
+    host.replaceChildren(editorElement);
+    const config = {
+      ...native.config,
+      events: {
+        ...(native.config.events || {}),
+        onError(event) {
+          if (mountVersion !== officeEditorMountVersion) return;
+          const code = Number(event?.data?.errorCode ?? event?.data ?? 0);
+          officeNativeState.error = code === -4
+            ? 'ONLYOFFICE 无法从平台下载原文件，请检查“平台外部访问地址”是否能被 Document Server 访问。'
+            : `Office 原版预览加载失败${code ? `（错误码 ${code}）` : ''}，已切换为提取文本预览。`;
+        }
+      }
+    };
+    officeEditorInstanceHost = host;
+    officeEditorInstance = new window.DocsAPI.DocEditor(editorId, config);
   } catch (error) {
-    officeNativeState.error = error.message || 'Office 原版预览加载失败，请检查 Document Server 是否可访问';
+    if (mountVersion === officeEditorMountVersion) {
+      officeNativeState.error = error.message || 'Office 原版预览加载失败，请检查 Document Server 是否可访问';
+    }
   } finally {
-    officeNativeState.loading = false;
+    if (mountVersion === officeEditorMountVersion) officeNativeState.loading = false;
   }
 }
 
@@ -2898,23 +2931,29 @@ async function loadAuditReport() {
 async function loadGovernanceSearchAnalytics(days = 30) {
   if (!isAdminUser.value) return;
   governanceSearchDays.value = Number(days || 30);
-  governanceSearchAnalytics.value = await api(`/governance/search-analytics?days=${encodeURIComponent(governanceSearchDays.value)}`);
+  try {
+    governanceSearchAnalytics.value = await api(`/governance/search-analytics?days=${encodeURIComponent(governanceSearchDays.value)}`, { silentError: true });
+  } catch (error) {
+    ElMessage.error(error.status === 404 ? '知识治理接口尚未加载，请重启后端服务' : '搜索运营数据加载失败，请稍后重试');
+  }
 }
 
 async function loadGovernance() {
   if (!isAdminUser.value) return;
-  const [summary, qualityPage, duplicateResult, reviewPage, analytics] = await Promise.all([
-    api('/governance/dashboard'),
-    api('/governance/quality?pageSize=500'),
-    api('/governance/duplicates'),
-    api('/governance/reviews?pageSize=500'),
-    api(`/governance/search-analytics?days=${encodeURIComponent(governanceSearchDays.value)}`)
-  ]);
-  governanceDashboard.value = summary;
-  governanceQualityItems.value = qualityPage.items || [];
-  governanceDuplicateData.value = duplicateResult;
-  governanceReviewItems.value = reviewPage.items || [];
-  governanceSearchAnalytics.value = analytics;
+  if (governanceLoading.value) return;
+  governanceLoading.value = true;
+  try {
+    const workspace = await api(`/governance/workspace?pageSize=500&days=${encodeURIComponent(governanceSearchDays.value)}`, { silentError: true });
+    governanceDashboard.value = workspace.dashboard;
+    governanceQualityItems.value = workspace.quality?.items || [];
+    governanceDuplicateData.value = workspace.duplicates;
+    governanceReviewItems.value = workspace.reviews?.items || [];
+    governanceSearchAnalytics.value = workspace.searchAnalytics;
+  } catch (error) {
+    ElMessage.error(error.status === 404 ? '知识治理接口尚未加载，请重启后端服务' : '知识治理数据加载失败，请稍后重试');
+  } finally {
+    governanceLoading.value = false;
+  }
 }
 
 async function loadApprovals() {
@@ -3194,17 +3233,17 @@ function applyPreviewSearchKeyword(keyword) {
 async function previewNode(node, versionId = null, options = {}) {
   if (!node) return;
   await runWithPasswordUnlock(node, async () => {
+    resetPreviewViewport();
     previewDialog.node = node;
     previewDialog.data = null;
     previewDialog.loading = true;
     previewDialog.visible = true;
-    resetPreviewViewport();
     const suffix = versionId ? `?versionId=${encodeURIComponent(versionId)}` : '';
     try {
       previewDialog.data = await api(`/files/${node.id}/preview${suffix}`, { headers: nodeUnlockHeaders() });
+      previewDialog.loading = false;
       await nextTick();
       applyPreviewSearchKeyword(options.searchKeyword || node.searchMatch?.keyword || '');
-      previewDialog.loading = false;
       void Promise.allSettled([markUploadMessagesRead(node), loadRecentAccess()]);
     } catch (error) {
       previewDialog.visible = false;
@@ -4603,16 +4642,24 @@ async function saveFilePolicy() {
 }
 
 watch(
-  () => previewDialog.data?.officePreview?.native,
-  () => {
+  [
+    () => previewDialog.data?.officePreview?.native,
+    () => previewDialog.loading
+  ],
+  ([native, loading]) => {
+    if (!native || loading) {
+      destroyOfficeEditor();
+      return;
+    }
     void mountOfficeEditor();
-  }
+  },
+  { flush: 'post' }
 );
 
 watch(
   () => previewDialog.visible,
   (visible) => {
-    if (!visible) destroyOfficeEditor();
+    if (!visible && !previewDialog.visible) destroyOfficeEditor();
   }
 );
 

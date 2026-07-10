@@ -4,7 +4,20 @@
 
 ## 当前部署状态
 
-腾讯云测试环境已部署并验收 ONLYOFFICE Docs `8.2.3.1`。容器仅监听服务器本机端口，由 Nginx 通过统一子路径转发，JWT 密钥保存在服务器运行目录，不进入 Git 仓库。
+CentOS 服务器已部署并验收 ONLYOFFICE Docs `8.2.3.1`，对外地址为 `http://222.90.144.186:4010`。容器使用独立持久化卷，JWT 密钥只保存在运行配置中，不进入 Git 仓库。
+
+开发机通过 SSH 反向隧道把本机 `3000` 端口映射到服务器回环地址 `127.0.0.1:18091`，服务器上的桥接服务再把它提供给 ONLYOFFICE 容器：
+
+```text
+ONLYOFFICE 容器 -> 172.17.0.1:18092 -> 127.0.0.1:18091 -> 开发机 127.0.0.1:3000
+```
+
+桥接脚本和 systemd 服务模板位于：
+
+```text
+scripts/office-preview-bridge.py
+deploy/systemd/document-platform-office-preview-bridge.service
+```
 
 本地开发机如需验证原版预览，需要先安装并启动 Docker Desktop，再运行项目脚本。
 
@@ -119,6 +132,13 @@ npm run onlyoffice:setup
 ```text
 平台外部访问地址 = https://服务器域名/文档平台-api
 Document Server 地址 = https://服务器域名/文档平台-office
+```
+
+当前开发测试环境使用：
+
+```text
+Document Server 地址 = http://222.90.144.186:4010
+平台外部访问地址 = http://172.17.0.1:18092
 ```
 
 服务器上建议只把容器端口绑定到回环地址，例如 `127.0.0.1:8081:80`，再由 Nginx 对外提供 HTTPS 地址。不要直接把 Document Server 管理端口暴露到公网。

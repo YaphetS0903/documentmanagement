@@ -18,9 +18,17 @@ export function signToken(payload, expiresInMs = 24 * 60 * 60 * 1000) {
 export function verifyToken(token) {
   if (!token || !token.includes('.')) return null;
   const [encoded, sig] = token.split('.');
+  if (!encoded || !sig) return null;
   const expected = crypto.createHmac('sha256', config.jwtSecret).update(encoded).digest('base64url');
-  if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return null;
-  const payload = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8'));
-  if (payload.exp && payload.exp < Date.now()) return null;
-  return payload;
+  const actualBuffer = Buffer.from(sig);
+  const expectedBuffer = Buffer.from(expected);
+  if (actualBuffer.length !== expectedBuffer.length) return null;
+  if (!crypto.timingSafeEqual(actualBuffer, expectedBuffer)) return null;
+  try {
+    const payload = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8'));
+    if (payload.exp && payload.exp < Date.now()) return null;
+    return payload;
+  } catch {
+    return null;
+  }
 }
