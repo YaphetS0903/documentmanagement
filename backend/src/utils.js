@@ -64,6 +64,8 @@ export function pickPublicUser(user) {
     status: user.status,
     departmentIds: user.departmentIds || [],
     roleIds: user.roleIds || [],
-    avatarUrl: user.avatarUrl || ''
+    avatarUrl: user.avatarStorageKey ? `/api/v1/public/avatars/${encodeURIComponent(user.id)}` : (user.avatarUrl || ''),
+    defaultWorkPathId: user.defaultWorkPathId || null,
+    sourceType: user.sourceType || 'local'
   };
 }

@@ -26,7 +26,7 @@ import {
 
 export const DashboardView = {
   props: ['dashboard', 'formatDate'],
-  emits: ['open-docs'],
+  emits: ['open-docs', 'open-node'],
   computed: {
     maxGrowthValue() {
       return Math.max(1, ...(this.dashboard?.growthTrend || []).map((item) => Math.max(item.files || 0, item.versions || 0)));
@@ -39,6 +39,8 @@ export const DashboardView = {
         <div class="stat-tile"><span>可见文件</span><strong>{{ dashboard?.stats?.files || 0 }}</strong></div>
         <div class="stat-tile"><span>文件版本</span><strong>{{ dashboard?.stats?.versions || 0 }}</strong></div>
         <div class="stat-tile"><span>未读消息</span><strong>{{ dashboard?.stats?.unreadMessages || 0 }}</strong></div>
+        <div class="stat-tile"><span>待办审批</span><strong>{{ dashboard?.stats?.pendingApprovals || 0 }}</strong></div>
+        <div class="stat-tile"><span>锁定文件</span><strong>{{ dashboard?.stats?.lockedFiles || 0 }}</strong></div>
       </div>
       <section class="section">
         <div class="section-header">
@@ -58,6 +60,48 @@ export const DashboardView = {
           <span><i class="legend-dot file"></i>新增文件</span>
           <span><i class="legend-dot version"></i>新增版本</span>
         </div>
+      </section>
+      <section class="section">
+        <div class="section-header"><h2 class="section-title">我的工作专题</h2></div>
+        <el-tabs>
+          <el-tab-pane label="待办" name="todo">
+            <el-table :data="dashboard?.pendingApprovals || []" border>
+              <el-table-column prop="actionLabel" label="事项" width="140" />
+              <el-table-column prop="nodePath" label="文件" min-width="260" />
+              <el-table-column prop="currentStepName" label="当前步骤" width="140" />
+              <el-table-column label="提交时间" width="180"><template #default="{ row }">{{ formatDate(row.createdAt) }}</template></el-table-column>
+            </el-table>
+          </el-tab-pane>
+          <el-tab-pane label="我的分享" name="shares">
+            <el-table :data="dashboard?.myShares || []" border>
+              <el-table-column prop="nodePath" label="文件" min-width="280" />
+              <el-table-column prop="type" label="类型" width="100" />
+              <el-table-column prop="status" label="状态" width="100" />
+              <el-table-column label="到期时间" width="180"><template #default="{ row }">{{ formatDate(row.expiresAt) }}</template></el-table-column>
+            </el-table>
+          </el-tab-pane>
+          <el-tab-pane label="我的订阅" name="subscriptions">
+            <el-table :data="dashboard?.mySubscriptions || []" border>
+              <el-table-column prop="nodePath" label="文件" min-width="300" />
+              <el-table-column label="事件" width="180"><template #default="{ row }">{{ (row.eventTypes || []).join('、') }}</template></el-table-column>
+              <el-table-column label="创建时间" width="180"><template #default="{ row }">{{ formatDate(row.createdAt) }}</template></el-table-column>
+            </el-table>
+          </el-tab-pane>
+          <el-tab-pane label="锁定文件" name="locked">
+            <el-table :data="dashboard?.lockedFiles || []" border @row-click="$emit('open-node', $event)">
+              <el-table-column prop="name" label="名称" min-width="220" />
+              <el-table-column prop="fullPath" label="路径" min-width="280" />
+              <el-table-column label="锁定时间" width="180"><template #default="{ row }">{{ formatDate(row.lockedAt) }}</template></el-table-column>
+            </el-table>
+          </el-tab-pane>
+          <el-tab-pane label="收藏" name="favorites">
+            <el-table :data="dashboard?.favorites || []" border @row-click="$emit('open-node', $event.node)">
+              <el-table-column prop="folderName" label="收藏夹" width="150" />
+              <el-table-column prop="node.name" label="名称" min-width="220" />
+              <el-table-column prop="node.fullPath" label="路径" min-width="280" />
+            </el-table>
+          </el-tab-pane>
+        </el-tabs>
       </section>
       <section class="section">
         <div class="section-header">
@@ -90,7 +134,7 @@ export const DashboardView = {
 
 export const DocsView = {
   props: ['tree', 'children', 'selectedFolder', 'users', 'departments', 'roles', 'categories', 'recentSearches', 'formatDate', 'formatSize', 'actions', 'spaceSummary', 'isAdmin', 'enableSync', 'recentAccesses', 'storageScope', 'suggestSearch'],
-  emits: ['select-folder', 'create-folder', 'upload', 'rename', 'delete', 'download', 'preview', 'office-edit', 'versions', 'lock', 'unlock', 'favorite', 'permissions', 'view-access', 'node-password', 'sync-external', 'search', 'clear-recent-searches', 'batch-download', 'batch-move', 'batch-delete', 'batch-metadata', 'move', 'copy', 'copy-enterprise', 'share', 'subscribe', 'reminder', 'metadata', 'links', 'workflow', 'security', 'request-approval', 'governance'],
+  emits: ['select-folder', 'create-folder', 'create-office', 'upload', 'rename', 'delete', 'download', 'export-pdf', 'print', 'preview', 'office-edit', 'versions', 'lock', 'unlock', 'favorite', 'permissions', 'view-access', 'node-password', 'sync-external', 'search', 'clear-recent-searches', 'batch-download', 'batch-move', 'batch-delete', 'batch-metadata', 'move', 'copy', 'copy-enterprise', 'share', 'subscribe', 'reminder', 'metadata', 'links', 'workflow', 'security', 'request-approval', 'governance'],
   data: () => ({
     Download: DownloadIcon,
     MoreHorizontal: MoreHorizontalIcon,
@@ -330,6 +374,8 @@ export const DocsView = {
         preview: () => this.$emit('preview', row, null, { searchKeyword: row.searchMatch?.keyword || this.keyword || '' }),
         officeEdit: () => this.$emit('office-edit', row),
         download: () => this.$emit('download', row),
+        exportPdf: () => this.$emit('export-pdf', row),
+        print: () => this.$emit('print', row),
         requestDownload: () => this.$emit('request-approval', row, 'download'),
         requestBorrow: () => this.$emit('request-approval', row, 'borrow'),
         requestExternal: () => this.$emit('request-approval', row, 'external'),
@@ -357,6 +403,10 @@ export const DocsView = {
         delete: () => this.$emit('delete', row)
       };
       commands[command]?.();
+    },
+    handleCreateCommand(command) {
+      if (command === 'folder') this.$emit('create-folder');
+      else this.$emit('create-office', command);
     },
     runSearch() {
       this.page = 1;
@@ -481,7 +531,17 @@ export const DocsView = {
         <div class="toolbar docs-toolbar">
           <div class="docs-actions">
             <el-button type="primary" :icon="UploadCloud" @click="$emit('upload')">上传</el-button>
-            <el-button :icon="Plus" @click="$emit('create-folder')">新建</el-button>
+            <el-dropdown trigger="click" @command="handleCreateCommand">
+              <el-button :icon="Plus">新建</el-button>
+              <template #dropdown>
+                <el-dropdown-menu>
+                  <el-dropdown-item command="folder">文件夹</el-dropdown-item>
+                  <el-dropdown-item command="docx">Word 文档</el-dropdown-item>
+                  <el-dropdown-item command="xlsx">Excel 表格</el-dropdown-item>
+                  <el-dropdown-item command="pptx">PPT 演示文稿</el-dropdown-item>
+                </el-dropdown-menu>
+              </template>
+            </el-dropdown>
             <el-button v-if="enableSync" :icon="RefreshCw" @click="$emit('sync-external')">同步</el-button>
             <el-dropdown trigger="click" :disabled="!singleSelection" @command="handleMoreCommand">
               <el-button :icon="MoreHorizontal" :disabled="!singleSelection">更多</el-button>
@@ -491,6 +551,8 @@ export const DocsView = {
                   <el-dropdown-item v-if="singleSelection.nodeType === 'file'" :command="{ action: 'preview', row: singleSelection }" :disabled="!can(singleSelection, 'file:preview')">预览</el-dropdown-item>
                   <el-dropdown-item v-if="canOfficeEdit(singleSelection)" :command="{ action: 'officeEdit', row: singleSelection }">在线编辑</el-dropdown-item>
                   <el-dropdown-item v-if="!downloadBlocked(singleSelection)" :command="{ action: 'download', row: singleSelection }" :disabled="!canDownload(singleSelection)">{{ singleSelection.nodeType === 'folder' ? '打包下载' : '下载' }}</el-dropdown-item>
+                  <el-dropdown-item v-if="singleSelection.nodeType === 'file' && can(singleSelection, 'file:export_pdf')" :command="{ action: 'exportPdf', row: singleSelection }">导出 PDF</el-dropdown-item>
+                  <el-dropdown-item v-if="singleSelection.nodeType === 'file' && can(singleSelection, 'file:print')" :command="{ action: 'print', row: singleSelection }">打印</el-dropdown-item>
                   <el-dropdown-item v-if="downloadBlocked(singleSelection)" :command="{ action: 'requestDownload', row: singleSelection }">申请下载</el-dropdown-item>
                   <el-dropdown-item v-if="singleSelection.nodeType === 'file'" :command="{ action: 'requestBorrow', row: singleSelection }">申请借阅</el-dropdown-item>
                   <el-dropdown-item v-if="singleSelection.nodeType === 'file'" :command="{ action: 'requestExternal', row: singleSelection }">申请外发</el-dropdown-item>
@@ -689,8 +751,8 @@ export const DocsView = {
 };
 
 export const CollaborationView = {
-  props: ['shares', 'subscriptions', 'reminders', 'formatDate'],
-  emits: ['revoke-share', 'cancel-subscription', 'edit-reminder', 'cancel-reminder'],
+  props: ['shares', 'externalLinks', 'subscriptions', 'reminders', 'favorites', 'favoriteFolders', 'formatDate'],
+  emits: ['revoke-share', 'revoke-external-link', 'copy-external-link', 'cancel-subscription', 'edit-reminder', 'cancel-reminder', 'create-favorite-folder', 'rename-favorite-folder', 'delete-favorite-folder', 'move-favorite', 'remove-favorite'],
   data: () => ({ activeTab: 'shares' }),
   methods: {
     audienceLabel(row) {
@@ -738,6 +800,54 @@ export const CollaborationView = {
                 <el-button size="small" type="danger" :disabled="row.status !== 'active'" @click="$emit('revoke-share', row)">撤销</el-button>
               </template>
             </el-table-column>
+          </el-table>
+        </el-tab-pane>
+        <el-tab-pane label="外链管理" name="external-links">
+          <el-table :data="externalLinks" border>
+            <el-table-column prop="nodePath" label="文件" min-width="240" />
+            <el-table-column label="权限" width="130">
+              <template #default="{ row }">{{ row.allowPreview ? '预览' : '' }}{{ row.allowPreview && row.allowDownload ? '、' : '' }}{{ row.allowDownload ? '下载' : '' }}</template>
+            </el-table-column>
+            <el-table-column label="提取码" width="90">
+              <template #default="{ row }">{{ row.hasPassword ? '有' : '无' }}</template>
+            </el-table-column>
+            <el-table-column label="访问次数" width="110">
+              <template #default="{ row }">{{ row.accessCount }} / {{ row.maxAccessCount || '不限' }}</template>
+            </el-table-column>
+            <el-table-column prop="status" label="状态" width="90" />
+            <el-table-column label="到期时间" width="180">
+              <template #default="{ row }">{{ formatDate(row.expiresAt) }}</template>
+            </el-table-column>
+            <el-table-column label="操作" width="150" fixed="right">
+              <template #default="{ row }">
+                <el-button size="small" @click="$emit('copy-external-link', row)">复制</el-button>
+                <el-button size="small" type="danger" :disabled="row.status !== 'active'" @click="$emit('revoke-external-link', row)">撤销</el-button>
+              </template>
+            </el-table-column>
+          </el-table>
+        </el-tab-pane>
+        <el-tab-pane label="收藏夹" name="favorites">
+          <div class="section-header">
+            <div class="toolbar compact-toolbar">
+              <el-button type="primary" @click="$emit('create-favorite-folder')">新建收藏夹</el-button>
+            </div>
+          </div>
+          <el-table :data="favoriteFolders" border style="margin-bottom: 14px">
+            <el-table-column prop="name" label="收藏夹" min-width="220" />
+            <el-table-column prop="itemCount" label="数量" width="90" />
+            <el-table-column label="操作" width="150"><template #default="{ row }"><template v-if="!row.system"><el-button size="small" @click="$emit('rename-favorite-folder', row)">重命名</el-button><el-button size="small" type="danger" @click="$emit('delete-favorite-folder', row)">删除</el-button></template></template></el-table-column>
+          </el-table>
+          <el-table :data="favorites" border>
+            <el-table-column prop="node.name" label="名称" min-width="200" />
+            <el-table-column prop="node.fullPath" label="路径" min-width="260" />
+            <el-table-column label="收藏夹" width="190">
+              <template #default="{ row }">
+                <el-select :model-value="row.folderId || ''" @change="$emit('move-favorite', row, $event)" style="width: 100%">
+                  <el-option v-for="folder in favoriteFolders" :key="folder.id || 'default'" :label="folder.name" :value="folder.id || ''" />
+                </el-select>
+              </template>
+            </el-table-column>
+            <el-table-column label="操作" width="90"><template #default="{ row }"><el-button size="small" type="danger" @click="$emit('remove-favorite', row)">取消</el-button></template></el-table-column>
           </el-table>
         </el-tab-pane>
         <el-tab-pane label="我的订阅" name="subscriptions">
@@ -913,14 +1023,35 @@ export const UsersView = {
 };
 
 export const ProfileView = {
-  props: ['user', 'departments', 'roles'],
-  emits: ['change-password'],
+  props: ['user', 'departments', 'roles', 'folders'],
+  emits: ['change-password', 'save-profile', 'upload-avatar'],
+  data: () => ({ form: { displayName: '', email: '', phone: '', defaultWorkPathId: null }, avatarFile: null }),
+  watch: {
+    user: {
+      immediate: true,
+      deep: true,
+      handler(value) {
+        this.form = {
+          displayName: value?.displayName || '',
+          email: value?.email || '',
+          phone: value?.phone || '',
+          defaultWorkPathId: value?.defaultWorkPathId || null
+        };
+      }
+    }
+  },
   methods: {
     depNames() {
       return (this.user?.departmentIds || []).map((id) => this.departments.find((item) => item.id === id)?.name).filter(Boolean).join('、') || '-';
     },
     roleNames() {
       return (this.user?.roleIds || []).map((id) => this.roles.find((item) => item.id === id)?.name).filter(Boolean).join('、') || '-';
+    },
+    selectAvatar(file) {
+      this.avatarFile = file.raw || null;
+    },
+    submitAvatar() {
+      if (this.avatarFile) this.$emit('upload-avatar', this.avatarFile);
     }
   },
   template: `
@@ -928,6 +1059,28 @@ export const ProfileView = {
       <div class="section-header">
         <h2 class="section-title">个人中心</h2>
         <el-button type="primary" @click="$emit('change-password')">修改密码</el-button>
+      </div>
+      <div class="profile-editor">
+        <div class="profile-avatar-block">
+          <el-avatar :size="88" :src="user?.avatarUrl || ''">{{ (user?.displayName || user?.username || '用').slice(0, 1) }}</el-avatar>
+          <el-upload :auto-upload="false" :show-file-list="false" accept="image/png,image/jpeg,image/webp,image/gif" :on-change="selectAvatar">
+            <el-button>选择头像</el-button>
+          </el-upload>
+          <el-button type="primary" :disabled="!avatarFile" @click="submitAvatar">上传头像</el-button>
+        </div>
+        <el-form class="profile-form" label-position="top">
+          <div class="form-grid">
+            <el-form-item label="姓名"><el-input v-model="form.displayName" /></el-form-item>
+            <el-form-item label="邮箱"><el-input v-model="form.email" /></el-form-item>
+            <el-form-item label="电话"><el-input v-model="form.phone" /></el-form-item>
+            <el-form-item label="默认工作目录">
+              <el-select v-model="form.defaultWorkPathId" clearable filterable style="width: 100%">
+                <el-option v-for="item in folders" :key="item.id" :label="item.fullPath || item.name" :value="item.id" />
+              </el-select>
+            </el-form-item>
+          </div>
+          <el-button type="primary" @click="$emit('save-profile', form)">保存个人资料</el-button>
+        </el-form>
       </div>
       <el-descriptions :column="2" border>
         <el-descriptions-item label="账号">{{ user?.username || '-' }}</el-descriptions-item>
@@ -1129,10 +1282,46 @@ export const TrashView = {
   `
 };
 
+export const PersonalDriveRecordsView = {
+  props: ['trashItems', 'logs', 'formatDate'],
+  emits: ['restore', 'destroy', 'refresh'],
+  data: () => ({ activeTab: 'trash' }),
+  template: `
+    <section class="section drive-records-section">
+      <div class="section-header">
+        <h2 class="section-title">网盘记录</h2>
+        <el-button size="small" @click="$emit('refresh')">刷新</el-button>
+      </div>
+      <el-tabs v-model="activeTab">
+        <el-tab-pane label="网盘回收站" name="trash">
+          <el-table :data="trashItems" border empty-text="网盘回收站为空">
+            <el-table-column prop="name" label="名称" min-width="180" />
+            <el-table-column prop="fullPath" label="原路径" min-width="260" />
+            <el-table-column label="删除时间" width="180"><template #default="{ row }">{{ formatDate(row.deletedAt) }}</template></el-table-column>
+            <el-table-column label="操作" width="180">
+              <template #default="{ row }">
+                <el-button size="small" type="primary" @click="$emit('restore', row)">恢复</el-button>
+                <el-button size="small" type="danger" @click="$emit('destroy', row)">彻底删除</el-button>
+              </template>
+            </el-table-column>
+          </el-table>
+        </el-tab-pane>
+        <el-tab-pane label="操作记录" name="logs">
+          <el-table :data="logs" border empty-text="暂无网盘操作记录">
+            <el-table-column prop="action" label="动作" width="190" />
+            <el-table-column prop="targetPath" label="对象" min-width="280" />
+            <el-table-column label="时间" width="180"><template #default="{ row }">{{ formatDate(row.createdAt) }}</template></el-table-column>
+          </el-table>
+        </el-tab-pane>
+      </el-tabs>
+    </section>
+  `
+};
+
 export const MessagesView = {
   props: ['messages', 'formatDate'],
-  emits: ['open', 'read', 'read-all'],
-  data: () => ({ unreadOnly: false, typePrefix: '' }),
+  emits: ['open', 'read', 'unread', 'archive', 'delete', 'read-all', 'filter-archive'],
+  data: () => ({ unreadOnly: false, archivedOnly: false, typePrefix: '' }),
   computed: {
     visibleMessages() {
       return (this.messages || []).filter((item) => !this.unreadOnly || !item.readAt).filter((item) => !this.typePrefix || String(item.messageType || '').startsWith(this.typePrefix));
@@ -1147,6 +1336,7 @@ export const MessagesView = {
         <h2 class="section-title">消息中心</h2>
         <div class="toolbar compact-toolbar">
           <el-switch v-model="unreadOnly" active-text="只看未读" />
+          <el-switch v-model="archivedOnly" active-text="查看归档" @change="$emit('filter-archive', archivedOnly)" />
           <el-select v-model="typePrefix" clearable placeholder="消息类型" style="width: 150px">
             <el-option label="文件更新" value="file" />
             <el-option label="审批" value="approval" />
@@ -1164,10 +1354,13 @@ export const MessagesView = {
         <el-table-column prop="content" label="内容" min-width="320" />
         <el-table-column label="时间" width="180"><template #default="{ row }">{{ formatDate(row.createdAt) }}</template></el-table-column>
         <el-table-column label="关联对象" min-width="180"><template #default="{ row }">{{ row.relatedNode?.fullPath || '-' }}</template></el-table-column>
-        <el-table-column label="操作" width="170">
+        <el-table-column label="操作" width="270">
           <template #default="{ row }">
             <el-button size="small" @click="$emit('open', row)">详情</el-button>
-            <el-button size="small" @click="$emit('read', row)">标记已读</el-button>
+            <el-button v-if="!row.readAt" size="small" @click="$emit('read', row)">已读</el-button>
+            <el-button v-else size="small" @click="$emit('unread', row)">未读</el-button>
+            <el-button size="small" @click="$emit('archive', row, !row.archivedAt)">{{ row.archivedAt ? '恢复' : '归档' }}</el-button>
+            <el-button size="small" type="danger" @click="$emit('delete', row)">删除</el-button>
           </template>
         </el-table-column>
       </el-table>
@@ -1176,7 +1369,7 @@ export const MessagesView = {
 };
 
 export const AnnouncementsView = {
-  props: ['announcements', 'formatDate', 'formatSize'],
+  props: ['announcements', 'formatDate', 'formatSize', 'canManage'],
   emits: ['create', 'edit', 'publish', 'revoke', 'delete', 'download'],
   methods: {
     statusType(status) {
@@ -1198,23 +1391,24 @@ export const AnnouncementsView = {
   template: `
     <section class="section">
       <div class="section-header">
-        <h2 class="section-title">公告管理</h2>
-        <el-button type="primary" @click="$emit('create')">新建公告</el-button>
+        <h2 class="section-title">{{ canManage ? '公告管理' : '公告' }}</h2>
+        <el-button v-if="canManage" type="primary" @click="$emit('create')">新建公告</el-button>
       </div>
       <el-table :data="announcements" border>
         <el-table-column prop="title" label="标题" min-width="180" />
+        <el-table-column prop="content" label="公告内容" min-width="280" show-overflow-tooltip />
         <el-table-column label="状态" width="100">
           <template #default="{ row }"><el-tag :type="statusType(row.status)">{{ statusText(row.status) }}</el-tag></template>
         </el-table-column>
         <el-table-column label="范围" width="140"><template #default="{ row }">{{ audienceLabel(row) }}</template></el-table-column>
         <el-table-column label="附件" min-width="160">
           <template #default="{ row }">
-            <el-button v-if="row.attachment" link type="primary" @click="$emit('download', row)">{{ row.attachment.originalFilename }}</el-button>
+            <div v-if="row.attachments?.length"><el-button v-for="item in row.attachments" :key="item.id" link type="primary" @click="$emit('download', row, item)">{{ item.originalFilename }}</el-button></div>
             <span v-else>-</span>
           </template>
         </el-table-column>
         <el-table-column label="发布时间" width="180"><template #default="{ row }">{{ formatDate(row.publishedAt) }}</template></el-table-column>
-        <el-table-column label="操作" width="260" fixed="right">
+        <el-table-column v-if="canManage" label="操作" width="260" fixed="right">
           <template #default="{ row }">
             <el-button size="small" @click="$emit('edit', row)">编辑</el-button>
             <el-button v-if="row.status !== 'published'" size="small" type="primary" @click="$emit('publish', row)">发布</el-button>
@@ -1228,8 +1422,8 @@ export const AnnouncementsView = {
 };
 
 export const ApiManagementView = {
-  props: ['credentials', 'callLogs', 'users', 'filePolicy', 'formatDate'],
-  emits: ['create', 'edit', 'rotate', 'disable', 'edit-file-policy'],
+  props: ['credentials', 'callLogs', 'webhooks', 'webhookDeliveries', 'users', 'filePolicy', 'formatDate'],
+  emits: ['create', 'edit', 'rotate', 'disable', 'edit-file-policy', 'create-webhook', 'edit-webhook', 'disable-webhook', 'retry-webhook'],
   methods: {
     userName(row) {
       return this.users.find((item) => item.id === row.userId)?.displayName || row.userName || row.userId;
@@ -1260,6 +1454,28 @@ export const ApiManagementView = {
               <el-button size="small" type="danger" :disabled="row.status !== 'enabled'" @click="$emit('disable', row)">停用</el-button>
             </template>
           </el-table-column>
+        </el-table>
+      </section>
+      <section class="section">
+        <div class="section-header"><h2 class="section-title">Webhook</h2><el-button type="primary" @click="$emit('create-webhook')">新建 Webhook</el-button></div>
+        <el-table :data="webhooks" border>
+          <el-table-column prop="name" label="名称" min-width="150" />
+          <el-table-column prop="url" label="地址" min-width="280" />
+          <el-table-column label="事件" min-width="180"><template #default="{ row }">{{ (row.eventPatterns || []).join('、') }}</template></el-table-column>
+          <el-table-column prop="status" label="状态" width="90" />
+          <el-table-column label="最近投递" width="180"><template #default="{ row }">{{ formatDate(row.lastDeliveredAt) }}</template></el-table-column>
+          <el-table-column label="操作" width="150"><template #default="{ row }"><el-button size="small" @click="$emit('edit-webhook', row)">编辑</el-button><el-button size="small" type="danger" :disabled="row.status !== 'enabled'" @click="$emit('disable-webhook', row)">停用</el-button></template></el-table-column>
+        </el-table>
+      </section>
+      <section class="section">
+        <div class="section-header"><h2 class="section-title">Webhook 投递</h2></div>
+        <el-table :data="webhookDeliveries" border height="280">
+          <el-table-column prop="eventType" label="事件" min-width="170" />
+          <el-table-column prop="status" label="状态" width="100" />
+          <el-table-column prop="responseStatus" label="响应码" width="90" />
+          <el-table-column prop="lastError" label="错误" min-width="220" />
+          <el-table-column label="时间" width="180"><template #default="{ row }">{{ formatDate(row.createdAt) }}</template></el-table-column>
+          <el-table-column label="操作" width="90"><template #default="{ row }"><el-button size="small" :disabled="row.status !== 'failed'" @click="$emit('retry-webhook', row)">重试</el-button></template></el-table-column>
         </el-table>
       </section>
       <section class="section">
@@ -1510,8 +1726,8 @@ export const GovernanceView = {
 };
 
 export const SystemManagementView = {
-  props: ['dashboard', 'auditLogs', 'filePolicy', 'externalLibrary', 'storageSettings', 'securityPolicy', 'wecomSettings', 'officePreviewSettings', 'searchIndexStatus', 'runtimeStatus', 'consistencyReport', 'backupJobs', 'systemAlerts', 'notificationDeliveries', 'auditReport', 'formatDate'],
-  emits: ['edit-file-policy', 'edit-external-library', 'edit-storage', 'sync-storage', 'export-audit', 'edit-security-policy', 'edit-office-preview', 'test-office-preview', 'rebuild-search-index', 'edit-wecom', 'test-wecom', 'check-consistency', 'create-backup', 'drill-backup', 'resolve-alert', 'retry-notification'],
+  props: ['dashboard', 'auditLogs', 'filePolicy', 'externalLibrary', 'storageSettings', 'fileStorageSettings', 'identitySettings', 'securityPolicy', 'wecomSettings', 'attachmentPurposes', 'officePreviewSettings', 'searchIndexStatus', 'runtimeStatus', 'consistencyReport', 'backupJobs', 'systemAlerts', 'notificationDeliveries', 'auditReport', 'formatDate'],
+  emits: ['edit-file-policy', 'edit-external-library', 'edit-storage', 'sync-storage', 'edit-file-storage', 'run-storage-lifecycle', 'edit-identity', 'sync-ldap', 'export-audit', 'edit-security-policy', 'edit-office-preview', 'test-office-preview', 'rebuild-search-index', 'edit-wecom', 'test-wecom', 'sync-wecom', 'edit-attachment-purposes', 'check-consistency', 'create-backup', 'drill-backup', 'resolve-alert', 'retry-notification'],
   computed: {
     stats() {
       return this.dashboard?.stats || {};
@@ -1584,6 +1800,17 @@ export const SystemManagementView = {
       </section>
       <section class="section">
         <div class="section-header">
+          <h2 class="section-title">附件用途</h2>
+          <el-button @click="$emit('edit-attachment-purposes')">维护字典</el-button>
+        </div>
+        <el-descriptions :column="2" border>
+          <el-descriptions-item label="用途数量">{{ attachmentPurposes?.length || 0 }}</el-descriptions-item>
+          <el-descriptions-item label="启用数量">{{ (attachmentPurposes || []).filter((item) => item.enabled).length }}</el-descriptions-item>
+          <el-descriptions-item label="当前用途" :span="2">{{ (attachmentPurposes || []).filter((item) => item.enabled).map((item) => item.name).join('、') || '-' }}</el-descriptions-item>
+        </el-descriptions>
+      </section>
+      <section class="section">
+        <div class="section-header">
           <h2 class="section-title">系统参数</h2>
           <div class="toolbar compact-toolbar">
             <el-button @click="$emit('edit-file-policy')">上传策略</el-button>
@@ -1648,6 +1875,7 @@ export const SystemManagementView = {
           <div class="toolbar compact-toolbar">
             <el-button @click="$emit('edit-wecom')">配置</el-button>
             <el-button type="primary" @click="$emit('test-wecom')">测试配置</el-button>
+            <el-button :disabled="!wecomSettings?.enabled" @click="$emit('sync-wecom')">同步通讯录</el-button>
           </div>
         </div>
         <el-descriptions :column="2" border>
@@ -1657,6 +1885,8 @@ export const SystemManagementView = {
           <el-descriptions-item label="Secret">{{ wecomSettings?.hasSecret ? '已保存' : '-' }}</el-descriptions-item>
           <el-descriptions-item label="组织同步">{{ wecomSettings?.syncDepartments || wecomSettings?.syncUsers ? '已配置' : '关闭' }}</el-descriptions-item>
           <el-descriptions-item label="消息推送">{{ wecomSettings?.pushMessages ? '启用' : '关闭' }}</el-descriptions-item>
+          <el-descriptions-item label="最后同步">{{ formatDate(wecomSettings?.lastSyncAt) }}</el-descriptions-item>
+          <el-descriptions-item label="同步结果">{{ wecomSettings?.lastSyncResult?.status || '-' }}</el-descriptions-item>
           <el-descriptions-item label="最后测试">{{ formatDate(wecomSettings?.lastTestAt) }}</el-descriptions-item>
           <el-descriptions-item label="测试结果">{{ wecomSettings?.lastTestResult?.message || '-' }}</el-descriptions-item>
         </el-descriptions>
@@ -1697,6 +1927,26 @@ export const SystemManagementView = {
           <el-descriptions-item label="最后加载">{{ formatDate(storageRuntime.lastLoadedAt) }}</el-descriptions-item>
           <el-descriptions-item label="最后保存">{{ formatDate(storageRuntime.lastSavedAt) }}</el-descriptions-item>
           <el-descriptions-item label="最近错误" :span="2">{{ storageRuntime.lastError || '-' }}</el-descriptions-item>
+        </el-descriptions>
+      </section>
+      <section class="section">
+        <div class="section-header"><h2 class="section-title">文件存储与生命周期</h2><div class="toolbar compact-toolbar"><el-button @click="$emit('edit-file-storage')">配置</el-button><el-button type="primary" @click="$emit('run-storage-lifecycle')">执行生命周期</el-button></div></div>
+        <el-descriptions :column="2" border>
+          <el-descriptions-item label="存储后端">{{ { local: '本地磁盘', nas: 'NAS', s3: 'S3/对象存储' }[fileStorageSettings?.provider] || '-' }}</el-descriptions-item>
+          <el-descriptions-item label="当前用量">{{ formatBytes(fileStorageSettings?.usage?.totalBytes) }}</el-descriptions-item>
+          <el-descriptions-item label="总容量配额">{{ fileStorageSettings?.quota?.totalGb ? fileStorageSettings.quota.totalGb + ' GB' : '不限' }}</el-descriptions-item>
+          <el-descriptions-item label="默认用户配额">{{ fileStorageSettings?.quota?.defaultUserGb ? fileStorageSettings.quota.defaultUserGb + ' GB' : '不限' }}</el-descriptions-item>
+          <el-descriptions-item label="分片保留">{{ fileStorageSettings?.lifecycle?.uploadSessionDays || '-' }} 天</el-descriptions-item>
+          <el-descriptions-item label="隔离文件保留">{{ fileStorageSettings?.lifecycle?.quarantineDays || '-' }} 天</el-descriptions-item>
+        </el-descriptions>
+      </section>
+      <section class="section">
+        <div class="section-header"><h2 class="section-title">统一身份源</h2><div class="toolbar compact-toolbar"><el-button @click="$emit('edit-identity')">配置</el-button><el-button :disabled="!identitySettings?.ldap?.enabled" type="primary" @click="$emit('sync-ldap')">同步 LDAP</el-button></div></div>
+        <el-descriptions :column="2" border>
+          <el-descriptions-item label="OIDC">{{ identitySettings?.oidc?.enabled ? '启用' : '关闭' }}</el-descriptions-item>
+          <el-descriptions-item label="SAML">{{ identitySettings?.saml?.enabled ? '启用' : '关闭' }}</el-descriptions-item>
+          <el-descriptions-item label="LDAP/AD">{{ identitySettings?.ldap?.enabled ? '启用' : '关闭' }}</el-descriptions-item>
+          <el-descriptions-item label="HR 同步">{{ identitySettings?.hr?.enabled ? '启用' : '关闭' }}</el-descriptions-item>
         </el-descriptions>
       </section>
       <section class="section">
@@ -1807,15 +2057,26 @@ export const SystemManagementView = {
 };
 
 export const AuditView = {
-  props: ['logs', 'formatDate'],
-  emits: ['export'],
+  props: ['logs', 'users', 'formatDate'],
+  emits: ['filter', 'export'],
+  data: () => ({ filters: { actorId: '', action: '', targetPath: '', range: [] } }),
   template: `
     <section class="section">
       <div class="section-header">
         <h2 class="section-title">审计日志</h2>
         <el-button type="primary" @click="$emit('export')">导出日志</el-button>
       </div>
-      <el-table class="compact-data-table" :data="logs" border height="calc(100dvh - 172px)">
+      <div class="toolbar audit-filter-toolbar">
+        <el-select v-model="filters.actorId" clearable filterable placeholder="操作者" style="width: 180px">
+          <el-option v-for="user in users" :key="user.id" :label="user.displayName || user.username" :value="user.id" />
+        </el-select>
+        <el-input v-model="filters.action" clearable placeholder="动作，如 file.download" style="width: 210px" />
+        <el-input v-model="filters.targetPath" clearable placeholder="文件或路径" style="width: 220px" />
+        <el-date-picker v-model="filters.range" type="datetimerange" range-separator="至" start-placeholder="开始时间" end-placeholder="结束时间" />
+        <el-button type="primary" @click="$emit('filter', { ...filters })">查询</el-button>
+        <el-button @click="filters = { actorId: '', action: '', targetPath: '', range: [] }; $emit('filter', { ...filters })">重置</el-button>
+      </div>
+      <el-table class="compact-data-table" :data="logs" border height="calc(100dvh - 232px)">
         <el-table-column prop="action" label="动作" width="180" />
         <el-table-column prop="actorId" label="操作者" width="150" />
         <el-table-column prop="targetPath" label="对象路径" min-width="300" />

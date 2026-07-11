@@ -222,7 +222,8 @@ export function createInitialDb() {
       { id: 'c_contract', parentId: null, name: '合同', fullPath: '/合同', sortOrder: 1, status: 'enabled' },
       { id: 'c_project', parentId: null, name: '项目', fullPath: '/项目', sortOrder: 2, status: 'enabled' },
       { id: 'c_archive', parentId: null, name: '档案', fullPath: '/档案', sortOrder: 3, status: 'enabled' },
-      { id: 'c_iso', parentId: null, name: 'ISO9000文件', fullPath: '/ISO9000文件', sortOrder: 4, status: 'enabled' }
+      { id: 'c_case_file', parentId: null, name: '案卷', fullPath: '/案卷', sortOrder: 4, status: 'enabled' },
+      { id: 'c_iso', parentId: null, name: 'ISO9000文件', fullPath: '/ISO9000文件', sortOrder: 5, status: 'enabled' }
     ],
     documentCategories: [],
     propertyDefinitions: [],

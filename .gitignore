@@ -6,6 +6,7 @@ backend/data/
 backend/uploads/
 backend/tmp/
 backend/backups/
+backend/quarantine/
 *.log
 *.tgz
 *.zip

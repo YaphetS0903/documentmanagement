@@ -1,5 +1,27 @@
 <template>
-  <div v-if="!token || !user" class="login-shell">
+  <div v-if="externalAccess.active" class="login-shell">
+    <section class="login-panel" aria-label="外链文件">
+      <h1 class="login-title">{{ externalAccess.metadata?.name || '外链文件' }}</h1>
+      <p class="login-subtitle">{{ externalAccess.metadata?.description || '文档管理平台安全外链' }}</p>
+      <el-descriptions v-if="externalAccess.metadata" :column="1" border>
+        <el-descriptions-item label="文件大小">{{ formatBytes(externalAccess.metadata.sizeBytes) }}</el-descriptions-item>
+        <el-descriptions-item label="有效期至">{{ formatDate(externalAccess.metadata.expiresAt) }}</el-descriptions-item>
+        <el-descriptions-item v-if="externalAccess.metadata.remainingAccessCount !== null" label="剩余访问次数">{{ externalAccess.metadata.remainingAccessCount }}</el-descriptions-item>
+      </el-descriptions>
+      <el-form v-if="!externalAccess.accessToken" label-position="top" style="margin-top: 18px">
+        <el-form-item v-if="externalAccess.metadata?.hasPassword" label="提取码">
+          <el-input v-model="externalAccess.password" type="password" show-password @keyup.enter="unlockExternalLink" />
+        </el-form-item>
+        <el-button type="primary" style="width: 100%" :loading="loading" @click="unlockExternalLink">访问文件</el-button>
+      </el-form>
+      <div v-else class="toolbar" style="margin-top: 18px">
+        <el-button v-if="externalAccess.metadata?.allowPreview" type="primary" :icon="Eye" @click="previewExternalLink">预览</el-button>
+        <el-button v-if="externalAccess.metadata?.allowDownload" :icon="Download" @click="downloadExternalLink">下载</el-button>
+      </div>
+    </section>
+  </div>
+
+  <div v-else-if="!token || !user" class="login-shell">
     <section class="login-panel" aria-label="登录">
       <h1 class="login-title">文档管理平台</h1>
       <p class="login-subtitle">B/S 架构 v1.0 候选版</p>
@@ -17,6 +39,9 @@
           </div>
         </el-form-item>
         <el-button type="primary" size="large" :loading="loading" style="width: 100%" @click="login">登录</el-button>
+        <el-button v-if="wecomLoginEnabled" size="large" style="width: 100%; margin: 12px 0 0" @click="startWecomLogin">企业微信登录</el-button>
+        <el-button v-if="identityLoginProviders.oidc" size="large" style="width: 100%; margin: 12px 0 0" @click="startIdentityLogin('oidc')">统一身份登录</el-button>
+        <el-button v-if="identityLoginProviders.saml" size="large" style="width: 100%; margin: 12px 0 0" @click="startIdentityLogin('saml')">SAML 登录</el-button>
       </el-form>
     </section>
   </div>
@@ -65,7 +90,7 @@
         </div>
       </header>
       <div class="content">
-        <DashboardViewPanel v-if="activeView === 'dashboard'" :dashboard="dashboard" :format-date="formatDate" @open-docs="switchView('docs')" />
+        <DashboardViewPanel v-if="activeView === 'dashboard'" :dashboard="dashboard" :format-date="formatDate" @open-docs="switchView('docs')" @open-node="openDashboardNode" />
         <DocsViewPanel
           v-if="activeView === 'docs'"
           :tree="docTree"
@@ -86,10 +111,13 @@
           :suggest-search="suggestSearchFiles"
           @select-folder="selectFolder"
           @create-folder="openFolderDialog"
+          @create-office="openOfficeCreateDialog"
           @upload="openUploadDialog"
           @rename="renameNode"
           @delete="deleteNode"
           @download="downloadNode"
+          @export-pdf="exportPdf"
+          @print="printNode"
           @preview="previewNode"
           @office-edit="openOfficeEditDialog"
           @versions="openVersionDialog"
@@ -140,10 +168,13 @@
           :suggest-search="suggestSearchDriveFiles"
           @select-folder="selectDriveFolder"
           @create-folder="openFolderDialog"
+          @create-office="openOfficeCreateDialog"
           @upload="openUploadDialog"
           @rename="renameNode"
           @delete="deleteNode"
           @download="downloadNode"
+          @export-pdf="exportPdf"
+          @print="printNode"
           @preview="previewNode"
           @office-edit="openOfficeEditDialog"
           @versions="openVersionDialog"
@@ -171,6 +202,15 @@
           @security="openSecurityDialog"
           @request-approval="openApprovalRequest"
           @governance="openGovernanceDialog"
+        />
+        <PersonalDriveRecordsViewPanel
+          v-if="activeView === 'drive'"
+          :trash-items="driveTrashItems"
+          :logs="driveLogs"
+          :format-date="formatDate"
+          @restore="restoreDriveTrash"
+          @destroy="destroyDriveTrash"
+          @refresh="loadPersonalDriveRecords"
         />
         <UsersViewPanel v-if="activeView === 'users'" :users="users" :departments="flatDepartments" :roles="flatRoles" @create="openUserDialog" @edit="openUserDialog" @reset="resetPassword" />
         <OrgViewPanel
@@ -203,17 +243,27 @@
           @delete-property="deletePropertyDefinition"
         />
         <TrashViewPanel v-if="activeView === 'trash'" :items="trashItems" :format-date="formatDate" @restore="restoreTrash" @destroy="destroyTrash" />
-        <MessagesViewPanel v-if="activeView === 'messages'" :messages="messages" :format-date="formatDate" @open="openMessageDialog" @read="readMessage" @read-all="readAllMessages" />
+        <MessagesViewPanel v-if="activeView === 'messages'" :messages="messages" :format-date="formatDate" @open="openMessageDialog" @read="readMessage" @unread="unreadMessage" @archive="archiveMessage" @delete="deleteMessage" @read-all="readAllMessages" @filter-archive="filterArchivedMessages" />
         <CollaborationViewPanel
           v-if="activeView === 'collaboration'"
           :shares="shares"
+          :external-links="externalLinks"
           :subscriptions="subscriptions"
           :reminders="reminders"
+          :favorites="favorites"
+          :favorite-folders="favoriteFolders"
           :format-date="formatDate"
           @revoke-share="revokeShare"
+          @revoke-external-link="revokeExternalLink"
+          @copy-external-link="copyExternalLink"
           @cancel-subscription="cancelSubscription"
           @edit-reminder="openReminderDialog"
           @cancel-reminder="cancelReminder"
+          @create-favorite-folder="createFavoriteFolder"
+          @rename-favorite-folder="renameFavoriteFolder"
+          @delete-favorite-folder="deleteFavoriteFolder"
+          @move-favorite="moveFavorite"
+          @remove-favorite="removeFavorite"
         />
         <ApprovalCenterViewPanel
           v-if="activeView === 'approvals'"
@@ -237,11 +287,15 @@
           :user="user"
           :departments="flatDepartments"
           :roles="flatRoles"
+          :folders="flattenTree(docTree).filter((item) => item.nodeType === 'folder')"
           @change-password="openPasswordDialog"
+          @save-profile="saveProfile"
+          @upload-avatar="uploadAvatar"
         />
         <AnnouncementsViewPanel
           v-if="activeView === 'announcements'"
           :announcements="announcements"
+          :can-manage="isAdminUser"
           :format-date="formatDate"
           :format-size="formatSize"
           @create="openAnnouncementDialog"
@@ -255,6 +309,8 @@
           v-if="activeView === 'api'"
           :credentials="apiCredentials"
           :call-logs="apiCallLogs"
+          :webhooks="webhooks"
+          :webhook-deliveries="webhookDeliveries"
           :users="users"
           :file-policy="filePolicy"
           :format-date="formatDate"
@@ -263,6 +319,10 @@
           @rotate="rotateCredentialSecret"
           @disable="disableCredential"
           @edit-file-policy="openFilePolicyDialog"
+          @create-webhook="openWebhookDialog()"
+          @edit-webhook="openWebhookDialog"
+          @disable-webhook="disableWebhook"
+          @retry-webhook="retryWebhook"
         />
         <GovernanceViewPanel
           v-if="activeView === 'governance'"
@@ -287,8 +347,11 @@
           :file-policy="filePolicy"
           :external-library="externalLibrary"
           :storage-settings="storageSettings"
+          :file-storage-settings="fileStorageSettings"
+          :identity-settings="identitySettings"
           :security-policy="securityPolicy"
           :wecom-settings="wecomSettings"
+          :attachment-purposes="attachmentPurposes"
           :office-preview-settings="officePreviewSettings"
           :search-index-status="searchIndexStatus"
           :runtime-status="runtimeStatus"
@@ -302,12 +365,18 @@
           @edit-external-library="openExternalLibraryDialog"
           @edit-storage="openStorageDialog"
           @sync-storage="syncStorageToMysql"
+          @edit-file-storage="openFileStorageDialog"
+          @run-storage-lifecycle="runStorageLifecycle"
+          @edit-identity="openIdentityDialog"
+          @sync-ldap="syncLdapDirectory"
           @edit-security-policy="openSecurityPolicyDialog"
           @edit-office-preview="openOfficePreviewDialog"
           @test-office-preview="testOfficePreviewSettings"
           @rebuild-search-index="rebuildSearchIndex"
           @edit-wecom="openWecomDialog"
           @test-wecom="testWecomSettings"
+          @sync-wecom="syncWecomDirectory"
+          @edit-attachment-purposes="openAttachmentPurposesDialog"
           @check-consistency="checkSystemConsistency"
           @create-backup="createSystemBackup"
           @drill-backup="drillSystemBackup"
@@ -315,7 +384,7 @@
           @retry-notification="retryNotificationDelivery"
           @export-audit="exportAuditLogs"
         />
-        <AuditViewPanel v-if="activeView === 'audit'" :logs="auditLogs" :format-date="formatDate" @export="exportAuditLogs" />
+        <AuditViewPanel v-if="activeView === 'audit'" :logs="auditLogs" :users="users" :format-date="formatDate" @filter="filterAuditLogs" @export="exportAuditLogs" />
       </div>
     </main>
 
@@ -331,6 +400,24 @@
       <template #footer>
         <el-button @click="folderDialog.visible = false">取消</el-button>
         <el-button type="primary" @click="createFolder">保存</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="officeCreateDialog.visible" :title="`新建${officeTypeLabel(officeCreateDialog.officeType)}`" width="460px">
+      <el-form label-position="top">
+        <el-form-item label="目标目录">
+          <el-input :model-value="activeFolder?.fullPath || '/'" disabled />
+        </el-form-item>
+        <el-form-item label="文件名称">
+          <el-input v-model="officeCreateDialog.name" @keyup.enter="createOfficeFile" />
+        </el-form-item>
+        <el-form-item label="版本说明">
+          <el-input v-model="officeCreateDialog.description" />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="officeCreateDialog.visible = false">取消</el-button>
+        <el-button type="primary" :loading="loading" @click="createOfficeFile">创建并编辑</el-button>
       </template>
     </el-dialog>
 
@@ -385,13 +472,25 @@
         <el-table-column label="创建时间" width="180">
           <template #default="{ row }">{{ formatDate(row.createdAt) }}</template>
         </el-table-column>
-        <el-table-column label="操作" width="240" fixed="right">
+        <el-table-column label="操作" width="320" fixed="right">
           <template #default="{ row }">
             <el-button size="small" :icon="FileText" @click="previewNode(versionDialog.node, row.id)">预览</el-button>
             <el-button size="small" :icon="Download" @click="downloadNode(versionDialog.node, row.id)">下载</el-button>
+            <el-button v-if="versionDialog.node?.permissions?.includes('file:export_pdf') || versionDialog.node?.permissions?.includes('full_control')" size="small" @click="exportPdf(versionDialog.node, row.id)">PDF</el-button>
+            <el-button v-if="versionDialog.node?.permissions?.includes('file:print') || versionDialog.node?.permissions?.includes('full_control')" size="small" @click="printNode(versionDialog.node, row.id)">打印</el-button>
             <el-button size="small" :icon="RotateCcw" @click="rollbackVersion(row)">回滚</el-button>
+            <el-button v-if="isAdminUser && row.id !== versionDialog.node?.currentVersion?.id" size="small" type="danger" :icon="Trash2" @click="deleteVersion(row)">删除</el-button>
           </template>
         </el-table-column>
+      </el-table>
+      <div v-if="versionDialog.items.length >= 2" class="toolbar" style="margin-top: 12px">
+        <el-select v-model="versionDialog.diffFromId" placeholder="起始版本" style="width: 170px"><el-option v-for="item in versionDialog.items" :key="item.id" :label="'版本 ' + item.versionNo" :value="item.id" /></el-select>
+        <el-select v-model="versionDialog.diffToId" placeholder="目标版本" style="width: 170px"><el-option v-for="item in versionDialog.items" :key="item.id" :label="'版本 ' + item.versionNo" :value="item.id" /></el-select>
+        <el-button @click="compareVersions">版本对比</el-button>
+      </div>
+      <el-table v-if="versionDialog.diffRows.length" :data="versionDialog.diffRows" border max-height="320" style="margin-top: 12px">
+        <el-table-column label="变更" width="80"><template #default="{ row }"><el-tag :type="row.type === 'added' ? 'success' : row.type === 'removed' ? 'danger' : 'info'">{{ row.type === 'added' ? '新增' : row.type === 'removed' ? '删除' : '相同' }}</el-tag></template></el-table-column>
+        <el-table-column prop="text" label="内容" min-width="500" show-overflow-tooltip />
       </el-table>
       <el-divider />
       <div class="section-header">
@@ -417,6 +516,7 @@
         <el-button :icon="UploadCloud">上传新版本</el-button>
       </el-upload>
       <el-input v-model="versionDialog.description" placeholder="新版本说明" style="margin-top: 10px" />
+      <el-checkbox v-model="versionDialog.unlockAfterSave" style="margin-top: 10px">保存后解除文件锁定</el-checkbox>
       <template #footer>
         <el-button @click="versionDialog.visible = false">关闭</el-button>
         <el-button type="primary" :loading="loading" @click="uploadVersion">保存新版本</el-button>
@@ -622,6 +722,25 @@
               <el-option label="归档" value="archived" />
             </el-select>
           </el-form-item>
+          <el-form-item label="知识分类">
+            <el-select v-model="permissionDialog.form.condition.categoryIds" multiple clearable filterable style="width: 100%">
+              <el-option v-for="category in flatCategories" :key="category.id" :label="category.fullPath || category.name" :value="category.id" />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="扩展属性">
+            <el-select v-model="permissionDialog.form.condition.propertyId" clearable filterable style="width: 100%">
+              <el-option v-for="definition in propertyDefinitions" :key="definition.id" :label="definition.name" :value="definition.id" />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="属性匹配方式">
+            <el-select v-model="permissionDialog.form.condition.propertyOperator" style="width: 100%">
+              <el-option label="等于" value="equals" />
+              <el-option label="包含" value="contains" />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="属性值">
+            <el-input v-model="permissionDialog.form.condition.propertyValue" />
+          </el-form-item>
         </div>
       </el-form>
       <template #footer>
@@ -747,6 +866,33 @@
         <el-button v-if="storageDialog.form.provider === 'mysql'" :loading="storageDialog.testing" @click="testStorageConnection">测试连接</el-button>
         <el-button type="primary" :loading="loading" @click="saveStorageSettings">保存配置</el-button>
       </template>
+    </el-dialog>
+
+    <el-dialog v-model="fileStorageDialog.visible" title="文件存储与生命周期" width="760px">
+      <el-form label-position="top">
+        <el-form-item label="文件存储后端"><el-segmented v-model="fileStorageDialog.form.provider" :options="[{ label: '本地磁盘', value: 'local' }, { label: 'NAS', value: 'nas' }, { label: 'S3', value: 's3' }]" /></el-form-item>
+        <el-form-item v-if="fileStorageDialog.form.provider === 'nas'" label="NAS 根目录"><el-input v-model="fileStorageDialog.form.nasRoot" /></el-form-item>
+        <template v-if="fileStorageDialog.form.provider === 's3'">
+          <div class="form-grid"><el-form-item label="S3 Endpoint"><el-input v-model="fileStorageDialog.form.s3.endpoint" /></el-form-item><el-form-item label="Region"><el-input v-model="fileStorageDialog.form.s3.region" /></el-form-item></div>
+          <div class="form-grid"><el-form-item label="Bucket"><el-input v-model="fileStorageDialog.form.s3.bucket" /></el-form-item><el-form-item label="Path Style"><el-switch v-model="fileStorageDialog.form.s3.forcePathStyle" /></el-form-item></div>
+          <div class="form-grid"><el-form-item label="Access Key"><el-input v-model="fileStorageDialog.form.s3.accessKeyId" :placeholder="fileStorageSettings?.s3?.hasAccessKeyId ? '留空不修改' : ''" /></el-form-item><el-form-item label="Secret Key"><el-input v-model="fileStorageDialog.form.s3.secretAccessKey" type="password" show-password :placeholder="fileStorageSettings?.s3?.hasSecretAccessKey ? '留空不修改' : ''" /></el-form-item></div>
+        </template>
+        <el-divider content-position="left">容量配额</el-divider>
+        <div class="form-grid"><el-form-item label="平台总配额 GB（0 不限）"><el-input-number v-model="fileStorageDialog.form.quota.totalGb" :min="0" style="width:100%" /></el-form-item><el-form-item label="默认用户配额 GB（0 不限）"><el-input-number v-model="fileStorageDialog.form.quota.defaultUserGb" :min="0" style="width:100%" /></el-form-item></div>
+        <el-divider content-position="left">生命周期</el-divider>
+        <div class="form-grid"><el-form-item label="分片会话保留天数"><el-input-number v-model="fileStorageDialog.form.lifecycle.uploadSessionDays" :min="1" style="width:100%" /></el-form-item><el-form-item label="隔离文件保留天数"><el-input-number v-model="fileStorageDialog.form.lifecycle.quarantineDays" :min="1" style="width:100%" /></el-form-item><el-form-item label="历史版本保留天数（0 永久）"><el-input-number v-model="fileStorageDialog.form.lifecycle.historicalVersionDays" :min="0" style="width:100%" /></el-form-item><el-form-item label="至少保留版本数"><el-input-number v-model="fileStorageDialog.form.lifecycle.keepLatestVersions" :min="1" style="width:100%" /></el-form-item></div>
+      </el-form>
+      <template #footer><el-button @click="fileStorageDialog.visible=false">取消</el-button><el-button @click="testFileStorage">测试</el-button><el-button type="primary" @click="saveFileStorage">保存</el-button></template>
+    </el-dialog>
+
+    <el-dialog v-model="identityDialog.visible" title="统一身份源" width="820px" class="tall-dialog">
+      <el-tabs>
+        <el-tab-pane label="OIDC"><el-form label-position="top"><el-switch v-model="identityDialog.form.oidc.enabled" active-text="启用" /><div class="form-grid"><el-form-item label="Issuer"><el-input v-model="identityDialog.form.oidc.issuer" /></el-form-item><el-form-item label="Client ID"><el-input v-model="identityDialog.form.oidc.clientId" /></el-form-item><el-form-item label="Client Secret"><el-input v-model="identityDialog.form.oidc.clientSecret" type="password" show-password :placeholder="identitySettings?.oidc?.hasClientSecret ? '留空不修改' : ''" /></el-form-item><el-form-item label="回调地址"><el-input v-model="identityDialog.form.oidc.redirectUri" /></el-form-item></div><el-form-item label="自动创建员工账号"><el-switch v-model="identityDialog.form.oidc.autoProvision" /></el-form-item></el-form></el-tab-pane>
+        <el-tab-pane label="SAML"><el-form label-position="top"><el-switch v-model="identityDialog.form.saml.enabled" active-text="启用" /><div class="form-grid"><el-form-item label="IdP 登录地址"><el-input v-model="identityDialog.form.saml.entryPoint" /></el-form-item><el-form-item label="SP Issuer"><el-input v-model="identityDialog.form.saml.issuer" /></el-form-item><el-form-item label="回调地址"><el-input v-model="identityDialog.form.saml.callbackUrl" /></el-form-item><el-form-item label="自动创建员工账号"><el-switch v-model="identityDialog.form.saml.autoProvision" /></el-form-item></div><el-form-item label="IdP 证书 PEM"><el-input v-model="identityDialog.form.saml.idpCert" type="textarea" :rows="4" :placeholder="identitySettings?.saml?.hasIdpCert ? '留空不修改' : ''" /></el-form-item></el-form></el-tab-pane>
+        <el-tab-pane label="LDAP/AD"><el-form label-position="top"><el-switch v-model="identityDialog.form.ldap.enabled" active-text="启用" /><div class="form-grid"><el-form-item label="LDAP URL"><el-input v-model="identityDialog.form.ldap.url" /></el-form-item><el-form-item label="Base DN"><el-input v-model="identityDialog.form.ldap.baseDn" /></el-form-item><el-form-item label="Bind DN"><el-input v-model="identityDialog.form.ldap.bindDn" /></el-form-item><el-form-item label="Bind 密码"><el-input v-model="identityDialog.form.ldap.bindPassword" type="password" show-password :placeholder="identitySettings?.ldap?.hasBindPassword ? '留空不修改' : ''" /></el-form-item><el-form-item label="用户过滤器"><el-input v-model="identityDialog.form.ldap.userFilter" /></el-form-item><el-form-item label="账号属性"><el-input v-model="identityDialog.form.ldap.usernameAttribute" /></el-form-item></div></el-form></el-tab-pane>
+        <el-tab-pane label="HR"><el-form label-position="top"><el-switch v-model="identityDialog.form.hr.enabled" active-text="启用" /><el-form-item label="同步密钥"><el-input v-model="identityDialog.form.hr.syncSecret" type="password" show-password :placeholder="identitySettings?.hr?.hasSyncSecret ? '留空不修改' : ''" /></el-form-item><el-form-item label="自动停用缺失人员"><el-switch v-model="identityDialog.form.hr.autoDisableMissing" /></el-form-item></el-form></el-tab-pane>
+      </el-tabs>
+      <template #footer><el-button @click="identityDialog.visible=false">取消</el-button><el-button type="primary" @click="saveIdentitySettings">保存</el-button></template>
     </el-dialog>
 
     <el-dialog v-model="governanceDialog.visible" title="文档质量与复审" width="860px" class="tall-dialog">
@@ -986,6 +1132,20 @@
       </template>
     </el-dialog>
 
+    <el-dialog v-model="attachmentPurposesDialog.visible" title="附件用途字典" width="680px">
+      <el-table :data="attachmentPurposesDialog.rows" border>
+        <el-table-column label="编码" min-width="160"><template #default="{ row }"><el-input v-model="row.code" /></template></el-table-column>
+        <el-table-column label="名称" min-width="180"><template #default="{ row }"><el-input v-model="row.name" /></template></el-table-column>
+        <el-table-column label="启用" width="90"><template #default="{ row }"><el-switch v-model="row.enabled" /></template></el-table-column>
+        <el-table-column label="操作" width="80"><template #default="{ $index }"><el-button :icon="Trash2" circle @click="attachmentPurposesDialog.rows.splice($index, 1)" /></template></el-table-column>
+      </el-table>
+      <el-button :icon="Plus" style="margin-top: 12px" @click="attachmentPurposesDialog.rows.push({ code: '', name: '', enabled: true })">新增用途</el-button>
+      <template #footer>
+        <el-button @click="attachmentPurposesDialog.visible = false">取消</el-button>
+        <el-button type="primary" @click="saveAttachmentPurposes">保存</el-button>
+      </template>
+    </el-dialog>
+
     <el-dialog v-model="approvalRequestDialog.visible" :title="approvalRequestTitle" width="560px">
       <el-form label-position="top">
         <el-form-item label="文件/文件夹">
@@ -1220,8 +1380,13 @@
           <el-input v-model="filePolicyDialog.form.allowedExtensionsText" type="textarea" :rows="4" placeholder="docx,pdf,xlsx,png" />
         </el-form-item>
         <el-form-item label="单文件大小上限 MB">
-          <el-input-number v-model="filePolicyDialog.form.maxSizeMb" :min="1" :max="300" style="width: 100%" />
+          <el-input-number v-model="filePolicyDialog.form.maxSizeMb" :min="1" :max="10240" style="width: 100%" />
         </el-form-item>
+        <el-form-item label="分片大小 MB"><el-input-number v-model="filePolicyDialog.form.chunkSizeMb" :min="1" :max="64" style="width: 100%" /></el-form-item>
+        <div class="form-grid">
+          <el-form-item label="ClamAV 病毒扫描"><el-switch v-model="filePolicyDialog.form.enableVirusScan" /></el-form-item>
+          <el-form-item label="拒绝可执行文件"><el-switch v-model="filePolicyDialog.form.rejectExecutableFiles" /></el-form-item>
+        </div>
       </el-form>
       <template #footer>
         <el-button @click="filePolicyDialog.visible = false">取消</el-button>
@@ -1258,9 +1423,14 @@
           </el-select>
         </el-form-item>
         <el-form-item label="公告附件">
-          <el-upload :auto-upload="false" :limit="1" :on-change="onAnnouncementFileChange" :on-remove="onAnnouncementFileRemove">
-            <el-button :icon="Paperclip">选择附件</el-button>
+          <el-upload multiple :auto-upload="false" :limit="10" :on-change="onAnnouncementFileChange" :on-remove="onAnnouncementFileRemove">
+            <el-button :icon="Paperclip">选择附件（最多 10 个）</el-button>
           </el-upload>
+        </el-form-item>
+        <el-form-item v-if="announcementDialog.existingAttachments.length" label="已有附件">
+          <el-checkbox-group v-model="announcementDialog.removeAttachmentIds">
+            <el-checkbox v-for="item in announcementDialog.existingAttachments" :key="item.id" :label="item.id">删除 {{ item.originalFilename }}</el-checkbox>
+          </el-checkbox-group>
         </el-form-item>
       </el-form>
       <template #footer>
@@ -1303,6 +1473,16 @@
       </template>
     </el-dialog>
 
+    <el-dialog v-model="webhookDialog.visible" :title="webhookDialog.form.id ? '编辑 Webhook' : '新建 Webhook'" width="620px">
+      <el-form label-position="top">
+        <el-form-item label="名称"><el-input v-model="webhookDialog.form.name" /></el-form-item>
+        <el-form-item label="接收地址"><el-input v-model="webhookDialog.form.url" placeholder="https://example.com/webhook" /></el-form-item>
+        <el-form-item label="事件模式"><el-input v-model="webhookDialog.form.eventPatternsText" placeholder="file.*, approval.*, *" /></el-form-item>
+        <el-form-item label="状态"><el-switch v-model="webhookDialog.form.enabled" /></el-form-item>
+      </el-form>
+      <template #footer><el-button @click="webhookDialog.visible = false">取消</el-button><el-button type="primary" @click="saveWebhook">保存</el-button></template>
+    </el-dialog>
+
     <el-dialog v-model="shareDialog.visible" :title="shareDialog.form.type === 'publish' ? '文件发布' : '文件分享'" width="620px">
       <el-form label-position="top">
         <el-form-item label="文件/文件夹">
@@ -1311,15 +1491,15 @@
         <el-form-item label="类型">
           <el-segmented v-model="shareDialog.form.type" :options="shareTypes" />
         </el-form-item>
-        <el-form-item label="接收范围">
+        <el-form-item v-if="shareDialog.form.type !== 'external'" label="接收范围">
           <el-segmented v-model="shareDialog.audienceType" :options="subjectTypes" />
         </el-form-item>
-        <el-form-item label="接收对象" v-if="shareDialog.audienceType !== 'all'">
+        <el-form-item label="接收对象" v-if="shareDialog.form.type !== 'external' && shareDialog.audienceType !== 'all'">
           <el-select v-model="shareDialog.audienceIds" multiple filterable style="width: 100%">
             <el-option v-for="item in shareSubjectOptions" :key="item.id" :label="item.name || item.displayName" :value="item.id" />
           </el-select>
         </el-form-item>
-        <el-form-item label="授予权限">
+        <el-form-item v-if="shareDialog.form.type !== 'external'" label="授予权限">
           <el-checkbox-group v-model="shareDialog.form.actions">
             <el-checkbox label="visible">可见</el-checkbox>
             <el-checkbox label="file:preview">预览</el-checkbox>
@@ -1327,6 +1507,16 @@
             <el-checkbox label="file:update">修改</el-checkbox>
           </el-checkbox-group>
         </el-form-item>
+        <template v-if="shareDialog.form.type === 'external'">
+          <div class="form-grid">
+            <el-form-item label="允许预览"><el-switch v-model="shareDialog.form.allowPreview" /></el-form-item>
+            <el-form-item label="允许下载"><el-switch v-model="shareDialog.form.allowDownload" /></el-form-item>
+          </div>
+          <div class="form-grid">
+            <el-form-item label="提取码（可选）"><el-input v-model="shareDialog.form.password" maxlength="64" show-password /></el-form-item>
+            <el-form-item label="访问次数上限（0 为不限）"><el-input-number v-model="shareDialog.form.maxAccessCount" :min="0" :max="1000000" style="width: 100%" /></el-form-item>
+          </div>
+        </template>
         <el-form-item label="有效天数">
           <el-input-number v-model="shareDialog.days" :min="1" :max="365" />
         </el-form-item>
@@ -1387,11 +1577,15 @@
               <el-button :icon="Paperclip">选择附件</el-button>
             </el-upload>
             <el-input v-model="linkDialog.attachmentDescription" placeholder="附件说明" style="max-width: 280px" />
+            <el-select v-model="linkDialog.attachmentPurposeCode" placeholder="附件用途" style="width: 170px">
+              <el-option v-for="item in linkDialog.attachmentPurposes" :key="item.code" :label="item.name" :value="item.code" />
+            </el-select>
             <el-button type="primary" :loading="loading" @click="uploadAttachment">上传附件</el-button>
           </div>
           <el-table :data="linkDialog.attachments" border>
             <el-table-column prop="name" label="附件名称" min-width="180" />
             <el-table-column prop="description" label="说明" min-width="180" />
+            <el-table-column prop="purposeName" label="用途" width="120" />
             <el-table-column label="大小" width="110">
               <template #default="{ row }">{{ formatSize(row.sizeBytes) }}</template>
             </el-table-column>
@@ -1469,18 +1663,18 @@
           <el-input v-model="metadataDialog.tagsText" placeholder="多个标签用逗号分隔" />
         </el-form-item>
         <el-form-item label="分类">
-          <el-select v-model="metadataDialog.categoryIds" multiple style="width: 100%">
+          <el-select v-model="metadataDialog.categoryIds" multiple style="width: 100%" @change="refreshMetadataPropertyEntries">
             <el-option v-for="item in flatCategories" :key="item.id" :label="item.fullPath || item.name" :value="item.id" />
           </el-select>
         </el-form-item>
-        <el-form-item v-for="item in propertyDefinitions" :key="item.id" :label="item.name">
-          <el-select v-if="item.dataType === 'enum'" v-model="metadataDialog.values[item.id]" clearable style="width: 100%">
-            <el-option v-for="option in item.options || []" :key="option" :label="option" :value="option" />
+        <el-form-item v-for="item in metadataDialog.propertyEntries" :key="item.key" :label="item.categoryName ? item.categoryName + ' / ' + item.definition.name : item.definition.name" :required="item.definition.required">
+          <el-select v-if="item.definition.dataType === 'enum'" v-model="metadataDialog.values[item.key]" clearable style="width: 100%">
+            <el-option v-for="option in item.definition.options || []" :key="option" :label="option" :value="option" />
           </el-select>
-          <el-switch v-else-if="item.dataType === 'boolean'" v-model="metadataDialog.values[item.id]" active-value="true" inactive-value="false" />
-          <el-date-picker v-else-if="item.dataType === 'date'" v-model="metadataDialog.values[item.id]" type="date" value-format="YYYY-MM-DD" style="width: 100%" />
-          <el-input-number v-else-if="item.dataType === 'number'" v-model="metadataDialog.values[item.id]" style="width: 100%" />
-          <el-input v-else v-model="metadataDialog.values[item.id]" />
+          <el-switch v-else-if="item.definition.dataType === 'boolean'" v-model="metadataDialog.values[item.key]" active-value="true" inactive-value="false" />
+          <el-date-picker v-else-if="item.definition.dataType === 'date'" v-model="metadataDialog.values[item.key]" type="date" value-format="YYYY-MM-DD" style="width: 100%" />
+          <el-input-number v-else-if="item.definition.dataType === 'number'" v-model="metadataDialog.values[item.key]" style="width: 100%" />
+          <el-input v-else v-model="metadataDialog.values[item.key]" />
         </el-form-item>
         <el-form-item label="评分">
           <el-rate v-model="metadataDialog.score" />
@@ -1524,6 +1718,11 @@
         </el-form-item>
         <el-form-item label="是否必填">
           <el-switch v-model="propertyDialog.form.required" />
+        </el-form-item>
+        <el-form-item label="绑定分类">
+          <el-select v-model="propertyDialog.form.categoryIds" multiple clearable filterable style="width: 100%">
+            <el-option v-for="item in flatCategories" :key="item.id" :label="item.fullPath || item.name" :value="item.id" />
+          </el-select>
         </el-form-item>
         <el-form-item label="枚举选项">
           <el-input v-model="propertyDialog.form.optionsText" type="textarea" :rows="3" placeholder="多个选项用逗号或换行分隔" />
@@ -1886,6 +2085,7 @@ import {
   KnowledgeView as KnowledgeViewPanel,
   MessagesView as MessagesViewPanel,
   OrgView as OrgViewPanel,
+  PersonalDriveRecordsView as PersonalDriveRecordsViewPanel,
   ProfileView as ProfileViewPanel,
   SystemManagementView as SystemManagementViewPanel,
   TrashView as TrashViewPanel,
@@ -1893,6 +2093,8 @@ import {
 } from './components/views.js';
 
 const token = ref(getToken());
+const wecomLoginEnabled = ref(false);
+const identityLoginProviders = reactive({ oidc: false, saml: false });
 const user = ref(null);
 const loading = ref(false);
 const activeView = ref('docs');
@@ -1917,7 +2119,10 @@ const driveTree = ref([]);
 const driveChildren = ref([]);
 const selectedDriveFolder = ref(null);
 const driveSummary = ref(null);
+const driveTrashItems = ref([]);
+const driveLogs = ref([]);
 const messages = ref([]);
+const messagesArchivedOnly = ref(false);
 const auditLogs = ref([]);
 const actions = ref([]);
 const categoryTree = ref([]);
@@ -1926,17 +2131,25 @@ const selectedCategory = ref(null);
 const propertyDefinitions = ref([]);
 const trashItems = ref([]);
 const shares = ref([]);
+const externalLinks = ref([]);
 const subscriptions = ref([]);
 const reminders = ref([]);
+const favorites = ref([]);
+const favoriteFolders = ref([]);
 const announcements = ref([]);
 const apiCredentials = ref([]);
 const apiCallLogs = ref([]);
+const webhooks = ref([]);
+const webhookDeliveries = ref([]);
 const permissionTemplates = ref([]);
 const filePolicy = ref({ allowedExtensions: [], maxSizeMb: 300 });
 const externalLibrary = ref({ rootPath: '', lastSyncedAt: null, lastSyncSummary: null });
 const storageSettings = ref(null);
+const fileStorageSettings = ref(null);
+const identitySettings = ref(null);
 const securityPolicy = ref(null);
 const wecomSettings = ref(null);
+const attachmentPurposes = ref([]);
 const officePreviewSettings = ref(null);
 const searchIndexStatus = ref(null);
 const approvalTodo = ref([]);
@@ -1961,9 +2174,11 @@ const governanceLoading = ref(false);
 const nodeUnlockTokens = reactive({});
 
 const folderDialog = reactive({ visible: false, name: '' });
+const officeCreateDialog = reactive({ visible: false, officeType: 'docx', name: '', description: '在线新建' });
 const uploadDialog = reactive({ visible: false, files: [], description: '初始版本' });
 const moveDialog = reactive({ visible: false, mode: 'move', space: 'docs', node: null, nodes: [], targetId: '' });
-const versionDialog = reactive({ visible: false, node: null, items: [], logs: [], file: null, description: '' });
+const versionDialog = reactive({ visible: false, node: null, items: [], logs: [], file: null, description: '', unlockAfterSave: true, diffFromId: '', diffToId: '', diffRows: [] });
+const auditFilters = reactive({ actorId: '', action: '', targetPath: '', range: [] });
 const workflowDialog = reactive({ visible: false, node: null, action: 'publish', templateId: '', approverId: '', secondApproverId: '', mode: 'single', ccUserIds: [], comment: '', approvals: [] });
 const permissionDialog = reactive({
   visible: false,
@@ -1982,7 +2197,7 @@ const permissionDialog = reactive({
     scope: 'all',
     priority: 100,
     inheritEnabled: true,
-    condition: { filenameContains: '', pathPrefix: '', extensions: '', businessStatus: '' }
+    condition: { filenameContains: '', pathPrefix: '', extensions: '', businessStatus: '', categoryIds: [], propertyId: '', propertyOperator: 'equals', propertyValue: '' }
   }
 });
 const PREVIEW_INITIAL_LINES = 800;
@@ -2100,8 +2315,9 @@ const shareDialog = reactive({
   audienceType: 'role',
   audienceIds: [],
   days: 30,
-  form: { type: 'share', description: '', actions: ['visible', 'file:preview', 'file:download'] }
+  form: { type: 'share', description: '', actions: ['visible', 'file:preview', 'file:download'], allowPreview: true, allowDownload: false, password: '', maxAccessCount: 0 }
 });
+const externalAccess = reactive({ active: false, token: '', metadata: null, password: '', accessToken: '' });
 const reminderDialog = reactive({ visible: false, node: null, form: { triggerAt: new Date(), endAt: null, cycle: 'none', intervalDays: 0, remindBy: ['system'], remark: '' } });
 const linkDialog = reactive({
   visible: false,
@@ -2110,14 +2326,16 @@ const linkDialog = reactive({
   attachments: [],
   attachmentFile: null,
   attachmentDescription: '',
+  attachmentPurposeCode: '',
+  attachmentPurposes: [],
   relations: [],
   relationKeyword: '',
   relationDescription: '',
   candidates: []
 });
-const metadataDialog = reactive({ visible: false, node: null, tagsText: '', categoryIds: [], values: {}, businessStatus: 'effective', comments: [], comment: '', score: 5 });
+const metadataDialog = reactive({ visible: false, node: null, tagsText: '', categoryIds: [], propertyEntries: [], values: {}, businessStatus: 'effective', comments: [], comment: '', score: 5 });
 const categoryDialog = reactive({ visible: false, form: {} });
-const propertyDialog = reactive({ visible: false, form: { name: '', targetType: 'file', dataType: 'string', required: false, optionsText: '' } });
+const propertyDialog = reactive({ visible: false, form: { name: '', targetType: 'file', dataType: 'string', required: false, optionsText: '', categoryIds: [] } });
 const passwordDialog = reactive({ visible: false, form: { oldPassword: '', newPassword: '', confirmPassword: '' } });
 const externalLibraryDialog = reactive({ visible: false, rootPath: '', includePathsText: '', excludePatternsText: '', syncJobs: [] });
 const storageDialog = reactive({
@@ -2127,6 +2345,8 @@ const storageDialog = reactive({
   testResult: null,
   form: { provider: 'json', host: '', port: 3306, database: '', user: '', password: '', ssl: false }
 });
+const fileStorageDialog = reactive({ visible: false, form: { provider: 'local', nasRoot: '', s3: { endpoint: '', region: 'us-east-1', bucket: '', accessKeyId: '', secretAccessKey: '', forcePathStyle: true }, quota: { totalGb: 0, defaultUserGb: 0 }, lifecycle: { uploadSessionDays: 7, quarantineDays: 30, historicalVersionDays: 0, keepLatestVersions: 3 } } });
+const identityDialog = reactive({ visible: false, form: { oidc: {}, saml: {}, ldap: {}, hr: {} } });
 const governanceDialog = reactive({
   visible: false,
   activeTab: 'quality',
@@ -2169,6 +2389,7 @@ const wecomDialog = reactive({
     pushMessages: false
   }
 });
+const attachmentPurposesDialog = reactive({ visible: false, rows: [] });
 const officePreviewDialog = reactive({
   visible: false,
   form: {
@@ -2210,9 +2431,10 @@ const viewAccessDialog = reactive({ visible: false, node: null, restricted: fals
 const nodePasswordDialog = reactive({ visible: false, node: null, enabled: false, password: '', confirmPassword: '' });
 const unlockDialog = reactive({ visible: false, node: null, nodeName: '', password: '', retry: null, resolve: null, reject: null });
 const messageDialog = reactive({ visible: false, item: null });
-const filePolicyDialog = reactive({ visible: false, form: { allowedExtensionsText: '', maxSizeMb: 300 } });
-const announcementDialog = reactive({ visible: false, file: null, audienceType: 'all', audienceIds: [], form: { title: '', content: '', status: 'published', expiresAt: null } });
+const filePolicyDialog = reactive({ visible: false, form: { allowedExtensionsText: '', maxSizeMb: 2048, chunkSizeMb: 8, enableVirusScan: false, rejectExecutableFiles: true } });
+const announcementDialog = reactive({ visible: false, files: [], existingAttachments: [], removeAttachmentIds: [], audienceType: 'all', audienceIds: [], form: { title: '', content: '', status: 'published', expiresAt: null } });
 const credentialDialog = reactive({ visible: false, form: { id: '', name: '', userId: '', scopesText: 'files:read', status: 'enabled', rateLimitPerMinute: 120, expiresAt: null } });
+const webhookDialog = reactive({ visible: false, form: { id: '', name: '', url: '', eventPatternsText: '*', enabled: true } });
 
 const navItems = [
   { key: 'dashboard', label: '工作台', icon: Gauge },
@@ -2227,12 +2449,12 @@ const navItems = [
   { key: 'messages', label: '消息中心', icon: Bell },
   { key: 'collaboration', label: '协作中心', icon: Share2 },
   { key: 'approvals', label: '审批中心', icon: ClipboardCheck },
-  { key: 'announcements', label: '公告管理', icon: Bell },
+  { key: 'announcements', label: '公告', icon: Bell },
   { key: 'api', label: '开放 API', icon: Shield },
   { key: 'system', label: '系统管理', icon: Settings },
   { key: 'audit', label: '审计日志', icon: History }
 ];
-const adminOnlyViews = new Set(['users', 'org', 'governance', 'announcements', 'api', 'system', 'audit']);
+const adminOnlyViews = new Set(['users', 'org', 'governance', 'api', 'system', 'audit']);
 const isAdminUser = computed(() => (user.value?.roleIds || []).includes('r_admin'));
 const workflowApprovalTemplates = computed(() => approvalTemplates.value.filter((item) => item.status === 'enabled' && ['workflow', 'publish'].includes(item.type)));
 const requestApprovalTemplates = computed(() => approvalTemplates.value.filter((item) => item.status === 'enabled' && item.type === approvalRequestDialog.type));
@@ -2247,7 +2469,8 @@ const subjectTypes = [
 ];
 const shareTypes = [
   { label: '分享', value: 'share' },
-  { label: '发布', value: 'publish' }
+  { label: '发布', value: 'publish' },
+  { label: '外链', value: 'external' }
 ];
 const permissionEffects = [
   { label: '允许', value: 'allow' },
@@ -2898,6 +3121,7 @@ function versionActionLabel(action) {
     create: '初始上传',
     upload: '上传新版本',
     rollback: '版本回滚',
+    delete: '删除历史版本',
     external_create: '同步新增',
     external_update: '同步更新'
   }[action] || action || '-';
@@ -3006,6 +3230,89 @@ async function consumeSsoTicketFromUrl() {
   }
 }
 
+async function loadWecomLoginConfig() {
+  try {
+    const config = await api('/wecom/auth/config', { silentError: true });
+    wecomLoginEnabled.value = Boolean(config.enabled);
+  } catch {
+    wecomLoginEnabled.value = false;
+  }
+}
+
+async function loadIdentityLoginProviders() {
+  try {
+    const providers = await api('/auth/providers', { silentError: true });
+    identityLoginProviders.oidc = Boolean(providers.oidc?.enabled);
+    identityLoginProviders.saml = Boolean(providers.saml?.enabled);
+  } catch {
+    identityLoginProviders.oidc = false;
+    identityLoginProviders.saml = false;
+  }
+}
+
+async function startIdentityLogin(provider) {
+  const currentUrl = new URL(window.location.href);
+  currentUrl.search = '';
+  currentUrl.hash = '';
+  const data = await api(`/auth/${provider}/url?redirectUri=${encodeURIComponent(currentUrl.toString())}`);
+  window.location.assign(data.authorizeUrl);
+}
+
+async function consumeOidcLoginFromUrl() {
+  const currentUrl = new URL(window.location.href);
+  const code = currentUrl.searchParams.get('code');
+  const state = currentUrl.searchParams.get('state');
+  if (!code || !state || !identityLoginProviders.oidc) return false;
+  try {
+    const data = await api(`/auth/oidc/callback?code=${encodeURIComponent(code)}&state=${encodeURIComponent(state)}`);
+    setToken(data.token);
+    token.value = data.token;
+    user.value = data.user;
+    currentUrl.searchParams.delete('code');
+    currentUrl.searchParams.delete('state');
+    window.history.replaceState({}, '', `${currentUrl.pathname}${currentUrl.search}${currentUrl.hash}`);
+    await bootstrap();
+    ElMessage.success('统一身份登录成功');
+    return true;
+  } catch (error) {
+    ElMessage.error(error.message || '统一身份登录失败');
+    return false;
+  }
+}
+
+async function startWecomLogin() {
+  const currentUrl = new URL(window.location.href);
+  currentUrl.search = '';
+  currentUrl.hash = '';
+  const data = await api(`/wecom/auth/url?redirectUri=${encodeURIComponent(currentUrl.toString())}`);
+  window.location.assign(data.authorizeUrl);
+}
+
+async function consumeWecomLoginFromUrl() {
+  const currentUrl = new URL(window.location.href);
+  const code = currentUrl.searchParams.get('code');
+  if (!code) return false;
+  const state = currentUrl.searchParams.get('state') || '';
+  try {
+    const data = await api(`/wecom/auth/callback?code=${encodeURIComponent(code)}&state=${encodeURIComponent(state)}`);
+    setToken(data.token);
+    token.value = data.token;
+    user.value = data.user;
+    currentUrl.searchParams.delete('code');
+    currentUrl.searchParams.delete('state');
+    window.history.replaceState({}, '', `${currentUrl.pathname}${currentUrl.search}${currentUrl.hash}`);
+    await bootstrap();
+    ElMessage.success('企业微信登录成功');
+    return true;
+  } catch (error) {
+    currentUrl.searchParams.delete('code');
+    currentUrl.searchParams.delete('state');
+    window.history.replaceState({}, '', `${currentUrl.pathname}${currentUrl.search}${currentUrl.hash}`);
+    ElMessage.error(error.message || '企业微信登录失败');
+    return false;
+  }
+}
+
 async function logout() {
   try {
     await api('/auth/logout', { method: 'POST' });
@@ -3022,13 +3329,25 @@ async function bootstrap() {
   user.value = me.user;
   actions.value = me.actions;
   if (adminOnlyViews.has(activeView.value) && !isAdminUser.value) activeView.value = 'dashboard';
-  const commonLoads = [loadOrg(), loadUsers(), loadKnowledge(), loadDashboard(), loadDocTree(), loadMessages(), loadCollaboration(), loadRecentAccess(), loadRecentSearches(), loadApprovals()];
-  const adminLoads = isAdminUser.value ? [loadAnnouncements(), loadAudit(), loadExternalLibrary(), loadSecurityPolicy(), loadWecomSettings()] : [];
+  const commonLoads = [loadOrg(), loadUsers(), loadKnowledge(), loadDashboard(), loadDocTree(), loadMessages(), loadAnnouncements(), loadCollaboration(), loadRecentAccess(), loadRecentSearches(), loadApprovals()];
+  const adminLoads = isAdminUser.value ? [loadAudit(), loadExternalLibrary(), loadSecurityPolicy(), loadWecomSettings(), loadAttachmentPurposes(), loadFileStorageSettings(), loadIdentitySettings()] : [];
   await Promise.all([...commonLoads, ...adminLoads]);
 }
 
 async function loadDashboard() {
   dashboard.value = await api('/dashboard');
+}
+
+async function openDashboardNode(node) {
+  if (!node) return;
+  activeView.value = node.spaceType === 'personal' ? 'drive' : 'docs';
+  const tree = node.spaceType === 'personal' ? driveTree.value : docTree.value;
+  const parent = flattenTree(tree).find((item) => item.id === node.parentId);
+  if (parent) {
+    if (node.spaceType === 'personal') await selectDriveFolder(parent);
+    else await selectFolder(parent);
+  }
+  if (node.nodeType === 'file') await previewNode(node);
 }
 
 async function loadOrg() {
@@ -3048,8 +3367,22 @@ async function loadPermissionTemplates() {
 
 async function loadDocTree() {
   docTree.value = await api('/nodes/tree', { headers: nodeUnlockHeaders() });
-  const root = flattenTree(docTree.value).find((item) => item.id === 'n_root') || flattenTree(docTree.value)[0];
-  if (!selectedFolder.value && root) await selectFolder(root);
+  const folders = flattenTree(docTree.value);
+  const root = folders.find((item) => item.id === 'n_root') || folders[0];
+  const preferred = user.value?.defaultWorkPathId ? folders.find((item) => item.id === user.value.defaultWorkPathId && item.nodeType === 'folder') : null;
+  if (!selectedFolder.value && (preferred || root)) await selectFolder(preferred || root);
+}
+
+async function saveProfile(form) {
+  user.value = await api('/profile', { method: 'PUT', body: form });
+  ElMessage.success('个人资料已保存');
+}
+
+async function uploadAvatar(file) {
+  const form = new FormData();
+  form.append('avatar', file);
+  user.value = await api('/profile/avatar', { method: 'POST', body: form });
+  ElMessage.success('头像已更新');
 }
 
 async function selectFolder(node) {
@@ -3062,13 +3395,19 @@ async function selectFolder(node) {
 }
 
 async function loadPersonalDrive() {
-  const [tree, summary] = await Promise.all([api('/personal-drive/tree', { headers: nodeUnlockHeaders() }), api('/personal-drive/summary')]);
+  const [tree, summary] = await Promise.all([api('/personal-drive/tree', { headers: nodeUnlockHeaders() }), api('/personal-drive/summary'), loadPersonalDriveRecords()]);
   driveTree.value = tree;
   driveSummary.value = summary;
   const folders = flattenTree(driveTree.value);
   const root = folders[0];
   if (!selectedDriveFolder.value && root) await selectDriveFolder(root);
   else if (selectedDriveFolder.value) await selectDriveFolder(selectedDriveFolder.value);
+}
+
+async function loadPersonalDriveRecords() {
+  const [trashPage, logPage] = await Promise.all([api('/personal-drive/trash?pageSize=100'), api('/personal-drive/logs?pageSize=100')]);
+  driveTrashItems.value = trashPage.items;
+  driveLogs.value = logPage.items;
 }
 
 async function selectDriveFolder(node) {
@@ -3081,17 +3420,28 @@ async function selectDriveFolder(node) {
 }
 
 async function loadMessages() {
-  const page = await api('/messages?pageSize=100');
+  const page = await api(`/messages?pageSize=100&archived=${messagesArchivedOnly.value ? 'true' : 'false'}`);
   messages.value = page.items;
 }
 
 async function loadAudit() {
   try {
-    const page = await api('/audit-logs?pageSize=100');
+    const params = new URLSearchParams({ pageSize: '100' });
+    if (auditFilters.actorId) params.set('actorId', auditFilters.actorId);
+    if (auditFilters.action) params.set('action', auditFilters.action);
+    if (auditFilters.targetPath) params.set('targetPath', auditFilters.targetPath);
+    if (auditFilters.range?.[0]) params.set('startAt', new Date(auditFilters.range[0]).toISOString());
+    if (auditFilters.range?.[1]) params.set('endAt', new Date(auditFilters.range[1]).toISOString());
+    const page = await api(`/audit-logs?${params.toString()}`);
     auditLogs.value = page.items;
   } catch {
     auditLogs.value = [];
   }
+}
+
+async function filterAuditLogs(filters) {
+  Object.assign(auditFilters, filters || {});
+  await loadAudit();
 }
 
 async function loadKnowledge() {
@@ -3113,14 +3463,50 @@ async function loadTrash() {
 }
 
 async function loadCollaboration() {
-  const [sharePage, subItems, reminderItems] = await Promise.all([
+  const [sharePage, externalPage, subItems, reminderItems, favoriteItems, folders] = await Promise.all([
     api('/shares?pageSize=200'),
+    api('/external-links?pageSize=200'),
     api('/subscriptions'),
-    api('/reminders')
+    api('/reminders'),
+    api('/favorites'),
+    api('/favorite-folders')
   ]);
   shares.value = sharePage.items;
+  externalLinks.value = externalPage.items;
   subscriptions.value = subItems;
   reminders.value = reminderItems;
+  favorites.value = favoriteItems;
+  favoriteFolders.value = folders;
+}
+
+async function createFavoriteFolder() {
+  const { value } = await ElMessageBox.prompt('请输入收藏夹名称', '新建收藏夹', { inputValidator: (input) => Boolean(input?.trim()) || '名称不能为空' });
+  await api('/favorite-folders', { method: 'POST', body: { name: value } });
+  ElMessage.success('收藏夹已创建');
+  await loadCollaboration();
+}
+
+async function renameFavoriteFolder(row) {
+  const { value } = await ElMessageBox.prompt('请输入新名称', '重命名收藏夹', { inputValue: row.name, inputValidator: (input) => Boolean(input?.trim()) || '名称不能为空' });
+  await api(`/favorite-folders/${row.id}`, { method: 'PUT', body: { name: value } });
+  ElMessage.success('收藏夹已重命名');
+  await loadCollaboration();
+}
+
+async function deleteFavoriteFolder(row) {
+  await ElMessageBox.confirm('删除收藏夹后，其中内容会移到默认收藏夹，确定删除吗？', '删除收藏夹', { type: 'warning' });
+  await api(`/favorite-folders/${row.id}`, { method: 'DELETE' });
+  await loadCollaboration();
+}
+
+async function moveFavorite(row, folderId) {
+  await api(`/favorites/${row.id}`, { method: 'PUT', body: { folderId: folderId || null } });
+  await Promise.all([loadCollaboration(), loadDashboard()]);
+}
+
+async function removeFavorite(row) {
+  await api(`/favorites/${row.id}`, { method: 'DELETE' });
+  await Promise.all([loadCollaboration(), loadDashboard()]);
 }
 
 async function loadAnnouncements() {
@@ -3129,13 +3515,17 @@ async function loadAnnouncements() {
 }
 
 async function loadApiManagement() {
-  const [credentialPage, logPage, policy] = await Promise.all([
+  const [credentialPage, logPage, webhookPage, deliveryPage, policy] = await Promise.all([
     api('/api-credentials?pageSize=200'),
     api('/api-call-logs?pageSize=200'),
+    api('/webhooks?pageSize=200'),
+    api('/webhook-deliveries?pageSize=200'),
     api('/system-settings/file-policy')
   ]);
   apiCredentials.value = credentialPage.items;
   apiCallLogs.value = logPage.items;
+  webhooks.value = webhookPage.items;
+  webhookDeliveries.value = deliveryPage.items;
   filePolicy.value = policy;
 }
 
@@ -3154,6 +3544,67 @@ async function loadStorageSettings() {
   storageSettings.value = await api('/system-settings/storage');
 }
 
+async function loadFileStorageSettings() {
+  if (!isAdminUser.value) return;
+  fileStorageSettings.value = await api('/system-settings/file-storage');
+}
+
+async function loadIdentitySettings() {
+  if (!isAdminUser.value) return;
+  identitySettings.value = await api('/system-settings/identity');
+}
+
+function openFileStorageDialog() {
+  const current = fileStorageSettings.value || {};
+  fileStorageDialog.form = {
+    provider: current.provider || 'local', nasRoot: current.nasRoot || '',
+    s3: { endpoint: current.s3?.endpoint || '', region: current.s3?.region || 'us-east-1', bucket: current.s3?.bucket || '', accessKeyId: '', secretAccessKey: '', forcePathStyle: current.s3?.forcePathStyle !== false },
+    quota: { totalGb: Number(current.quota?.totalGb || 0), defaultUserGb: Number(current.quota?.defaultUserGb || 0), userLimitsGb: current.quota?.userLimitsGb || {} },
+    lifecycle: { uploadSessionDays: Number(current.lifecycle?.uploadSessionDays || 7), quarantineDays: Number(current.lifecycle?.quarantineDays || 30), historicalVersionDays: Number(current.lifecycle?.historicalVersionDays || 0), keepLatestVersions: Number(current.lifecycle?.keepLatestVersions || 3) }
+  };
+  fileStorageDialog.visible = true;
+}
+
+async function testFileStorage() {
+  await api('/system-settings/file-storage/test', { method: 'POST', body: fileStorageDialog.form });
+  ElMessage.success('文件存储连接正常');
+}
+
+async function saveFileStorage() {
+  fileStorageSettings.value = await api('/system-settings/file-storage', { method: 'PUT', body: fileStorageDialog.form });
+  fileStorageDialog.visible = false;
+  ElMessage.success('文件存储配置已保存');
+}
+
+async function runStorageLifecycle() {
+  const result = await api('/system/storage/lifecycle/run', { method: 'POST', body: {} });
+  ElMessage.success(`生命周期完成：分片 ${result.expiredSessions}，隔离 ${result.expiredQuarantine}，版本 ${result.expiredVersions}`);
+  await loadFileStorageSettings();
+}
+
+function openIdentityDialog() {
+  const current = identitySettings.value || {};
+  identityDialog.form = {
+    oidc: { ...(current.oidc || {}), clientSecret: '' },
+    saml: { ...(current.saml || {}), idpCert: '' },
+    ldap: { ...(current.ldap || {}), bindPassword: '' },
+    hr: { ...(current.hr || {}), syncSecret: '' }
+  };
+  identityDialog.visible = true;
+}
+
+async function saveIdentitySettings() {
+  identitySettings.value = await api('/system-settings/identity', { method: 'PUT', body: identityDialog.form });
+  identityDialog.visible = false;
+  ElMessage.success('身份源配置已保存');
+}
+
+async function syncLdapDirectory() {
+  const result = await api('/system-settings/identity/ldap/sync', { method: 'POST', body: {} });
+  ElMessage.success(`LDAP 同步完成：新增 ${result.created}，更新 ${result.updated}`);
+  await Promise.all([loadOrg(), loadUsers()]);
+}
+
 async function loadSecurityPolicy() {
   if (!isAdminUser.value) return;
   securityPolicy.value = await api('/system-settings/security-policy');
@@ -3162,6 +3613,24 @@ async function loadSecurityPolicy() {
 async function loadWecomSettings() {
   if (!isAdminUser.value) return;
   wecomSettings.value = await api('/system-settings/wecom');
+}
+
+async function loadAttachmentPurposes() {
+  if (!isAdminUser.value) return;
+  attachmentPurposes.value = await api('/system-settings/attachment-purposes');
+}
+
+function openAttachmentPurposesDialog() {
+  attachmentPurposesDialog.rows = attachmentPurposes.value.map((item) => ({ ...item }));
+  attachmentPurposesDialog.visible = true;
+}
+
+async function saveAttachmentPurposes() {
+  attachmentPurposes.value = await api('/system-settings/attachment-purposes', {
+    method: 'PUT', body: { purposes: attachmentPurposesDialog.rows }
+  });
+  attachmentPurposesDialog.visible = false;
+  ElMessage.success('附件用途已保存');
 }
 
 async function loadOfficePreviewSettings() {
@@ -3324,7 +3793,7 @@ async function refreshCurrent() {
   if (activeView.value === 'messages') await loadMessages();
   if (activeView.value === 'collaboration') await loadCollaboration();
   if (activeView.value === 'approvals') await loadApprovals();
-  if (activeView.value === 'announcements' && isAdminUser.value) await loadAnnouncements();
+  if (activeView.value === 'announcements') await loadAnnouncements();
   if (activeView.value === 'api' && isAdminUser.value) {
     await loadUsers();
     await loadApiManagement();
@@ -3342,6 +3811,45 @@ async function refreshCurrent() {
 function openFolderDialog() {
   folderDialog.name = '';
   folderDialog.visible = true;
+}
+
+function officeTypeLabel(type) {
+  return { docx: ' Word 文档', xlsx: ' Excel 表格', pptx: ' PPT 演示文稿' }[type] || ' Office 文件';
+}
+
+function openOfficeCreateDialog(officeType) {
+  const defaultNames = { docx: '新建文档.docx', xlsx: '新建表格.xlsx', pptx: '新建演示文稿.pptx' };
+  officeCreateDialog.officeType = officeType;
+  officeCreateDialog.name = defaultNames[officeType] || '';
+  officeCreateDialog.description = '在线新建';
+  officeCreateDialog.visible = true;
+}
+
+async function createOfficeFile() {
+  const type = officeCreateDialog.officeType;
+  let name = String(officeCreateDialog.name || '').trim();
+  if (!name) return ElMessage.warning('请输入文件名称');
+  if (!name.toLowerCase().endsWith(`.${type}`)) name += `.${type}`;
+  const fallbackParent = activeView.value === 'drive' ? selectedDriveFolder.value?.id : 'n_root';
+  loading.value = true;
+  try {
+    const node = await api('/files/office', {
+      method: 'POST',
+      headers: nodeUnlockHeaders(),
+      body: {
+        parentId: activeFolder.value?.id || fallbackParent || 'n_root',
+        officeType: type,
+        name,
+        description: officeCreateDialog.description || '在线新建'
+      }
+    });
+    officeCreateDialog.visible = false;
+    ElMessage.success('文件已创建，正在打开编辑器');
+    await refreshCurrent();
+    await openOfficeEditDialog(node);
+  } finally {
+    loading.value = false;
+  }
 }
 
 async function createFolder() {
@@ -3371,11 +3879,29 @@ async function uploadFile() {
   loading.value = true;
   try {
     for (const file of uploadDialog.files) {
-      const form = new FormData();
-      form.append('parentId', activeFolder.value?.id || 'n_root');
-      form.append('description', uploadDialog.description || '初始版本');
-      form.append('file', file);
-      await api('/files', { method: 'POST', headers: nodeUnlockHeaders(), body: form });
+      const chunkSize = Math.max(1, Number(filePolicy.value?.chunkSizeMb || 8)) * 1024 * 1024;
+      const useChunked = file.size > chunkSize;
+      if (!useChunked) {
+        const form = new FormData();
+        form.append('parentId', activeFolder.value?.id || 'n_root');
+        form.append('description', uploadDialog.description || '初始版本');
+        form.append('file', file);
+        await api('/files', { method: 'POST', headers: nodeUnlockHeaders(), body: form });
+        continue;
+      }
+      const totalChunks = Math.ceil(file.size / chunkSize);
+      const session = await api('/uploads/chunked/init', {
+        method: 'POST', headers: nodeUnlockHeaders(),
+        body: { parentId: activeFolder.value?.id || 'n_root', filename: file.name, sizeBytes: file.size, totalChunks, description: uploadDialog.description || '分片上传' }
+      });
+      const uploaded = new Set(session.uploadedChunks || []);
+      for (let index = 0; index < totalChunks; index += 1) {
+        if (uploaded.has(index)) continue;
+        const chunkForm = new FormData();
+        chunkForm.append('chunk', file.slice(index * chunkSize, Math.min((index + 1) * chunkSize, file.size)), `${file.name}.part${index}`);
+        await api(`/uploads/chunked/${session.id}/chunks/${index}`, { method: 'PUT', body: chunkForm });
+      }
+      await api(`/uploads/chunked/${session.id}/complete`, { method: 'POST', headers: nodeUnlockHeaders(), body: {} });
     }
     uploadDialog.visible = false;
     ElMessage.success('上传成功');
@@ -3432,6 +3958,35 @@ async function downloadNode(node, versionId = null) {
     }
     throw error;
   }
+}
+
+async function exportPdf(node, versionId = null) {
+  const suffix = versionId ? `?versionId=${encodeURIComponent(versionId)}` : '';
+  const filename = `${String(node.name || 'document').replace(/\.[^.]+$/, '')}.pdf`;
+  await runWithPasswordUnlock(node, async () => {
+    await downloadFile(`/files/${node.id}/export-pdf${suffix}`, filename, null, { headers: nodeUnlockHeaders() });
+  });
+  ElMessage.success('PDF 已导出');
+}
+
+async function printNode(node, versionId = null) {
+  const suffix = versionId ? `?versionId=${encodeURIComponent(versionId)}` : '';
+  await runWithPasswordUnlock(node, async () => {
+    const blob = await api(`/files/${node.id}/print${suffix}`, { headers: nodeUnlockHeaders(), blob: true });
+    const url = URL.createObjectURL(blob);
+    const frame = document.createElement('iframe');
+    frame.style.position = 'fixed';
+    frame.style.width = '1px';
+    frame.style.height = '1px';
+    frame.style.opacity = '0';
+    frame.src = url;
+    frame.onload = () => {
+      frame.contentWindow?.focus();
+      frame.contentWindow?.print();
+      window.setTimeout(() => { URL.revokeObjectURL(url); frame.remove(); }, 60000);
+    };
+    document.body.appendChild(frame);
+  });
 }
 
 async function batchDownload(rows) {
@@ -3606,8 +4161,19 @@ async function openVersionDialog(node) {
     versionDialog.logs = logs;
     versionDialog.file = null;
     versionDialog.description = '';
+    versionDialog.unlockAfterSave = true;
+    versionDialog.diffFromId = versions[1]?.id || '';
+    versionDialog.diffToId = versions[0]?.id || '';
+    versionDialog.diffRows = [];
     versionDialog.visible = true;
   });
+}
+
+async function compareVersions() {
+  if (!versionDialog.diffFromId || !versionDialog.diffToId || versionDialog.diffFromId === versionDialog.diffToId) return ElMessage.warning('请选择两个不同版本');
+  const data = await api(`/files/${versionDialog.node.id}/version-diff?fromVersionId=${encodeURIComponent(versionDialog.diffFromId)}&toVersionId=${encodeURIComponent(versionDialog.diffToId)}`, { headers: nodeUnlockHeaders() });
+  versionDialog.diffRows = data.rows;
+  ElMessage.success(`对比完成：新增 ${data.summary.added} 行，删除 ${data.summary.removed} 行`);
 }
 
 function onVersionFileChange(file) {
@@ -3622,7 +4188,7 @@ async function uploadVersion() {
   if (!versionDialog.file) return ElMessage.warning('请选择新版本文件');
   const form = new FormData();
   form.append('description', versionDialog.description || '上传更新');
-  form.append('unlock', 'true');
+  form.append('unlock', versionDialog.unlockAfterSave ? 'true' : 'false');
   form.append('file', versionDialog.file);
   loading.value = true;
   try {
@@ -3639,6 +4205,14 @@ async function rollbackVersion(row) {
   await ElMessageBox.confirm(`确定回滚到版本 ${row.versionNo} 吗？`, '版本回滚', { type: 'warning' });
   await api(`/files/${versionDialog.node.id}/versions/${row.id}/rollback`, { method: 'POST', headers: nodeUnlockHeaders() });
   ElMessage.success('已回滚');
+  await openVersionDialog(versionDialog.node);
+  await refreshCurrent();
+}
+
+async function deleteVersion(row) {
+  await ElMessageBox.confirm(`确定彻底删除历史版本 ${row.versionNo} 吗？此操作不可恢复。`, '删除历史版本', { type: 'warning' });
+  await api(`/files/${versionDialog.node.id}/versions/${row.id}`, { method: 'DELETE', headers: nodeUnlockHeaders() });
+  ElMessage.success('历史版本已删除');
   await openVersionDialog(versionDialog.node);
   await refreshCurrent();
 }
@@ -3927,7 +4501,7 @@ function defaultPermissionForm() {
     scope: 'all',
     priority: 100,
     inheritEnabled: true,
-    condition: { filenameContains: '', pathPrefix: '', extensions: '', businessStatus: '' }
+    condition: { filenameContains: '', pathPrefix: '', extensions: '', businessStatus: '', categoryIds: [], propertyId: '', propertyOperator: 'equals', propertyValue: '' }
   };
 }
 
@@ -3943,7 +4517,11 @@ function permissionTemplateToForm(template, current = permissionDialog.form) {
       filenameContains: template.condition?.filenameContains || '',
       pathPrefix: template.condition?.pathPrefix || '',
       extensions: Array.isArray(template.condition?.extensions) ? template.condition.extensions.join(',') : '',
-      businessStatus: template.condition?.businessStatus || ''
+      businessStatus: template.condition?.businessStatus || '',
+      categoryIds: [...(template.condition?.categoryIds || [])],
+      propertyId: template.condition?.propertyId || '',
+      propertyOperator: template.condition?.propertyOperator || 'equals',
+      propertyValue: template.condition?.propertyValue || ''
     }
   };
 }
@@ -3961,7 +4539,11 @@ function hydratePermissionForm(row) {
       filenameContains: row.condition?.filenameContains || '',
       pathPrefix: row.condition?.pathPrefix || '',
       extensions: Array.isArray(row.condition?.extensions) ? row.condition.extensions.join(',') : '',
-      businessStatus: row.condition?.businessStatus || ''
+      businessStatus: row.condition?.businessStatus || '',
+      categoryIds: [...(row.condition?.categoryIds || [])],
+      propertyId: row.condition?.propertyId || '',
+      propertyOperator: row.condition?.propertyOperator || 'equals',
+      propertyValue: row.condition?.propertyValue || ''
     }
   };
 }
@@ -3994,7 +4576,11 @@ function buildPermissionPayload() {
       filenameContains: form.condition.filenameContains,
       pathPrefix: form.condition.pathPrefix,
       extensions,
-      businessStatus: form.condition.businessStatus
+      businessStatus: form.condition.businessStatus,
+      categoryIds: form.condition.categoryIds,
+      propertyId: form.condition.propertyId,
+      propertyOperator: form.condition.propertyOperator,
+      propertyValue: form.condition.propertyValue
     }
   };
 }
@@ -4338,6 +4924,14 @@ async function testWecomSettings() {
   await loadWecomSettings();
 }
 
+async function syncWecomDirectory() {
+  const result = await api('/system-settings/wecom/sync', { method: 'POST' });
+  await Promise.all([loadWecomSettings(), loadOrg(), loadUsers()]);
+  const created = Number(result.departments?.created || 0) + Number(result.users?.created || 0);
+  const updated = Number(result.departments?.updated || 0) + Number(result.users?.updated || 0);
+  ElMessage.success(`同步完成：新增 ${created}，更新 ${updated}${result.users?.conflicts ? `，冲突 ${result.users.conflicts}` : ''}`);
+}
+
 async function openOfficePreviewDialog() {
   await loadOfficePreviewSettings();
   officePreviewDialog.form = {
@@ -4524,16 +5118,27 @@ function openShareDialog(node, type = 'share') {
   shareDialog.audienceType = 'role';
   shareDialog.audienceIds = flatRoles.value.length ? ['r_employee'] : [];
   shareDialog.days = 30;
-  shareDialog.form = { type, description: '', actions: ['visible', 'file:preview', 'file:download'] };
+  shareDialog.form = { type, description: '', actions: ['visible', 'file:preview', 'file:download'], allowPreview: true, allowDownload: false, password: '', maxAccessCount: 0 };
   shareDialog.visible = true;
 }
 
 async function createShare() {
+  const expiresAt = new Date(Date.now() + Number(shareDialog.days || 30) * 24 * 60 * 60 * 1000).toISOString();
+  if (shareDialog.form.type === 'external') {
+    const link = await api(`/nodes/${shareDialog.node.id}/external-links`, {
+      method: 'POST',
+      body: { ...shareDialog.form, expiresAt }
+    });
+    shareDialog.visible = false;
+    await copyExternalLink(link);
+    ElMessage.success('外链已创建并复制');
+    await loadCollaboration();
+    return;
+  }
   const audience = { all: shareDialog.audienceType === 'all', userIds: [], departmentIds: [], roleIds: [] };
   if (shareDialog.audienceType === 'user') audience.userIds = shareDialog.audienceIds;
   if (shareDialog.audienceType === 'department') audience.departmentIds = shareDialog.audienceIds;
   if (shareDialog.audienceType === 'role') audience.roleIds = shareDialog.audienceIds;
-  const expiresAt = new Date(Date.now() + Number(shareDialog.days || 30) * 24 * 60 * 60 * 1000).toISOString();
   await api(`/nodes/${shareDialog.node.id}/share`, {
     method: 'POST',
     body: { ...shareDialog.form, audience, expiresAt, includeChildren: true }
@@ -4542,6 +5147,57 @@ async function createShare() {
   ElMessage.success(shareDialog.form.type === 'publish' ? '发布成功' : '分享成功');
   await loadMessages();
   await loadCollaboration();
+}
+
+async function copyExternalLink(row) {
+  const url = new URL(row.publicUrl || `/?externalLink=${encodeURIComponent(row.token)}`, window.location.origin).toString();
+  await navigator.clipboard.writeText(url);
+  ElMessage.success('外链地址已复制');
+}
+
+async function revokeExternalLink(row) {
+  await ElMessageBox.confirm('撤销后外部人员将无法继续访问，确定撤销吗？', '撤销外链', { type: 'warning' });
+  await api(`/external-links/${row.id}/revoke`, { method: 'PATCH' });
+  ElMessage.success('外链已撤销');
+  await loadCollaboration();
+}
+
+async function loadExternalLinkFromUrl() {
+  const currentUrl = new URL(window.location.href);
+  const linkToken = currentUrl.searchParams.get('externalLink');
+  if (!linkToken) return false;
+  externalAccess.active = true;
+  externalAccess.token = linkToken;
+  externalAccess.metadata = await api(`/public/external-links/${encodeURIComponent(linkToken)}`, { silentError: true });
+  if (!externalAccess.metadata.hasPassword) await unlockExternalLink();
+  return true;
+}
+
+async function unlockExternalLink() {
+  loading.value = true;
+  try {
+    const data = await api(`/public/external-links/${encodeURIComponent(externalAccess.token)}/access`, {
+      method: 'POST', body: { password: externalAccess.password }
+    });
+    externalAccess.accessToken = data.accessToken;
+  } finally {
+    loading.value = false;
+  }
+}
+
+function previewExternalLink() {
+  const url = `/api/v1/public/external-links/${encodeURIComponent(externalAccess.token)}/content?accessToken=${encodeURIComponent(externalAccess.accessToken)}`;
+  window.open(url, '_blank', 'noopener');
+}
+
+function downloadExternalLink() {
+  const url = `/api/v1/public/external-links/${encodeURIComponent(externalAccess.token)}/download?accessToken=${encodeURIComponent(externalAccess.accessToken)}`;
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = externalAccess.metadata?.name || 'download';
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
 }
 
 async function subscribeNode(node) {
@@ -4591,6 +5247,7 @@ async function openLinkDialog(node) {
     linkDialog.tab = 'attachments';
     linkDialog.attachmentFile = null;
     linkDialog.attachmentDescription = '';
+    linkDialog.attachmentPurposeCode = '';
     linkDialog.relationKeyword = '';
     linkDialog.relationDescription = '';
     linkDialog.candidates = [];
@@ -4601,12 +5258,15 @@ async function openLinkDialog(node) {
 
 async function loadNodeLinks() {
   if (!linkDialog.node) return;
-  const [attachments, relations] = await Promise.all([
+  const [attachments, relations, purposes] = await Promise.all([
     api(`/nodes/${linkDialog.node.id}/attachments`, { headers: nodeUnlockHeaders() }),
-    api(`/nodes/${linkDialog.node.id}/relations`, { headers: nodeUnlockHeaders() })
+    api(`/nodes/${linkDialog.node.id}/relations`, { headers: nodeUnlockHeaders() }),
+    api('/attachment-purposes')
   ]);
   linkDialog.attachments = attachments;
   linkDialog.relations = relations;
+  linkDialog.attachmentPurposes = purposes;
+  if (!linkDialog.attachmentPurposeCode) linkDialog.attachmentPurposeCode = purposes[0]?.code || '';
 }
 
 function onAttachmentFileChange(file) {
@@ -4621,12 +5281,14 @@ async function uploadAttachment() {
   if (!linkDialog.attachmentFile) return ElMessage.warning('请选择附件文件');
   const form = new FormData();
   form.append('description', linkDialog.attachmentDescription || '');
+  form.append('purposeCode', linkDialog.attachmentPurposeCode || '');
   form.append('file', linkDialog.attachmentFile);
   loading.value = true;
   try {
     await api(`/nodes/${linkDialog.node.id}/attachments`, { method: 'POST', headers: nodeUnlockHeaders(), body: form });
     linkDialog.attachmentFile = null;
     linkDialog.attachmentDescription = '';
+    linkDialog.attachmentPurposeCode = linkDialog.attachmentPurposes[0]?.code || '';
     ElMessage.success('附件已上传');
     await loadNodeLinks();
   } finally {
@@ -4705,13 +5367,32 @@ async function openMetadataDialog(node) {
     metadataDialog.categoryIds = meta.categories || [];
     metadataDialog.businessStatus = node.businessStatus || 'effective';
     metadataDialog.values = {};
+    metadataDialog.propertyEntries = meta.values || [];
     (meta.values || []).forEach((item) => {
-      metadataDialog.values[item.definition.id] = item.value || '';
+      metadataDialog.values[item.key] = item.value || '';
     });
     metadataDialog.comments = comments;
     metadataDialog.comment = '';
     metadataDialog.score = 5;
     metadataDialog.visible = true;
+  });
+}
+
+function refreshMetadataPropertyEntries() {
+  const entries = [];
+  propertyDefinitions.value.forEach((definition) => {
+    const bound = definition.categoryIds || [];
+    if (!bound.length) {
+      entries.push({ key: definition.id, definition, categoryId: null, categoryName: '' });
+      return;
+    }
+    metadataDialog.categoryIds.filter((id) => bound.includes(id)).forEach((categoryId) => {
+      entries.push({ key: `${categoryId}:${definition.id}`, definition, categoryId, categoryName: flatCategories.value.find((item) => item.id === categoryId)?.name || categoryId });
+    });
+  });
+  metadataDialog.propertyEntries = entries;
+  entries.forEach((item) => {
+    if (metadataDialog.values[item.key] === undefined) metadataDialog.values[item.key] = '';
   });
 }
 
@@ -4769,9 +5450,10 @@ function openPropertyDialog(row = null) {
       targetType: row.targetType || 'file',
       dataType: row.dataType || 'string',
       required: Boolean(row.required),
-      optionsText: (row.options || []).join('\n')
+      optionsText: (row.options || []).join('\n'),
+      categoryIds: [...(row.categoryIds || [])]
     }
-    : { name: '', targetType: 'file', dataType: 'string', required: false, optionsText: '' };
+    : { name: '', targetType: 'file', dataType: 'string', required: false, optionsText: '', categoryIds: [] };
   propertyDialog.visible = true;
 }
 
@@ -4781,6 +5463,7 @@ function propertyPayload() {
     targetType: propertyDialog.form.targetType || 'file',
     dataType: propertyDialog.form.dataType || 'string',
     required: Boolean(propertyDialog.form.required),
+    categoryIds: propertyDialog.form.categoryIds || [],
     options: String(propertyDialog.form.optionsText || '').split(/[,\n，]+/).map((item) => item.trim()).filter(Boolean)
   };
 }
@@ -4814,6 +5497,19 @@ async function destroyTrash(row) {
   await api(`/trash/${row.id}`, { method: 'DELETE' });
   ElMessage.success('已彻底删除');
   await loadTrash();
+}
+
+async function restoreDriveTrash(row) {
+  await api(`/trash/${row.id}/restore`, { method: 'POST' });
+  ElMessage.success('已恢复到个人网盘');
+  await loadPersonalDrive();
+}
+
+async function destroyDriveTrash(row) {
+  await ElMessageBox.confirm(`彻底删除“${row.name}”后不可恢复，确定继续吗？`, '彻底删除', { type: 'warning' });
+  await api(`/trash/${row.id}`, { method: 'DELETE' });
+  ElMessage.success('已彻底删除');
+  await loadPersonalDrive();
 }
 
 function openUserDialog(row = null) {
@@ -4858,7 +5554,7 @@ async function saveDepartment() {
 }
 
 async function deleteDepartment(row) {
-  await ElMessageBox.confirm(`确定删除部门“${row.name}”吗？下级部门会平移到上级。`, '删除部门', { type: 'warning' });
+  await ElMessageBox.confirm(`确定删除部门“${row.name}”吗？请先确保没有用户和权限规则引用该部门；下级部门会平移到上级。`, '删除部门', { type: 'warning' });
   await api(`/departments/${row.id}`, { method: 'DELETE' });
   ElMessage.success('部门已删除');
   await loadOrg();
@@ -4884,7 +5580,7 @@ async function saveRole() {
 }
 
 async function deleteRole(row) {
-  await ElMessageBox.confirm(`确定删除角色“${row.name}”吗？下级角色会平移到上级。`, '删除角色', { type: 'warning' });
+  await ElMessageBox.confirm(`确定删除角色“${row.name}”吗？请先确保没有用户和权限规则引用该角色；下级角色会平移到上级。`, '删除角色', { type: 'warning' });
   await api(`/roles/${row.id}`, { method: 'DELETE' });
   ElMessage.success('角色已删除');
   await loadOrg();
@@ -4893,6 +5589,27 @@ async function deleteRole(row) {
 
 async function readMessage(row) {
   await api(`/messages/${row.id}/read`, { method: 'POST' });
+  await loadMessages();
+}
+
+async function unreadMessage(row) {
+  await api(`/messages/${row.id}/unread`, { method: 'POST' });
+  await loadMessages();
+}
+
+async function archiveMessage(row, archived) {
+  await api(`/messages/${row.id}/archive`, { method: 'PATCH', body: { archived } });
+  await loadMessages();
+}
+
+async function deleteMessage(row) {
+  await ElMessageBox.confirm(`确定删除消息“${row.title}”吗？`, '删除消息', { type: 'warning' });
+  await api(`/messages/${row.id}`, { method: 'DELETE' });
+  await loadMessages();
+}
+
+async function filterArchivedMessages(value) {
+  messagesArchivedOnly.value = Boolean(value);
   await loadMessages();
 }
 
@@ -4945,7 +5662,14 @@ async function changePassword() {
 }
 
 async function exportAuditLogs() {
-  await downloadFile('/audit-logs/export', '审计日志.csv', {});
+  const body = {
+    actorId: auditFilters.actorId || '',
+    action: auditFilters.action || '',
+    targetPath: auditFilters.targetPath || '',
+    startAt: auditFilters.range?.[0] ? new Date(auditFilters.range[0]).toISOString() : '',
+    endAt: auditFilters.range?.[1] ? new Date(auditFilters.range[1]).toISOString() : ''
+  };
+  await downloadFile('/audit-logs/export', '审计日志.csv', body);
   ElMessage.success('审计日志已导出');
 }
 
@@ -4961,19 +5685,21 @@ function openAnnouncementDialog(row = null) {
   const audience = row?.audience || { all: true };
   announcementDialog.audienceType = audience.all ? 'all' : audience.userIds?.length ? 'user' : audience.departmentIds?.length ? 'department' : 'role';
   announcementDialog.audienceIds = audience.userIds?.length ? [...audience.userIds] : audience.departmentIds?.length ? [...audience.departmentIds] : [...(audience.roleIds || [])];
-  announcementDialog.file = null;
+  announcementDialog.files = [];
+  announcementDialog.existingAttachments = [...(row?.attachments || [])];
+  announcementDialog.removeAttachmentIds = [];
   announcementDialog.form = row?.id
     ? { id: row.id, title: row.title, content: row.content, status: row.status, expiresAt: row.expiresAt ? new Date(row.expiresAt) : null }
     : { title: '', content: '', status: 'published', expiresAt: null };
   announcementDialog.visible = true;
 }
 
-function onAnnouncementFileChange(file) {
-  announcementDialog.file = file.raw;
+function onAnnouncementFileChange(_file, files) {
+  announcementDialog.files = files.map((item) => item.raw).filter(Boolean);
 }
 
-function onAnnouncementFileRemove() {
-  announcementDialog.file = null;
+function onAnnouncementFileRemove(_file, files) {
+  announcementDialog.files = files.map((item) => item.raw).filter(Boolean);
 }
 
 async function saveAnnouncement() {
@@ -4985,7 +5711,8 @@ async function saveAnnouncement() {
   form.append('status', announcementDialog.form.status || 'published');
   form.append('audience', JSON.stringify(dialogAudience(announcementDialog.audienceType, announcementDialog.audienceIds)));
   if (announcementDialog.form.expiresAt) form.append('expiresAt', new Date(announcementDialog.form.expiresAt).toISOString());
-  if (announcementDialog.file) form.append('file', announcementDialog.file);
+  announcementDialog.files.forEach((file) => form.append('files', file));
+  form.append('removeAttachmentIds', JSON.stringify(announcementDialog.removeAttachmentIds));
   loading.value = true;
   try {
     if (announcementDialog.form.id) {
@@ -5021,8 +5748,10 @@ async function deleteAnnouncement(row) {
   await loadAnnouncements();
 }
 
-async function downloadAnnouncementAttachment(row) {
-  await downloadFile(`/announcements/${row.id}/attachment`, row.attachment?.originalFilename || `${row.title}.附件`);
+async function downloadAnnouncementAttachment(row, attachment = null) {
+  const item = attachment || row.attachment;
+  const endpoint = item?.id ? `/announcements/${row.id}/attachments/${item.id}` : `/announcements/${row.id}/attachment`;
+  await downloadFile(endpoint, item?.originalFilename || `${row.title}.附件`);
 }
 
 function openCredentialDialog(row = null) {
@@ -5067,6 +5796,40 @@ async function saveCredential() {
   }
 }
 
+function openWebhookDialog(row = null) {
+  webhookDialog.form = row?.id
+    ? { id: row.id, name: row.name, url: row.url, eventPatternsText: (row.eventPatterns || ['*']).join(','), enabled: row.status === 'enabled' }
+    : { id: '', name: '', url: '', eventPatternsText: '*', enabled: true };
+  webhookDialog.visible = true;
+}
+
+async function saveWebhook() {
+  const body = {
+    name: webhookDialog.form.name,
+    url: webhookDialog.form.url,
+    eventPatterns: String(webhookDialog.form.eventPatternsText || '*').split(/[,\s，]+/).map((item) => item.trim()).filter(Boolean),
+    status: webhookDialog.form.enabled ? 'enabled' : 'disabled'
+  };
+  const result = webhookDialog.form.id
+    ? await api(`/webhooks/${webhookDialog.form.id}`, { method: 'PUT', body })
+    : await api('/webhooks', { method: 'POST', body });
+  webhookDialog.visible = false;
+  if (result.secret) await ElMessageBox.alert(`签名 Secret：${result.secret}`, '请立即保存 Webhook Secret', { confirmButtonText: '已保存' });
+  await loadApiManagement();
+}
+
+async function disableWebhook(row) {
+  await api(`/webhooks/${row.id}`, { method: 'DELETE' });
+  ElMessage.success('Webhook 已停用');
+  await loadApiManagement();
+}
+
+async function retryWebhook(row) {
+  await api(`/webhook-deliveries/${row.id}/retry`, { method: 'POST', body: {} });
+  ElMessage.success('Webhook 已重试');
+  await loadApiManagement();
+}
+
 async function rotateCredentialSecret(row) {
   const data = await api(`/api-credentials/${row.id}/rotate-secret`, { method: 'POST', body: {} });
   await showCredentialSecret(data);
@@ -5083,7 +5846,10 @@ async function disableCredential(row) {
 function openFilePolicyDialog() {
   filePolicyDialog.form = {
     allowedExtensionsText: (filePolicy.value.allowedExtensions || []).join(','),
-    maxSizeMb: filePolicy.value.maxSizeMb || 300
+    maxSizeMb: filePolicy.value.maxSizeMb || 2048,
+    chunkSizeMb: filePolicy.value.chunkSizeMb || 8,
+    enableVirusScan: Boolean(filePolicy.value.enableVirusScan),
+    rejectExecutableFiles: filePolicy.value.rejectExecutableFiles !== false
   };
   filePolicyDialog.visible = true;
 }
@@ -5091,7 +5857,10 @@ function openFilePolicyDialog() {
 async function saveFilePolicy() {
   const body = {
     allowedExtensions: String(filePolicyDialog.form.allowedExtensionsText || '').split(/[,\s，]+/).map((item) => item.replace(/^\./, '').trim().toLowerCase()).filter(Boolean),
-    maxSizeMb: filePolicyDialog.form.maxSizeMb || 300
+    maxSizeMb: filePolicyDialog.form.maxSizeMb || 2048,
+    chunkSizeMb: filePolicyDialog.form.chunkSizeMb || 8,
+    enableVirusScan: Boolean(filePolicyDialog.form.enableVirusScan),
+    rejectExecutableFiles: filePolicyDialog.form.rejectExecutableFiles !== false
   };
   filePolicy.value = await api('/system-settings/file-policy', { method: 'PUT', body });
   filePolicyDialog.visible = false;
@@ -5126,7 +5895,12 @@ onBeforeUnmount(() => {
 });
 
 onMounted(async () => {
+  if (await loadExternalLinkFromUrl()) return;
   await loadCaptcha();
+  await loadWecomLoginConfig();
+  await loadIdentityLoginProviders();
+  if (await consumeOidcLoginFromUrl()) return;
+  if (await consumeWecomLoginFromUrl()) return;
   if (await consumeSsoTicketFromUrl()) return;
   if (token.value) {
     try {

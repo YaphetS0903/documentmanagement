@@ -4,6 +4,7 @@ import http from 'node:http';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import AdmZip from 'adm-zip';
+import { PDFDocument } from 'pdf-lib';
 
 const testPort = '3100';
 const officeTestPort = '3180';
@@ -49,8 +50,22 @@ async function loginPayload(username, password) {
 
 await fs.rm(testRuntimeRoot, { recursive: true, force: true });
 let failWecomSend = false;
+const receivedWebhooks = [];
+const convertedPdfDocument = await PDFDocument.create();
+convertedPdfDocument.addPage([595, 842]);
+const convertedPdfBytes = Buffer.from(await convertedPdfDocument.save());
 
 const officeServer = http.createServer((req, res) => {
+  if (req.url === '/webhook-smoke' && req.method === 'POST') {
+    const chunks = [];
+    req.on('data', (chunk) => chunks.push(chunk));
+    req.on('end', () => {
+      receivedWebhooks.push({ headers: req.headers, body: JSON.parse(Buffer.concat(chunks).toString('utf8')) });
+      res.writeHead(204);
+      res.end();
+    });
+    return;
+  }
   if (req.url?.startsWith('/cgi-bin/gettoken')) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ errcode: 0, errmsg: 'ok', access_token: 'wecom-smoke-token', expires_in: 7200 }));
@@ -59,6 +74,36 @@ const officeServer = http.createServer((req, res) => {
   if (req.url?.startsWith('/cgi-bin/message/send')) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(failWecomSend ? { errcode: 40014, errmsg: 'invalid access_token smoke' } : { errcode: 0, errmsg: 'ok', msgid: 'wecom-smoke-message' }));
+    return;
+  }
+  if (req.url?.startsWith('/cgi-bin/department/list')) {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ errcode: 0, errmsg: 'ok', department: [
+      { id: 1, name: '企业微信总部', parentid: 0, order: 1 },
+      { id: 2, name: '企业微信研发部', parentid: 1, order: 10 }
+    ] }));
+    return;
+  }
+  if (req.url?.startsWith('/cgi-bin/user/list')) {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ errcode: 0, errmsg: 'ok', userlist: [
+      { userid: 'wecom-smoke-user', name: '企业微信测试用户', department: [2], mobile: '13800000000', email: 'wecom@example.test', enable: 1 }
+    ] }));
+    return;
+  }
+  if (req.url?.startsWith('/cgi-bin/auth/getuserinfo')) {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ errcode: 0, errmsg: 'ok', UserId: 'wecom-smoke-user' }));
+    return;
+  }
+  if (req.url?.startsWith('/ConvertService.ashx')) {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ endConvert: true, fileUrl: `http://127.0.0.1:${officeTestPort}/cache/files/converted-smoke.pdf` }));
+    return;
+  }
+  if (req.url?.startsWith('/cache/files/converted-smoke.pdf')) {
+    res.writeHead(200, { 'Content-Type': 'application/pdf', 'Content-Length': convertedPdfBytes.length });
+    res.end(convertedPdfBytes);
     return;
   }
   if (req.url === '/edited.pptx' || req.url?.startsWith('/cache/files/')) {
@@ -108,6 +153,52 @@ try {
   });
   const token = login.data.token;
   assert.ok(token);
+  const webhook = await request(`${base}/webhooks`, {
+    method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: '冒烟 Webhook', url: `http://127.0.0.1:${officeTestPort}/webhook-smoke`, eventPatterns: ['profile.*'] })
+  });
+  assert.ok(webhook.data.secret);
+  assert.equal(webhook.data.hasSecret, true);
+  const profile = await request(`${base}/profile`, { headers: { Authorization: `Bearer ${token}` } });
+  assert.equal(profile.data.username, 'admin');
+  const updatedProfile = await request(`${base}/profile`, {
+    method: 'PUT', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ displayName: '系统管理员', email: 'admin@example.test', phone: '029-12345678', defaultWorkPathId: 'n_root' })
+  });
+  assert.equal(updatedProfile.data.defaultWorkPathId, 'n_root');
+  for (let index = 0; index < 20 && !receivedWebhooks.length; index += 1) await wait(25);
+  assert.ok(receivedWebhooks.some((item) => item.body.type === 'profile.update'));
+  assert.match(receivedWebhooks[0].headers['x-document-signature'] || '', /^sha256=/);
+  const webhookDeliveries = await request(`${base}/webhook-deliveries?pageSize=20`, { headers: { Authorization: `Bearer ${token}` } });
+  assert.ok(webhookDeliveries.data.items.some((item) => item.subscriptionId === webhook.data.id && item.status === 'delivered'));
+  const avatarForm = new FormData();
+  avatarForm.append('avatar', new Blob([Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64')], { type: 'image/png' }), 'avatar.png');
+  const avatarProfile = await request(`${base}/profile/avatar`, { method: 'POST', headers: { Authorization: `Bearer ${token}` }, body: avatarForm });
+  assert.match(avatarProfile.data.avatarUrl, /\/api\/v1\/public\/avatars\/u_admin/);
+  const avatarResponse = await fetch(`http://localhost:${testPort}${avatarProfile.data.avatarUrl}`);
+  assert.equal(avatarResponse.status, 200);
+  assert.equal(avatarResponse.headers.get('content-type'), 'image/png');
+  const identitySettings = await request(`${base}/system-settings/identity`, {
+    method: 'PUT', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      oidc: { enabled: false, issuer: 'https://id.example.test', clientId: 'doc-platform', clientSecret: 'oidc-smoke-secret', redirectUri: 'http://localhost/oidc/callback', autoProvision: true },
+      saml: { enabled: false, entryPoint: 'https://id.example.test/saml', callbackUrl: 'http://localhost/saml/callback', idpCert: 'saml-smoke-cert' },
+      ldap: { enabled: false, url: 'ldap://ldap.example.test', bindDn: 'cn=admin,dc=example,dc=test', bindPassword: 'ldap-smoke-secret', baseDn: 'dc=example,dc=test' },
+      hr: { enabled: true, syncSecret: 'hr-smoke-secret', autoDisableMissing: false }
+    })
+  });
+  assert.equal(identitySettings.data.oidc.hasClientSecret, true);
+  assert.equal(identitySettings.data.oidc.clientSecret, undefined);
+  assert.equal(identitySettings.data.saml.hasIdpCert, true);
+  assert.equal(identitySettings.data.ldap.hasBindPassword, true);
+  assert.equal(identitySettings.data.hr.hasSyncSecret, true);
+  const hrSync = await request(`${base}/hr/sync`, {
+    method: 'POST', headers: { 'X-HR-Sync-Secret': 'hr-smoke-secret', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ departments: [{ id: 'hr-dep-1', name: 'HR 同步部门' }], users: [{ id: 'hr-user-1', username: 'hr-smoke-user', displayName: 'HR 同步用户', departmentId: 'hr-dep-1' }] })
+  });
+  assert.equal(hrSync.data.users, 1);
+  const hrUsers = await request(`${base}/users?pageSize=300`, { headers: { Authorization: `Bearer ${token}` } });
+  assert.ok(hrUsers.data.items.some((item) => item.username === 'hr-smoke-user' && item.sourceType === 'hr'));
 
   await request(`${base}/auth/change-password`, {
     method: 'POST',
@@ -170,6 +261,24 @@ try {
   assert.ok(openapi.paths['/nodes/{id}/approvals']);
   assert.ok(openapi.paths['/approvals/{id}/approve']);
   assert.ok(openapi.paths['/approvals/{id}']);
+  assert.ok(openapi.paths['/files/office']);
+  assert.ok(openapi.paths['/files/{id}/export-pdf']);
+  assert.ok(openapi.paths['/files/{id}/print']);
+  assert.ok(openapi.paths['/profile']);
+  assert.ok(openapi.paths['/profile/avatar']);
+  assert.ok(openapi.paths['/webhooks']);
+  assert.ok(openapi.paths['/webhook-deliveries']);
+  assert.ok(openapi.components.schemas.Node);
+  assert.ok(openapi.components.schemas.WebhookEvent.example);
+  assert.equal(openapi['x-generated-from-express-routes'], true);
+  assert.ok(openapi.paths['/messages/{id}/unread']);
+  assert.ok(openapi.paths['/auth/oidc/url']);
+  assert.ok(openapi.paths['/auth/saml/url']);
+  assert.ok(openapi.paths['/hr/sync']);
+  assert.ok(openapi.paths['/uploads/chunked/init']);
+  assert.ok(openapi.paths['/system-settings/file-storage']);
+  assert.ok(openapi.paths['/system/storage/lifecycle/run']);
+  assert.ok(openapi.paths['/files/{id}/versions/{versionId}']);
   assert.ok(openapi.paths['/files/{id}/version-logs']);
   assert.ok(openapi.paths['/nodes/{id}/view-access']);
   assert.ok(openapi.paths['/nodes/{id}/password']);
@@ -202,6 +311,7 @@ try {
   assert.ok(openapi.paths['/audit-logs/report']);
   assert.ok(openapi.paths['/system/runtime-status']);
   assert.ok(openapi.paths['/sso/tickets']);
+  assert.ok(openapi.paths['/sso/tickets/{id}/user']);
 
   const ssoTicket = await request(`${base}/sso/tickets`, {
     method: 'POST',
@@ -210,6 +320,11 @@ try {
   });
   assert.ok(ssoTicket.data.loginUrl.includes(ssoTicket.data.id));
   assert.ok(ssoTicket.data.frontendLoginUrl.includes(ssoTicket.data.id));
+  const ssoTicketUser = await request(`${base}/sso/tickets/${ssoTicket.data.id}/user`, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  assert.equal(ssoTicketUser.data.user.username, 'demo');
+  assert.equal(ssoTicketUser.data.consumedAt, null);
   const ssoLogin = await request(`${base}/sso/consume?ticket=${encodeURIComponent(ssoTicket.data.id)}`);
   assert.equal(ssoLogin.data.user.username, 'demo');
   const consumedAgain = await requestRaw(`${base}/sso/consume?ticket=${encodeURIComponent(ssoTicket.data.id)}`);
@@ -218,6 +333,16 @@ try {
   const originalFilePolicy = await request(`${base}/system-settings/file-policy`, {
     headers: { Authorization: `Bearer ${token}` }
   });
+  const fileStorageSettings = await request(`${base}/system-settings/file-storage`, {
+    method: 'PUT', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ provider: 'local', s3: { endpoint: 'https://s3.example.test', bucket: 'smoke', accessKeyId: 's3-smoke-access', secretAccessKey: 's3-smoke-secret' }, quota: { totalGb: 1, defaultUserGb: 1 }, lifecycle: { uploadSessionDays: 7, quarantineDays: 30, historicalVersionDays: 0, keepLatestVersions: 3 } })
+  });
+  assert.equal(fileStorageSettings.data.provider, 'local');
+  assert.equal(fileStorageSettings.data.quota.totalGb, 1);
+  const storageUsageResult = await request(`${base}/storage/usage`, { headers: { Authorization: `Bearer ${token}` } });
+  assert.equal(storageUsageResult.data.provider, 'local');
+  const storageLifecycle = await request(`${base}/system/storage/lifecycle/run`, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: '{}' });
+  assert.ok(Number.isInteger(storageLifecycle.data.expiredSessions));
   const updatedFilePolicy = await request(`${base}/system-settings/file-policy`, {
     method: 'PUT',
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
@@ -234,6 +359,17 @@ try {
   });
   assert.equal(blockedUpload.res.status, 400);
   assert.match(blockedUpload.body.message, /不允许上传/);
+  const executablePolicy = await request(`${base}/system-settings/file-policy`, {
+    method: 'PUT', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ allowedExtensions: ['txt', 'exe'], maxSizeMb: 10, chunkSizeMb: 1, enableVirusScan: false, rejectExecutableFiles: true })
+  });
+  assert.equal(executablePolicy.data.chunkSizeMb, 1);
+  const eicarForm = new FormData();
+  eicarForm.append('parentId', 'n_root');
+  eicarForm.append('file', new Blob([Buffer.from('X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*')]), 'eicar.txt');
+  const eicarUpload = await requestRaw(`${base}/files`, { method: 'POST', headers: { Authorization: `Bearer ${token}` }, body: eicarForm });
+  assert.equal(eicarUpload.res.status, 400);
+  assert.equal(eicarUpload.body.code, 'FILE_QUARANTINED');
   await request(`${base}/system-settings/file-policy`, {
     method: 'PUT',
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
@@ -308,6 +444,20 @@ try {
   assert.equal(personalSummary.data.files, 1);
   assert.equal(personalSummary.data.versions, 1);
   assert.ok(personalSummary.data.sizeBytes > 0);
+  const personalLogs = await request(`${base}/personal-drive/logs?pageSize=20`, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  assert.ok(personalLogs.data.items.some((item) => item.targetId === personalUpload.data.id && item.action === 'file.upload'));
+  await request(`${base}/nodes/${personalUpload.data.id}`, { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } });
+  const personalTrash = await request(`${base}/personal-drive/trash?pageSize=20`, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  assert.ok(personalTrash.data.items.some((item) => item.id === personalUpload.data.id));
+  await request(`${base}/trash/${personalUpload.data.id}/restore`, { method: 'POST', headers: { Authorization: `Bearer ${token}` } });
+  const restoredPersonalTrash = await request(`${base}/personal-drive/trash?pageSize=20`, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  assert.equal(restoredPersonalTrash.data.items.some((item) => item.id === personalUpload.data.id), false);
   const demoLoginForPrivateDrive = await request(`${base}/auth/login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -317,6 +467,10 @@ try {
     headers: { Authorization: `Bearer ${demoLoginForPrivateDrive.data.token}` }
   });
   assert.equal(demoExternalSettings.res.status, 403);
+  const demoPersonalLogs = await request(`${base}/personal-drive/logs?pageSize=100`, {
+    headers: { Authorization: `Bearer ${demoLoginForPrivateDrive.data.token}` }
+  });
+  assert.equal(demoPersonalLogs.data.items.some((item) => item.targetId === personalUpload.data.id), false);
   const demoSyncSummary = await request(`${base}/external-library/sync`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${demoLoginForPrivateDrive.data.token}`, 'Content-Type': 'application/json' },
@@ -347,6 +501,16 @@ try {
     body: JSON.stringify({ name: '冒烟子部门更新', parentId: null, status: 'disabled' })
   });
   assert.equal(updatedDepartment.data.status, 'disabled');
+  const departmentUser = await request(`${base}/users`, {
+    method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username: 'department-reference-user', displayName: '部门引用用户', password: 'User1234', departmentIds: [department.data.id], roleIds: ['r_employee'] })
+  });
+  const referencedDepartmentDelete = await requestRaw(`${base}/departments/${department.data.id}`, { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } });
+  assert.equal(referencedDepartmentDelete.res.status, 409);
+  assert.equal(referencedDepartmentDelete.body.code, 'REFERENCE_CONFLICT');
+  await request(`${base}/users/${departmentUser.data.id}`, {
+    method: 'PUT', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ departmentIds: [] })
+  });
   await request(`${base}/departments/${department.data.id}`, {
     method: 'DELETE',
     headers: { Authorization: `Bearer ${token}` }
@@ -368,6 +532,15 @@ try {
     body: JSON.stringify({ name: '冒烟子角色更新', parentId: null, status: 'disabled', description: 'updated' })
   });
   assert.equal(updatedRole.data.status, 'disabled');
+  await request(`${base}/users/${departmentUser.data.id}`, {
+    method: 'PUT', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ roleIds: [role.data.id] })
+  });
+  const referencedRoleDelete = await requestRaw(`${base}/roles/${role.data.id}`, { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } });
+  assert.equal(referencedRoleDelete.res.status, 409);
+  assert.equal(referencedRoleDelete.body.code, 'REFERENCE_CONFLICT');
+  await request(`${base}/users/${departmentUser.data.id}`, {
+    method: 'PUT', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ roleIds: ['r_employee'] })
+  });
   await request(`${base}/roles/${role.data.id}`, {
     method: 'DELETE',
     headers: { Authorization: `Bearer ${token}` }
@@ -384,9 +557,50 @@ try {
     headers: { Authorization: `Bearer ${token}` },
     body: form
   });
+  const unlockForm = new FormData();
+  unlockForm.append('parentId', 'n_root');
+  unlockForm.append('file', new Blob([Buffer.from('unlock version one')]), 'unlock-version-smoke.txt');
+  const unlockUpload = await request(`${base}/files`, { method: 'POST', headers: { Authorization: `Bearer ${token}` }, body: unlockForm });
+  await request(`${base}/files/${unlockUpload.data.id}/lock`, { method: 'POST', headers: { Authorization: `Bearer ${token}` } });
+  const keepLockForm = new FormData();
+  keepLockForm.append('unlock', 'false');
+  keepLockForm.append('file', new Blob([Buffer.from('unlock version two')]), 'unlock-version-smoke.txt');
+  await request(`${base}/files/${unlockUpload.data.id}/versions`, { method: 'POST', headers: { Authorization: `Bearer ${token}` }, body: keepLockForm });
+  const stillLocked = await request(`${base}/nodes/${unlockUpload.data.id}`, { headers: { Authorization: `Bearer ${token}` } });
+  assert.equal(stillLocked.data.lockedBy, 'u_admin');
+  const releaseLockForm = new FormData();
+  releaseLockForm.append('unlock', 'true');
+  releaseLockForm.append('file', new Blob([Buffer.from('unlock version three')]), 'unlock-version-smoke.txt');
+  await request(`${base}/files/${unlockUpload.data.id}/versions`, { method: 'POST', headers: { Authorization: `Bearer ${token}` }, body: releaseLockForm });
+  const unlockedAfterUpdate = await request(`${base}/nodes/${unlockUpload.data.id}`, { headers: { Authorization: `Bearer ${token}` } });
+  assert.equal(unlockedAfterUpdate.data.lockedBy, null);
   assert.equal(upload.data.name, 'smoke.txt');
   assert.equal(upload.data.hasUnread, true);
   assert.equal(upload.data.unreadCount, 1);
+
+  const chunkedBytes = Buffer.from('chunked upload smoke content split into several pieces');
+  const chunkSize = 12;
+  const chunkedInit = await request(`${base}/uploads/chunked/init`, {
+    method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ parentId: 'n_root', filename: 'chunked-smoke.txt', sizeBytes: chunkedBytes.length, totalChunks: Math.ceil(chunkedBytes.length / chunkSize), description: 'chunked smoke' })
+  });
+  for (let index = 0; index < chunkedInit.data.totalChunks; index += 1) {
+    const chunkForm = new FormData();
+    chunkForm.append('chunk', new Blob([chunkedBytes.subarray(index * chunkSize, Math.min((index + 1) * chunkSize, chunkedBytes.length))]), `part-${index}`);
+    await request(`${base}/uploads/chunked/${chunkedInit.data.id}/chunks/${index}`, { method: 'PUT', headers: { Authorization: `Bearer ${token}` }, body: chunkForm });
+  }
+  const chunkedStatus = await request(`${base}/uploads/chunked/${chunkedInit.data.id}`, { headers: { Authorization: `Bearer ${token}` } });
+  assert.equal(chunkedStatus.data.uploadedChunks.length, chunkedInit.data.totalChunks);
+  const chunkedComplete = await request(`${base}/uploads/chunked/${chunkedInit.data.id}/complete`, {
+    method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: '{}'
+  });
+  assert.equal(chunkedComplete.data.name, 'chunked-smoke.txt');
+  const idempotentChunkedComplete = await request(`${base}/uploads/chunked/${chunkedInit.data.id}/complete`, {
+    method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: '{}'
+  });
+  assert.equal(idempotentChunkedComplete.data.id, chunkedComplete.data.id);
+  const chunkedDownload = await requestRaw(`${base}/files/${chunkedComplete.data.id}/download`, { headers: { Authorization: `Bearer ${token}` } });
+  assert.equal(chunkedDownload.text, chunkedBytes.toString());
 
   const initialQuality = await request(`${base}/nodes/${upload.data.id}/quality`, {
     headers: { Authorization: `Bearer ${token}` }
@@ -571,6 +785,75 @@ try {
   assert.equal(proxiedOfficeScript.status, 200);
   assert.match(await proxiedOfficeScript.text(), /web-apps\/apps\/api\/documents\/api\.js/);
 
+  const createdOfficeNodes = [];
+  for (const officeCase of [
+    { officeType: 'docx', filename: '在线新建测试.docx', documentType: 'word', requiredEntry: 'word/document.xml' },
+    { officeType: 'xlsx', filename: '在线新建测试.xlsx', documentType: 'cell', requiredEntry: 'xl/workbook.xml' },
+    { officeType: 'pptx', filename: '在线新建测试.pptx', documentType: 'slide', requiredEntry: 'ppt/presentation.xml' }
+  ]) {
+    const created = await request(`${base}/files/office`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ parentId: 'n_root', officeType: officeCase.officeType, name: officeCase.filename, description: '在线新建 smoke' })
+    });
+    assert.equal(created.data.extension, officeCase.officeType);
+    assert.equal(created.data.currentVersion.versionNo, 1);
+    assert.equal(created.data.businessStatus, 'draft');
+    const download = await fetch(`${base}/files/${created.data.id}/download`, { headers: { Authorization: `Bearer ${token}` } });
+    assert.equal(download.status, 200);
+    const officeBuffer = Buffer.from(await download.arrayBuffer());
+    const officeZip = new AdmZip(officeBuffer);
+    assert.ok(officeZip.getEntry(officeCase.requiredEntry));
+    const edit = await request(`${base}/files/${created.data.id}/office-edit-session`, {
+      method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: '{}'
+    });
+    assert.equal(edit.data.editor.config.documentType, officeCase.documentType);
+    await requestRaw(edit.data.editor.config.editorConfig.callbackUrl, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status: 4 })
+    });
+    createdOfficeNodes.push({ ...officeCase, node: created.data, buffer: officeBuffer });
+  }
+  const duplicateOfficeCreate = await requestRaw(`${base}/files/office`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ parentId: 'n_root', officeType: 'docx', name: '在线新建测试.docx' })
+  });
+  assert.equal(duplicateOfficeCreate.res.status, 409);
+
+  const versionDeleteNode = createdOfficeNodes[0];
+  const officeUpdateForm = new FormData();
+  officeUpdateForm.append('description', '在线新建第二版');
+  officeUpdateForm.append('file', new Blob([versionDeleteNode.buffer]), versionDeleteNode.filename);
+  await request(`${base}/files/${versionDeleteNode.node.id}/versions`, {
+    method: 'POST', headers: { Authorization: `Bearer ${token}` }, body: officeUpdateForm
+  });
+  const versionsBeforeDelete = await request(`${base}/files/${versionDeleteNode.node.id}/versions`, { headers: { Authorization: `Bearer ${token}` } });
+  assert.equal(versionsBeforeDelete.data.length, 2);
+  const currentVersionDelete = await requestRaw(`${base}/files/${versionDeleteNode.node.id}/versions/${versionsBeforeDelete.data[0].id}`, {
+    method: 'DELETE', headers: { Authorization: `Bearer ${token}` }
+  });
+  assert.equal(currentVersionDelete.res.status, 409);
+  const deniedVersionDelete = await requestRaw(`${base}/files/${versionDeleteNode.node.id}/versions/${versionsBeforeDelete.data[1].id}`, {
+    method: 'DELETE', headers: { Authorization: `Bearer ${demoLoginForPrivateDrive.data.token}` }
+  });
+  assert.equal(deniedVersionDelete.res.status, 403);
+  await request(`${base}/files/${versionDeleteNode.node.id}/versions/${versionsBeforeDelete.data[1].id}`, {
+    method: 'DELETE', headers: { Authorization: `Bearer ${token}` }
+  });
+  const versionsAfterDelete = await request(`${base}/files/${versionDeleteNode.node.id}/versions`, { headers: { Authorization: `Bearer ${token}` } });
+  assert.equal(versionsAfterDelete.data.length, 1);
+  const versionLogsAfterDelete = await request(`${base}/files/${versionDeleteNode.node.id}/version-logs`, { headers: { Authorization: `Bearer ${token}` } });
+  assert.equal(versionLogsAfterDelete.data[0].action, 'delete');
+  const exportedPdf = await fetch(`${base}/files/${versionDeleteNode.node.id}/export-pdf`, { headers: { Authorization: `Bearer ${token}` } });
+  assert.equal(exportedPdf.status, 200);
+  assert.equal(exportedPdf.headers.get('content-type'), 'application/pdf');
+  assert.match(exportedPdf.headers.get('content-disposition') || '', /attachment/);
+  assert.equal(Buffer.from(await exportedPdf.arrayBuffer()).subarray(0, 4).toString(), '%PDF');
+  const printedPdf = await fetch(`${base}/files/${versionDeleteNode.node.id}/print`, { headers: { Authorization: `Bearer ${token}` } });
+  assert.equal(printedPdf.status, 200);
+  assert.match(printedPdf.headers.get('content-disposition') || '', /inline/);
+  assert.equal(Buffer.from(await printedPdf.arrayBuffer()).subarray(0, 4).toString(), '%PDF');
+
   for (const officeCase of [
     { filename: '编辑测试.docx', mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', documentType: 'word' },
     { filename: '编辑测试.xlsx', mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', documentType: 'cell' }
@@ -699,6 +982,7 @@ try {
     body: JSON.stringify({
       ...originalSecurityPolicy.data,
       enablePreviewWatermark: true,
+      enableDownloadWatermark: true,
       blockSensitiveDownload: true,
       allowAdminBypass: true,
       logSensitiveAccess: true,
@@ -707,6 +991,12 @@ try {
     })
   });
   assert.equal(updatedSecurityPolicy.data.blockSensitiveDownload, true);
+  assert.equal(updatedSecurityPolicy.data.enableDownloadWatermark, true);
+  const watermarkedOfficeDownload = await fetch(`${base}/files/${createdOfficeNodes[1].node.id}/download`, { headers: { Authorization: `Bearer ${token}` } });
+  assert.equal(watermarkedOfficeDownload.status, 200);
+  assert.equal(watermarkedOfficeDownload.headers.get('content-type'), 'application/pdf');
+  assert.match(watermarkedOfficeDownload.headers.get('content-disposition') || '', /watermarked\.pdf/);
+  assert.equal(Buffer.from(await watermarkedOfficeDownload.arrayBuffer()).subarray(0, 4).toString(), '%PDF');
   const securityUpdatedNode = await request(`${base}/nodes/${upload.data.id}/security`, {
     method: 'PUT',
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
@@ -855,8 +1145,25 @@ try {
     headers: { Authorization: `Bearer ${token}` }
   });
   assert.equal(wecomTest.data.ok, true);
+  assert.match(wecomTest.data.message, /连接成功/);
+  const wecomSync = await request(`${base}/system-settings/wecom/sync`, {
+    method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: '{}'
+  });
+  assert.equal(wecomSync.data.status, 'completed');
+  assert.equal(wecomSync.data.departments.created, 2);
+  assert.equal(wecomSync.data.users.created, 1);
+  const wecomSyncJobs = await request(`${base}/system-settings/wecom/sync-jobs?pageSize=10`, { headers: { Authorization: `Bearer ${token}` } });
+  assert.equal(wecomSyncJobs.data.items[0].status, 'completed');
+  const wecomUsers = await request(`${base}/users?pageSize=300`, { headers: { Authorization: `Bearer ${token}` } });
+  assert.ok(wecomUsers.data.items.some((item) => item.username === 'wecom-smoke-user'));
+  const wecomAuthConfig = await request(`${base}/wecom/auth/config`);
+  assert.equal(wecomAuthConfig.data.enabled, true);
+  const wecomAuthUrl = await request(`${base}/wecom/auth/url?redirectUri=${encodeURIComponent('http://localhost:5173/')}`);
+  assert.match(wecomAuthUrl.data.authorizeUrl, /open\.weixin\.qq\.com/);
+  assert.match(wecomAuthUrl.data.authorizeUrl, /state=/);
   const wecomCallback = await request(`${base}/wecom/auth/callback?code=smoke-code`);
-  assert.equal(wecomCallback.data.status, 'reserved');
+  assert.equal(wecomCallback.data.user.username, 'wecom-smoke-user');
+  assert.ok(wecomCallback.data.token);
   const approvalMessagesOnly = await request(`${base}/messages?type=approval&pageSize=100`, {
     headers: { Authorization: `Bearer ${demoLoginForPrivateDrive.data.token}` }
   });
@@ -928,6 +1235,11 @@ try {
   }), { files: 0, versions: 0 });
   assert.ok(growthTotals.files >= 1);
   assert.ok(growthTotals.versions >= 1);
+  assert.ok(Array.isArray(dashboard.data.pendingApprovals));
+  assert.ok(Array.isArray(dashboard.data.myShares));
+  assert.ok(Array.isArray(dashboard.data.mySubscriptions));
+  assert.ok(Array.isArray(dashboard.data.lockedFiles));
+  assert.ok(Array.isArray(dashboard.data.favorites));
 
   const conditionalRule = await request(`${base}/nodes/n_root/permission-rules`, {
     method: 'POST',
@@ -1387,6 +1699,7 @@ try {
 
   const attachmentForm = new FormData();
   attachmentForm.append('description', 'smoke attachment');
+  attachmentForm.append('purposeCode', 'reference');
   attachmentForm.append('file', new Blob([Buffer.from('attachment body')]), 'attachment.txt');
   const attachment = await request(`${base}/nodes/${upload.data.id}/attachments`, {
     method: 'POST',
@@ -1394,6 +1707,11 @@ try {
     body: attachmentForm
   });
   assert.equal(attachment.data.name, 'attachment.txt');
+  assert.equal(attachment.data.purposeName, '参考资料');
+  const attachmentPurposes = await request(`${base}/attachment-purposes`, { headers: { Authorization: `Bearer ${token}` } });
+  assert.ok(attachmentPurposes.data.some((item) => item.code === 'reference'));
+  const filteredAttachments = await request(`${base}/nodes/${upload.data.id}/attachments?purpose=reference`, { headers: { Authorization: `Bearer ${token}` } });
+  assert.equal(filteredAttachments.data.length, 1);
   const attachments = await request(`${base}/nodes/${upload.data.id}/attachments`, {
     headers: { Authorization: `Bearer ${token}` }
   });
@@ -1422,6 +1740,16 @@ try {
     headers: { Authorization: `Bearer ${token}` }
   });
   assert.equal(relations.data.length, 1);
+  await request(`${base}/nodes/${upload.data.id}/subscriptions`, {
+    method: 'POST', headers: { Authorization: `Bearer ${demoLoginForPrivateDrive.data.token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ includeChildren: false, eventTypes: ['update'] })
+  });
+  const relationUpdateForm = new FormData();
+  relationUpdateForm.append('description', 'relation notification version');
+  relationUpdateForm.append('file', new Blob([Buffer.from('quality relation notification update')]), relatedUpload.data.name);
+  await request(`${base}/files/${relatedUpload.data.id}/versions`, { method: 'POST', headers: { Authorization: `Bearer ${token}` }, body: relationUpdateForm });
+  const relationMessages = await request(`${base}/messages?type=relation.updated&pageSize=20`, { headers: { Authorization: `Bearer ${demoLoginForPrivateDrive.data.token}` } });
+  assert.ok(relationMessages.data.items.some((item) => item.relatedNodeId === upload.data.id));
 
   const prop = await request(`${base}/property-definitions`, {
     method: 'POST',
@@ -1459,12 +1787,42 @@ try {
   });
   assert.equal(updatedCategory.data.fullPath, '/冒烟子分类更新');
   assert.equal(updatedCategory.data.status, 'disabled');
+  const defaultCategories = await request(`${base}/categories/tree`, { headers: { Authorization: `Bearer ${token}` } });
+  for (const name of ['合同', '项目', '档案', '案卷', 'ISO9000文件']) assert.ok(defaultCategories.data.some((item) => item.name === name));
+
+  const categoryProperty = await request(`${base}/property-definitions`, {
+    method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: '分类专属编号', dataType: 'string', targetType: 'category', required: true, categoryIds: ['c_iso', category.data.id] })
+  });
+  assert.deepEqual(categoryProperty.data.categoryIds, ['c_iso', category.data.id]);
 
   await request(`${base}/nodes/${upload.data.id}/properties`, {
     method: 'PUT',
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ tags: ['质量体系'], categoryIds: ['c_iso'], values: { [prop.data.id]: '2026-07-08' } })
+    body: JSON.stringify({ tags: ['质量体系'], categoryIds: ['c_iso', category.data.id], values: {
+      [prop.data.id]: '2026-07-08',
+      [enumProp.data.id]: '内部',
+      [`c_iso:${categoryProperty.data.id}`]: 'ISO-001',
+      [`${category.data.id}:${categoryProperty.data.id}`]: 'SMOKE-002'
+    } })
   });
+  const categoryPropertyValues = await request(`${base}/nodes/${upload.data.id}/properties`, { headers: { Authorization: `Bearer ${token}` } });
+  assert.equal(categoryPropertyValues.data.values.find((item) => item.key === `c_iso:${categoryProperty.data.id}`)?.value, 'ISO-001');
+  assert.equal(categoryPropertyValues.data.values.find((item) => item.key === `${category.data.id}:${categoryProperty.data.id}`)?.value, 'SMOKE-002');
+  const metadataConditionalRule = await request(`${base}/nodes/n_root/permission-rules`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      subjectType: 'role', subjectId: 'r_employee', actions: ['file:update'], effect: 'allow', scope: 'all', priority: 650,
+      condition: { categoryIds: ['c_iso'], propertyId: categoryProperty.data.id, propertyOperator: 'contains', propertyValue: 'ISO-001' }
+    })
+  });
+  assert.deepEqual(metadataConditionalRule.data.condition.categoryIds, ['c_iso']);
+  assert.equal(metadataConditionalRule.data.condition.propertyOperator, 'contains');
+  const demoMetadataPermission = await request(`${base}/nodes/${upload.data.id}/permissions/effective`, { headers: { Authorization: `Bearer ${demoTokenForPermission}` } });
+  assert.equal(demoMetadataPermission.data.actions.includes('file:update'), true);
+  const demoUnclassifiedPermission = await request(`${base}/nodes/${relatedUpload.data.id}/permissions/effective`, { headers: { Authorization: `Bearer ${demoTokenForPermission}` } });
+  assert.equal(demoUnclassifiedPermission.data.actions.includes('file:update'), false);
 
   const categoryFiles = await request(`${base}/categories/c_iso/files?pageSize=20`, {
     headers: { Authorization: `Bearer ${token}` }
@@ -1523,27 +1881,68 @@ try {
   });
   assert.equal(revokedShare.data.status, 'revoked');
 
+  const externalLink = await request(`${base}/nodes/${upload.data.id}/external-links`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ description: 'smoke external link', password: '2468', allowPreview: true, allowDownload: true, maxAccessCount: 1, expiresAt: new Date(Date.now() + 86400000).toISOString() })
+  });
+  assert.equal(externalLink.data.hasPassword, true);
+  assert.equal(externalLink.data.maxAccessCount, 1);
+  assert.ok(externalLink.data.token);
+  assert.equal('passwordHash' in externalLink.data, false);
+  const externalMetadata = await request(`${base}/public/external-links/${externalLink.data.token}`);
+  assert.equal(externalMetadata.data.name, upload.data.name);
+  assert.equal(externalMetadata.data.remainingAccessCount, 1);
+  const wrongExternalPassword = await requestRaw(`${base}/public/external-links/${externalLink.data.token}/access`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: 'wrong' })
+  });
+  assert.equal(wrongExternalPassword.res.status, 401);
+  const externalAccess = await request(`${base}/public/external-links/${externalLink.data.token}/access`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: '2468' })
+  });
+  assert.ok(externalAccess.data.accessToken);
+  const externalContent = await requestRaw(`${base}/public/external-links/${externalLink.data.token}/content?accessToken=${encodeURIComponent(externalAccess.data.accessToken)}`);
+  assert.equal(externalContent.res.status, 200);
+  assert.match(externalContent.text, /质量手册 smoke test content/);
+  const externalDownload = await requestRaw(`${base}/public/external-links/${externalLink.data.token}/download?accessToken=${encodeURIComponent(externalAccess.data.accessToken)}`);
+  assert.equal(externalDownload.res.status, 200);
+  const exhaustedExternalLink = await requestRaw(`${base}/public/external-links/${externalLink.data.token}/access`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: '2468' })
+  });
+  assert.equal(exhaustedExternalLink.res.status, 410);
+  const externalLinks = await request(`${base}/external-links?pageSize=20`, { headers: { Authorization: `Bearer ${token}` } });
+  assert.ok(externalLinks.data.items.some((item) => item.id === externalLink.data.id && item.accessCount === 1));
+  const revokedExternalLink = await request(`${base}/external-links/${externalLink.data.id}/revoke`, { method: 'PATCH', headers: { Authorization: `Bearer ${token}` } });
+  assert.equal(revokedExternalLink.data.status, 'revoked');
+  const revokedExternalMetadata = await requestRaw(`${base}/public/external-links/${externalLink.data.token}`);
+  assert.equal(revokedExternalMetadata.res.status, 404);
+
   const announcementForm = new FormData();
   announcementForm.append('title', '冒烟公告');
   announcementForm.append('content', '公告内容 smoke announcement');
   announcementForm.append('status', 'draft');
   announcementForm.append('audience', JSON.stringify({ all: true }));
-  announcementForm.append('file', new Blob([Buffer.from('announcement attachment')]), 'announcement.txt');
+  announcementForm.append('files', new Blob([Buffer.from('announcement attachment one')]), 'announcement-one.txt');
+  announcementForm.append('files', new Blob([Buffer.from('announcement attachment two')]), 'announcement-two.txt');
   const announcement = await request(`${base}/announcements`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${token}` },
     body: announcementForm
   });
   assert.equal(announcement.data.status, 'draft');
+  assert.equal(announcement.data.attachments.length, 2);
   const publishedAnnouncement = await request(`${base}/announcements/${announcement.data.id}/publish`, {
     method: 'PATCH',
     headers: { Authorization: `Bearer ${token}` }
   });
   assert.equal(publishedAnnouncement.data.status, 'published');
-  const announcementDownload = await fetch(`${base}/announcements/${announcement.data.id}/attachment`, {
-    headers: { Authorization: `Bearer ${token}` }
-  });
-  assert.equal(announcementDownload.ok, true);
+  for (const attachmentItem of announcement.data.attachments) {
+    const announcementDownload = await fetch(`${base}/announcements/${announcement.data.id}/attachments/${attachmentItem.id}`, {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    assert.equal(announcementDownload.ok, true);
+    assert.ok((await announcementDownload.arrayBuffer()).byteLength > 0);
+  }
   const completeBackup = await request(`${base}/system/backups`, {
     method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: '{}'
   });
@@ -1552,7 +1951,16 @@ try {
   const backupSnapshot = JSON.parse(completeBackupZip.readAsText('db.json'));
   const archivedUploadNames = new Set(completeBackupZip.getEntries().filter((entry) => entry.entryName.startsWith('uploads/') && !entry.isDirectory).map((entry) => entry.entryName.slice('uploads/'.length)));
   assert.ok(archivedUploadNames.has(backupSnapshot.attachments.find((item) => item.id === attachment.data.id).storageKey));
-  assert.ok(archivedUploadNames.has(backupSnapshot.announcements.find((item) => item.id === announcement.data.id).attachment.storageKey));
+  const backupAnnouncement = backupSnapshot.announcements.find((item) => item.id === announcement.data.id);
+  assert.equal(backupAnnouncement.attachments.length, 2);
+  assert.ok(backupAnnouncement.attachments.every((item) => archivedUploadNames.has(item.storageKey)));
+  assert.equal(backupSnapshot.settings.identity.oidc.clientSecret, '');
+  assert.equal(backupSnapshot.settings.identity.saml.idpCert, '');
+  assert.equal(backupSnapshot.settings.identity.ldap.bindPassword, '');
+  assert.equal(backupSnapshot.settings.identity.hr.syncSecret, '');
+  assert.equal(backupSnapshot.settings.fileStorage.s3.accessKeyId, '');
+  assert.equal(backupSnapshot.settings.fileStorage.s3.secretAccessKey, '');
+  assert.ok(backupSnapshot.webhookSubscriptions.every((item) => item.secret === ''));
   const completeBackupDrill = await request(`${base}/system/backups/${completeBackup.data.id}/drill`, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: '{}' });
   assert.equal(completeBackupDrill.data.valid, true);
   assert.ok(completeBackupDrill.data.attachmentCount >= 1);
@@ -1561,6 +1969,8 @@ try {
     headers: { Authorization: `Bearer ${demoTokenForPermission}` }
   });
   assert.ok(demoAnnouncementMessages.data.items.some((item) => item.messageType === 'announcement.publish'));
+  const demoAnnouncements = await request(`${base}/announcements?pageSize=20`, { headers: { Authorization: `Bearer ${demoTokenForPermission}` } });
+  assert.ok(demoAnnouncements.data.items.some((item) => item.id === announcement.data.id && item.content.includes('公告内容')));
 
   const reminder = await request(`${base}/nodes/${upload.data.id}/reminders`, {
     method: 'POST',
@@ -1620,6 +2030,11 @@ try {
     headers: { Authorization: `Bearer ${token}` }
   });
   assert.equal(updatedVersions.data.length, 2);
+  const versionDiff = await request(`${base}/files/${upload.data.id}/version-diff?fromVersionId=${encodeURIComponent(updatedVersions.data[1].id)}&toVersionId=${encodeURIComponent(updatedVersions.data[0].id)}`, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  assert.ok(versionDiff.data.summary.added > 0 || versionDiff.data.summary.removed > 0);
+  assert.ok(versionDiff.data.rows.some((item) => item.type !== 'unchanged'));
   const uploadVersionLogs = await request(`${base}/files/${upload.data.id}/version-logs`, {
     headers: { Authorization: `Bearer ${token}` }
   });
@@ -1658,10 +2073,42 @@ try {
     headers: { Authorization: `Bearer ${demoToken}` }
   });
   assert.ok(readMessage.data.readAt);
+  const unreadMessage = await request(`${base}/messages/${subscriptionMessage.id}/unread`, { method: 'POST', headers: { Authorization: `Bearer ${demoToken}` } });
+  assert.equal(unreadMessage.data.readAt, null);
+  const archivedMessage = await request(`${base}/messages/${subscriptionMessage.id}/archive`, {
+    method: 'PATCH', headers: { Authorization: `Bearer ${demoToken}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ archived: true })
+  });
+  assert.ok(archivedMessage.data.archivedAt);
+  const activeMessagesAfterArchive = await request(`${base}/messages?pageSize=100`, { headers: { Authorization: `Bearer ${demoToken}` } });
+  assert.equal(activeMessagesAfterArchive.data.items.some((item) => item.id === subscriptionMessage.id), false);
+  const archivedMessages = await request(`${base}/messages?archived=true&pageSize=100`, { headers: { Authorization: `Bearer ${demoToken}` } });
+  assert.ok(archivedMessages.data.items.some((item) => item.id === subscriptionMessage.id));
+  await request(`${base}/messages/${subscriptionMessage.id}/archive`, {
+    method: 'PATCH', headers: { Authorization: `Bearer ${demoToken}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ archived: false })
+  });
+  await request(`${base}/messages/${subscriptionMessage.id}/read`, { method: 'POST', headers: { Authorization: `Bearer ${demoToken}` } });
   const unreadMessagesAfterRead = await request(`${base}/messages?unread=true&pageSize=20`, {
     headers: { Authorization: `Bearer ${demoToken}` }
   });
   assert.equal(unreadMessagesAfterRead.data.items.some((item) => item.id === subscriptionMessage.id), false);
+  const favoriteFolder = await request(`${base}/favorite-folders`, {
+    method: 'POST', headers: { Authorization: `Bearer ${demoToken}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ name: '重点资料' })
+  });
+  const favorite = await request(`${base}/favorites`, {
+    method: 'POST', headers: { Authorization: `Bearer ${demoToken}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ nodeId: upload.data.id, folderId: favoriteFolder.data.id })
+  });
+  assert.equal(favorite.data.folderName, '重点资料');
+  const renamedFavoriteFolder = await request(`${base}/favorite-folders/${favoriteFolder.data.id}`, {
+    method: 'PUT', headers: { Authorization: `Bearer ${demoToken}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ name: '重点文件' })
+  });
+  assert.equal(renamedFavoriteFolder.data.name, '重点文件');
+  const movedFavorite = await request(`${base}/favorites/${favorite.data.id}`, {
+    method: 'PUT', headers: { Authorization: `Bearer ${demoToken}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ folderId: null })
+  });
+  assert.equal(movedFavorite.data.folderName, '默认收藏夹');
+  await request(`${base}/favorite-folders/${favoriteFolder.data.id}`, { method: 'DELETE', headers: { Authorization: `Bearer ${demoToken}` } });
+  const favoriteFolders = await request(`${base}/favorite-folders`, { headers: { Authorization: `Bearer ${demoToken}` } });
+  assert.ok(favoriteFolders.data.some((item) => item.system && item.name === '默认收藏夹'));
   await request(`${base}/subscriptions/${demoSubscriptions.data.find((item) => item.nodeId === upload.data.id).id}`, {
     method: 'DELETE',
     headers: { Authorization: `Bearer ${demoToken}` }
@@ -1715,6 +2162,11 @@ try {
     headers: { Authorization: `Bearer ${token}` }
   });
   assert.ok(audit.data.total >= 1);
+  const filteredAudit = await request(`${base}/audit-logs?actorId=u_admin&action=file.upload&targetPath=${encodeURIComponent('/smoke.txt')}&startAt=${encodeURIComponent('2020-01-01T00:00:00.000Z')}&endAt=${encodeURIComponent('2100-01-01T00:00:00.000Z')}&pageSize=100`, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  assert.ok(filteredAudit.data.items.length >= 1);
+  assert.ok(filteredAudit.data.items.every((item) => item.actorId === 'u_admin' && item.action.includes('file.upload') && item.targetPath.includes('/smoke.txt')));
   const auditExport = await fetch(`${base}/audit-logs/export`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
@@ -1722,6 +2174,15 @@ try {
   });
   assert.equal(auditExport.ok, true);
   assert.match(await auditExport.text(), /动作/);
+  const filteredAuditExport = await fetch(`${base}/audit-logs/export`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ actorId: 'u_admin', action: 'file.upload', targetPath: '/smoke.txt', startAt: '2020-01-01T00:00:00.000Z', endAt: '2100-01-01T00:00:00.000Z' })
+  });
+  assert.equal(filteredAuditExport.ok, true);
+  const filteredAuditCsv = await filteredAuditExport.text();
+  assert.match(filteredAuditCsv, /file.upload/);
+  assert.match(filteredAuditCsv, /\/smoke.txt/);
 
   console.log('api smoke passed');
 } finally {

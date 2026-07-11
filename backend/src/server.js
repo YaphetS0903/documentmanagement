@@ -10,6 +10,12 @@ import mime from 'mime-types';
 import archiver from 'archiver';
 import AdmZip from 'adm-zip';
 import httpProxy from 'http-proxy';
+import { PDFDocument, StandardFonts, degrees, rgb } from 'pdf-lib';
+import { createRemoteJWKSet, jwtVerify } from 'jose';
+import { SAML } from '@node-saml/node-saml';
+import { Client as LdapClient } from 'ldapts';
+import NodeClam from 'clamscan';
+import { S3Client, PutObjectCommand, GetObjectCommand, HeadBucketCommand, DeleteObjectCommand } from '@aws-sdk/client-s3';
 import { config } from './config.js';
 import { addAudit, addMessage, ACTIONS, fullActions, loadDb, reloadDb, resetDb, saveDb } from './db.js';
 import {
@@ -23,6 +29,7 @@ import {
   writeStorageConfig
 } from './storage.js';
 import { signToken, verifyToken } from './token.js';
+import { createBlankOfficeBuffer } from './officeTemplates.js';
 import {
   createError,
   ensureDir,
@@ -40,6 +47,7 @@ import {
 await ensureDir(config.uploadDir);
 await ensureDir(config.tmpDir);
 await ensureDir(config.backupDir);
+await ensureDir(config.quarantineDir);
 await loadDb();
 
 const upload = multer({ dest: config.tmpDir, limits: { fileSize: 1024 * 1024 * 300 } });
@@ -47,7 +55,10 @@ const app = express();
 const onlyOfficeProxy = httpProxy.createProxyServer({ changeOrigin: true, xfwd: true, ws: true });
 const DEFAULT_FILE_POLICY = {
   allowedExtensions: ['doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'pdf', 'txt', 'md', 'csv', 'json', 'xml', 'html', 'png', 'jpg', 'jpeg', 'gif', 'zip'],
-  maxSizeMb: 300
+  maxSizeMb: 2048,
+  chunkSizeMb: 8,
+  enableVirusScan: false,
+  rejectExecutableFiles: true
 };
 const SECURITY_LEVELS = ['public', 'internal', 'restricted', 'confidential'];
 const SECURITY_LEVEL_LABELS = {
@@ -68,6 +79,28 @@ const DEFAULT_SECURITY_POLICY = {
   requirePublishApproval: true,
   requirePermissionApproval: true
 };
+const DEFAULT_ATTACHMENT_PURPOSES = [
+  { code: 'supplement', name: '正文补充', enabled: true },
+  { code: 'approval', name: '审批材料', enabled: true },
+  { code: 'evidence', name: '证明文件', enabled: true },
+  { code: 'reference', name: '参考资料', enabled: true },
+  { code: 'other', name: '其他', enabled: true }
+];
+const DEFAULT_IDENTITY_SETTINGS = {
+  oidc: { enabled: false, issuer: '', clientId: '', clientSecret: '', redirectUri: '', scopes: 'openid profile email', usernameClaim: 'preferred_username', displayNameClaim: 'name', emailClaim: 'email', autoProvision: false },
+  saml: { enabled: false, entryPoint: '', issuer: 'document-platform', callbackUrl: '', idpCert: '', usernameAttribute: 'nameID', displayNameAttribute: 'displayName', emailAttribute: 'email', autoProvision: false },
+  ldap: { enabled: false, url: '', bindDn: '', bindPassword: '', baseDn: '', userFilter: '(objectClass=person)', usernameAttribute: 'sAMAccountName', displayNameAttribute: 'displayName', emailAttribute: 'mail', departmentAttribute: 'department', syncUsers: true },
+  hr: { enabled: false, syncSecret: '', autoDisableMissing: false }
+};
+const DEFAULT_FILE_STORAGE_SETTINGS = {
+  provider: 'local',
+  nasRoot: '',
+  s3: { endpoint: '', region: 'us-east-1', bucket: '', accessKeyId: '', secretAccessKey: '', forcePathStyle: true },
+  quota: { totalGb: 0, defaultUserGb: 0, userLimitsGb: {} },
+  lifecycle: { uploadSessionDays: 7, quarantineDays: 30, historicalVersionDays: 0, keepLatestVersions: 3 },
+  updatedAt: null,
+  updatedBy: null
+};
 const DEFAULT_WECOM_SETTINGS = {
   enabled: false,
   corpId: '',
@@ -78,6 +111,8 @@ const DEFAULT_WECOM_SETTINGS = {
   syncUsers: true,
   pushMessages: false,
   apiBaseUrl: 'https://qyapi.weixin.qq.com',
+  lastSyncAt: null,
+  lastSyncResult: null,
   lastTestAt: null,
   lastTestResult: null
 };
@@ -290,6 +325,7 @@ async function authenticate(req, res, next) {
     req.user = user;
     req.db = db;
     req.apiCredential = credential;
+    attachWebhookDispatcher(req, res);
     attachApiCallLogger(req, res);
     return next();
   }
@@ -300,6 +336,7 @@ async function authenticate(req, res, next) {
   if (!user) return next(createError(401, 'UNAUTHORIZED', '用户不存在或已禁用'));
   req.user = user;
   req.db = db;
+  attachWebhookDispatcher(req, res);
   next();
 }
 
@@ -328,6 +365,7 @@ const COLLECTIONS = [
   'backupJobs',
   'systemAlerts',
   'favorites',
+  'favoriteFolders',
   'comments',
   'ratings',
   'attachments',
@@ -340,14 +378,21 @@ const COLLECTIONS = [
   'officeEditSessions',
   'subscriptions',
   'shares',
+  'externalLinks',
+  'externalLinkAccessLogs',
   'announcements',
   'auditLogs',
   'apiCredentials',
   'apiCallLogs',
+  'webhookSubscriptions',
+  'webhookDeliveries',
   'loginTickets',
+  'wecomSyncJobs',
   'externalSyncJobs',
   'recentAccesses',
   'searchEvents'
+  ,'uploadSessions'
+  ,'quarantineItems'
 ];
 
 function defaultPermissionTemplates(timestamp = now()) {
@@ -414,11 +459,28 @@ function ensureDbShape(db) {
     db.meta.permissionTemplateDefaultsSeeded = true;
   }
   db.settings = db.settings || {};
+  const defaultCategories = [
+    { id: 'c_contract', name: '合同' },
+    { id: 'c_project', name: '项目' },
+    { id: 'c_archive', name: '档案' },
+    { id: 'c_case_file', name: '案卷' },
+    { id: 'c_iso', name: 'ISO9000文件' }
+  ];
+  defaultCategories.forEach((category, index) => {
+    if (!db.categories.some((item) => item.id === category.id || (item.parentId == null && item.name === category.name))) {
+      db.categories.push({ ...category, parentId: null, fullPath: `/${category.name}`, sortOrder: index + 1, status: 'enabled' });
+    }
+  });
   db.settings.filePolicy = {
     ...DEFAULT_FILE_POLICY,
     ...(db.settings.filePolicy || {})
   };
   db.settings.securityPolicy = normalizeSecurityPolicy(db.settings.securityPolicy || {});
+  db.settings.attachmentPurposes = Array.isArray(db.settings.attachmentPurposes) && db.settings.attachmentPurposes.length
+    ? db.settings.attachmentPurposes
+    : DEFAULT_ATTACHMENT_PURPOSES.map((item) => ({ ...item }));
+  db.settings.identity = normalizeIdentitySettings(db.settings.identity || {});
+  db.settings.fileStorage = normalizeFileStorageSettings(db.settings.fileStorage || {});
   db.settings.wecom = normalizeWecomSettings(db.settings.wecom || {});
   db.settings.officePreview = normalizeOfficePreviewSettings(db.settings.officePreview || {});
   db.settings.externalLibrary = {
@@ -433,6 +495,13 @@ function ensureDbShape(db) {
     user.failedLoginCount = Number(user.failedLoginCount || 0);
     user.lastFailedLoginAt = user.lastFailedLoginAt || null;
     user.lockedUntil = user.lockedUntil || null;
+    user.defaultWorkPathId = user.defaultWorkPathId || null;
+    user.avatarStorageKey = user.avatarStorageKey || '';
+    user.avatarMimeType = user.avatarMimeType || '';
+  });
+  db.messages.forEach((message) => {
+    message.archivedAt = message.archivedAt || null;
+    message.deletedAt = message.deletedAt || null;
   });
   db.nodes.forEach((node) => {
     ensureNodeSecurityShape(db, node);
@@ -547,7 +616,7 @@ function sharedActionsForUser(db, user, node) {
   return [...actions];
 }
 
-function conditionMatches(rule, node) {
+function conditionMatches(db, rule, node) {
   const condition = rule.condition || {};
   const filenameContains = String(condition.filenameContains || '').trim().toLowerCase();
   if (filenameContains && !String(node.name || '').toLowerCase().includes(filenameContains)) return false;
@@ -559,11 +628,25 @@ function conditionMatches(rule, node) {
   if (extensions.length && !extensions.includes(String(node.extension || '').toLowerCase())) return false;
   const businessStatus = String(condition.businessStatus || '').trim();
   if (businessStatus && node.businessStatus !== businessStatus) return false;
+  const categoryIds = Array.isArray(condition.categoryIds) ? condition.categoryIds.map(String).filter(Boolean) : [];
+  if (categoryIds.length && !categoryIds.every((categoryId) => db.documentCategories.some((item) => item.nodeId === node.id && item.categoryId === categoryId))) return false;
+  const propertyId = String(condition.propertyId || '').trim();
+  const propertyValue = String(condition.propertyValue || '').trim();
+  if (propertyId) {
+    const values = db.propertyValues.filter((item) => item.nodeId === node.id && item.propertyId === propertyId).map((item) => String(item.value ?? ''));
+    if (!values.length) return false;
+    if (propertyValue) {
+      const normalizedValue = propertyValue.toLowerCase();
+      if (condition.propertyOperator === 'contains') {
+        if (!values.some((value) => value.toLowerCase().includes(normalizedValue))) return false;
+      } else if (!values.some((value) => value.toLowerCase() === normalizedValue)) return false;
+    }
+  }
   return true;
 }
 
 function ruleApplies(db, rule, node) {
-  if (!conditionMatches(rule, node)) return false;
+  if (!conditionMatches(db, rule, node)) return false;
   const scope = rule.scope || 'all';
   const isCurrent = rule.nodeId === node.id;
   const nodeAncestors = ancestors(db, node);
@@ -866,9 +949,164 @@ function normalizeWecomSettings(input = {}, fallback = {}) {
     syncUsers: normalizeBoolean(input.syncUsers ?? fallback.syncUsers, DEFAULT_WECOM_SETTINGS.syncUsers),
     pushMessages: normalizeBoolean(input.pushMessages ?? fallback.pushMessages, DEFAULT_WECOM_SETTINGS.pushMessages),
     apiBaseUrl: String(input.apiBaseUrl ?? fallback.apiBaseUrl ?? DEFAULT_WECOM_SETTINGS.apiBaseUrl).trim().replace(/\/+$/, ''),
+    lastSyncAt: input.lastSyncAt ?? fallback.lastSyncAt ?? null,
+    lastSyncResult: input.lastSyncResult ?? fallback.lastSyncResult ?? null,
     lastTestAt: input.lastTestAt ?? fallback.lastTestAt ?? null,
     lastTestResult: input.lastTestResult ?? fallback.lastTestResult ?? null
   };
+}
+
+async function requestWecomJson(settings, pathname, query = {}) {
+  const url = new URL(`${settings.apiBaseUrl}${pathname}`);
+  Object.entries(query).forEach(([key, value]) => {
+    if (value !== undefined && value !== null && value !== '') url.searchParams.set(key, String(value));
+  });
+  const response = await fetch(url, { signal: AbortSignal.timeout(10000) });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok || Number(payload.errcode || 0) !== 0) {
+    throw createError(502, 'WECOM_API_ERROR', `企业微信接口失败：${payload.errmsg || `HTTP ${response.status}`}`);
+  }
+  return payload;
+}
+
+async function getWecomAccessToken(settings) {
+  if (!settings.enabled || !settings.corpId || !settings.secret) {
+    throw createError(400, 'WECOM_NOT_CONFIGURED', '企业微信 CorpID、Secret 或启用状态未配置完整');
+  }
+  const payload = await requestWecomJson(settings, '/cgi-bin/gettoken', {
+    corpid: settings.corpId,
+    corpsecret: settings.secret
+  });
+  if (!payload.access_token) throw createError(502, 'WECOM_API_ERROR', '企业微信未返回 access_token');
+  return payload.access_token;
+}
+
+function encodeWecomState(redirectUri) {
+  const payload = Buffer.from(JSON.stringify({ redirectUri, expiresAt: Date.now() + 10 * 60 * 1000 })).toString('base64url');
+  const signature = crypto.createHmac('sha256', config.jwtSecret).update(payload).digest('base64url');
+  return `${payload}.${signature}`;
+}
+
+function verifyWecomState(state) {
+  const [payload, signature] = String(state || '').split('.');
+  if (!payload || !signature) throw createError(400, 'VALIDATION_ERROR', '企业微信登录 state 无效');
+  const expected = crypto.createHmac('sha256', config.jwtSecret).update(payload).digest('base64url');
+  const valid = signature.length === expected.length && crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
+  if (!valid) throw createError(400, 'VALIDATION_ERROR', '企业微信登录 state 校验失败');
+  const decoded = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+  if (!decoded.expiresAt || decoded.expiresAt < Date.now()) throw createError(400, 'VALIDATION_ERROR', '企业微信登录请求已过期');
+  return decoded;
+}
+
+async function syncWecomDirectory(db, actorId, req) {
+  const settings = currentWecomSettings(db);
+  const startedAt = now();
+  const job = {
+    id: newId('wcs_'),
+    status: 'running',
+    startedAt,
+    finishedAt: null,
+    createdBy: actorId,
+    departments: { created: 0, updated: 0 },
+    users: { created: 0, updated: 0, conflicts: 0 },
+    conflictDetails: [],
+    error: ''
+  };
+  db.wecomSyncJobs.unshift(job);
+  db.wecomSyncJobs = db.wecomSyncJobs.slice(0, 100);
+  try {
+    const accessToken = await getWecomAccessToken(settings);
+    const departmentMap = new Map();
+    if (settings.syncDepartments) {
+      const payload = await requestWecomJson(settings, '/cgi-bin/department/list', { access_token: accessToken });
+      const remoteDepartments = Array.isArray(payload.department) ? payload.department : [];
+      remoteDepartments.forEach((remote) => {
+        const externalId = String(remote.id);
+        let department = db.departments.find((item) => String(item.wecomDepartmentId || '') === externalId);
+        if (!department) {
+          department = {
+            id: newId('d_'), parentId: null, name: String(remote.name || `企业微信部门${externalId}`),
+            code: `wecom:${externalId}`, sortOrder: Number(remote.order || 100), status: 'enabled',
+            sourceType: 'wecom', wecomDepartmentId: externalId, createdAt: now(), updatedAt: now()
+          };
+          db.departments.push(department);
+          job.departments.created += 1;
+        } else {
+          Object.assign(department, {
+            name: String(remote.name || department.name),
+            sortOrder: Number(remote.order || department.sortOrder || 100),
+            status: 'enabled', sourceType: 'wecom', updatedAt: now()
+          });
+          job.departments.updated += 1;
+        }
+        departmentMap.set(externalId, department);
+      });
+      remoteDepartments.forEach((remote) => {
+        const department = departmentMap.get(String(remote.id));
+        const parentExternalId = String(remote.parentid || '');
+        department.parentId = parentExternalId && parentExternalId !== '0' ? departmentMap.get(parentExternalId)?.id || null : null;
+      });
+    } else {
+      db.departments.filter((item) => item.wecomDepartmentId).forEach((item) => departmentMap.set(String(item.wecomDepartmentId), item));
+    }
+
+    if (settings.syncUsers) {
+      const rootDepartmentId = [...departmentMap.keys()][0] || '1';
+      const payload = await requestWecomJson(settings, '/cgi-bin/user/list', {
+        access_token: accessToken, department_id: rootDepartmentId, fetch_child: 1
+      });
+      const remoteUsers = Array.isArray(payload.userlist) ? payload.userlist : [];
+      remoteUsers.forEach((remote) => {
+        const wecomUserId = String(remote.userid || '').trim();
+        if (!wecomUserId) return;
+        let user = db.users.find((item) => item.wecomUserId === wecomUserId);
+        if (!user) {
+          const usernameConflict = db.users.find((item) => item.username === wecomUserId);
+          if (usernameConflict && usernameConflict.sourceType !== 'wecom') {
+            job.users.conflicts += 1;
+            job.conflictDetails.push({ wecomUserId, reason: '本地存在同名账号，未自动覆盖' });
+            return;
+          }
+          user = usernameConflict;
+        }
+        const departmentIds = (remote.department || []).map((id) => departmentMap.get(String(id))?.id).filter(Boolean);
+        if (!user) {
+          const hp = hashPassword(crypto.randomBytes(32).toString('base64url'));
+          user = {
+            id: newId('u_'), username: wecomUserId, displayName: remote.name || wecomUserId,
+            passwordHash: hp.hash, passwordSalt: hp.salt, email: remote.email || remote.biz_mail || '', phone: remote.mobile || '',
+            avatarUrl: remote.avatar || '', status: Number(remote.enable ?? 1) === 1 ? 'enabled' : 'disabled',
+            departmentIds, roleIds: ['r_employee'], sourceType: 'wecom', wecomUserId,
+            lastLoginAt: null, failedLoginCount: 0, lastFailedLoginAt: null, lockedUntil: null,
+            createdAt: now(), updatedAt: now()
+          };
+          db.users.push(user);
+          job.users.created += 1;
+        } else {
+          Object.assign(user, {
+            displayName: remote.name || user.displayName, email: remote.email || remote.biz_mail || user.email || '',
+            phone: remote.mobile || user.phone || '', avatarUrl: remote.avatar || user.avatarUrl || '',
+            status: Number(remote.enable ?? 1) === 1 ? 'enabled' : 'disabled', departmentIds,
+            sourceType: 'wecom', wecomUserId, updatedAt: now()
+          });
+          job.users.updated += 1;
+        }
+      });
+    }
+    job.status = job.users.conflicts ? 'completed_with_conflicts' : 'completed';
+    job.finishedAt = now();
+    settings.lastSyncAt = job.finishedAt;
+    settings.lastSyncResult = { status: job.status, departments: job.departments, users: job.users };
+    addAudit(db, actorId, 'system.wecom.sync', 'system_setting', 'wecom', settings.lastSyncResult, req);
+    return job;
+  } catch (error) {
+    job.status = 'failed';
+    job.finishedAt = now();
+    job.error = error.message;
+    settings.lastSyncAt = job.finishedAt;
+    settings.lastSyncResult = { status: 'failed', error: error.message };
+    throw error;
+  }
 }
 
 function sanitizeWecomSettings(settings = {}) {
@@ -1123,6 +1361,93 @@ async function downloadOfficeEditedFile(db, settings, sourceUrl, session, extens
   return tempPath;
 }
 
+function pdfWatermarkText(db, user, node) {
+  const raw = `${watermarkTextFor(db, user, node)} | ${node.name || 'document'}`;
+  return raw.normalize('NFKD').replace(/[^\x20-\x7E]/g, '').replace(/\s+/g, ' ').trim() || `${user?.username || user?.id || 'user'} | ${node.name || 'document'}`;
+}
+
+async function addPdfWatermark(buffer, text) {
+  const document = await PDFDocument.load(buffer);
+  const font = await document.embedFont(StandardFonts.Helvetica);
+  document.getPages().forEach((page) => {
+    const { width, height } = page.getSize();
+    const fontSize = Math.max(16, Math.min(28, width / 24));
+    const textWidth = font.widthOfTextAtSize(text, fontSize);
+    const stepX = Math.max(textWidth + 100, width * 0.55);
+    const stepY = Math.max(120, height * 0.22);
+    for (let y = -20; y < height + stepY; y += stepY) {
+      for (let x = -width * 0.2; x < width + stepX; x += stepX) {
+        page.drawText(text, { x, y, size: fontSize, font, color: rgb(0.45, 0.48, 0.52), opacity: 0.16, rotate: degrees(28) });
+      }
+    }
+  });
+  return Buffer.from(await document.save());
+}
+
+async function convertVersionToPdf(req, node, version) {
+  const extension = extname(version.originalFilename || node.name);
+  const filePath = versionFilePath(version, node, req.db);
+  if (!fsSync.existsSync(filePath)) throw createError(404, 'NOT_FOUND', '文件内容不存在');
+  if (extension === 'pdf' || version.mimeType === 'application/pdf') return fs.readFile(filePath);
+  if (!OFFICE_PREVIEW_EXTENSIONS.has(extension)) throw createError(400, 'PDF_EXPORT_UNSUPPORTED', '当前仅支持 Office 和 PDF 文件导出或打印');
+  const settings = currentOfficePreviewSettings(req.db);
+  const configurationIssue = officePreviewConfigurationIssue(req, settings);
+  if (configurationIssue) throw createError(503, 'PDF_EXPORT_UNAVAILABLE', configurationIssue);
+  if (!settings.enabled || !settings.documentServerUrl) throw createError(503, 'PDF_EXPORT_UNAVAILABLE', '请先配置并启用 ONLYOFFICE Document Server');
+  const sourceToken = encodeURIComponent(signToken({ userId: req.user.id, purpose: 'pdf-export', nodeId: node.id, versionId: version.id }, 10 * 60 * 1000));
+  const unlockTokenValue = unlockTokensFromRequest(req).join(',');
+  const unlockToken = unlockTokenValue ? `&unlockToken=${encodeURIComponent(unlockTokenValue)}` : '';
+  const sourceUrl = joinUrl(requestPublicBaseUrl(req, settings), `/storage/raw/${version.id}?token=${sourceToken}${unlockToken}`);
+  const payload = {
+    async: false,
+    filetype: extension,
+    key: crypto.createHash('sha256').update(`${version.id}:${version.md5 || version.createdAt}:pdf`).digest('hex').slice(0, 20),
+    outputtype: 'pdf',
+    title: version.originalFilename || node.name,
+    url: sourceUrl
+  };
+  const headers = { 'Content-Type': 'application/json' };
+  if (settings.jwtSecret) {
+    const jwt = signOnlyOfficeToken(payload, settings.jwtSecret);
+    headers.Authorization = `Bearer ${jwt}`;
+    payload.token = jwt;
+  }
+  const response = await fetch(joinUrl(settings.documentServerUrl, '/ConvertService.ashx'), {
+    method: 'POST', headers, body: JSON.stringify(payload), signal: AbortSignal.timeout(60_000)
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok || result.error || result.endConvert === false || !(result.fileUrl || result.fileurl)) {
+    throw createError(502, 'PDF_EXPORT_FAILED', `ONLYOFFICE PDF 转换失败${result.error ? `（错误 ${result.error}）` : ''}`);
+  }
+  const downloadUrl = validateOfficeCallbackDownloadUrl(settings, result.fileUrl || result.fileurl);
+  const converted = await fetch(downloadUrl, { signal: AbortSignal.timeout(60_000) });
+  if (!converted.ok) throw createError(502, 'PDF_EXPORT_FAILED', `下载转换结果失败（HTTP ${converted.status}）`);
+  const bytes = Buffer.from(await converted.arrayBuffer());
+  if (!bytes.length) throw createError(502, 'PDF_EXPORT_FAILED', 'ONLYOFFICE 返回了空 PDF');
+  return bytes;
+}
+
+async function controlledPdfOutput(req, res, { action, inline = false } = {}) {
+  const node = nodeById(req.db, req.params.id);
+  requireNodeAction(req, node, action);
+  requireNodePasswordAccess(req, node);
+  if (node.nodeType !== 'file') throw createError(400, 'VALIDATION_ERROR', '只能输出文件');
+  const version = req.query.versionId ? versionById(req.db, req.query.versionId) : currentVersion(req.db, node);
+  if (!version || version.nodeId !== node.id) throw createError(404, 'NOT_FOUND', '版本不存在');
+  const converted = await convertVersionToPdf(req, node, version);
+  const output = await addPdfWatermark(converted, pdfWatermarkText(req.db, req.user, node));
+  const baseName = String(version.originalFilename || node.name).replace(/\.[^.]+$/, '');
+  addAudit(req.db, req.user.id, action === 'file:print' ? 'file.print' : 'file.export_pdf', 'node', node.id, {
+    targetPath: node.fullPath, versionNo: version.versionNo, watermarked: true
+  }, req);
+  recordRecentAccess(req.db, req.user, node, action === 'file:print' ? 'print' : 'export_pdf');
+  await saveDb(req.db);
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Length', output.length);
+  res.setHeader('Content-Disposition', `${inline ? 'inline' : 'attachment'}; filename*=UTF-8''${encodeURIComponent(`${baseName}.pdf`)}`);
+  res.end(output);
+}
+
 function buildOnlyOfficePreview(req, node, version, extension) {
   const settings = currentOfficePreviewSettings(req.db);
   if (!settings.enabled || !settings.documentServerUrl) return null;
@@ -1183,7 +1508,10 @@ function currentFilePolicy(db) {
     ...DEFAULT_FILE_POLICY,
     ...(db.settings?.filePolicy || {}),
     allowedExtensions: normalizeExtensions(db.settings?.filePolicy?.allowedExtensions || DEFAULT_FILE_POLICY.allowedExtensions),
-    maxSizeMb: Number(db.settings?.filePolicy?.maxSizeMb || DEFAULT_FILE_POLICY.maxSizeMb)
+    maxSizeMb: Number(db.settings?.filePolicy?.maxSizeMb || DEFAULT_FILE_POLICY.maxSizeMb),
+    chunkSizeMb: Math.max(1, Math.min(Number(db.settings?.filePolicy?.chunkSizeMb || DEFAULT_FILE_POLICY.chunkSizeMb), 64)),
+    enableVirusScan: normalizeBoolean(db.settings?.filePolicy?.enableVirusScan, DEFAULT_FILE_POLICY.enableVirusScan),
+    rejectExecutableFiles: normalizeBoolean(db.settings?.filePolicy?.rejectExecutableFiles, DEFAULT_FILE_POLICY.rejectExecutableFiles)
   };
 }
 
@@ -1327,6 +1655,57 @@ async function validateUploadedFileByPolicy(db, file) {
     if (fsSync.existsSync(file.path)) await fs.unlink(file.path);
     throw createError(400, 'VALIDATION_ERROR', `文件大小不能超过 ${policy.maxSizeMb} MB`);
   }
+}
+
+async function quarantineUploadedFile(db, filePath, originalFilename, reason, actorId = null) {
+  const id = newId('qua_');
+  const filename = `${id}-${safeFilename(originalFilename || 'file.bin')}`;
+  const targetPath = path.join(config.quarantineDir, filename);
+  await fs.rename(filePath, targetPath).catch(async () => {
+    await fs.copyFile(filePath, targetPath);
+    await fs.rm(filePath, { force: true });
+  });
+  const item = { id, originalFilename, storageKey: filename, reason, status: 'quarantined', createdBy: actorId, createdAt: now() };
+  db.quarantineItems.unshift(item);
+  db.quarantineItems = db.quarantineItems.slice(0, 1000);
+  return item;
+}
+
+async function scanIncomingFile(db, filePath, originalFilename, actorId = null) {
+  const policy = currentFilePolicy(db);
+  const extension = extname(originalFilename);
+  const executableExtensions = new Set(['exe', 'dll', 'com', 'scr', 'msi', 'bat', 'cmd', 'ps1', 'vbs', 'js', 'jse', 'wsf', 'hta', 'jar', 'sh']);
+  const handle = await fs.open(filePath, 'r');
+  const probe = Buffer.alloc(8192);
+  const { bytesRead } = await handle.read(probe, 0, probe.length, 0);
+  await handle.close();
+  const head = probe.subarray(0, bytesRead);
+  const text = head.toString('latin1');
+  let reason = '';
+  if (text.includes('EICAR-STANDARD-ANTIVIRUS-TEST-FILE')) reason = '检测到 EICAR 测试病毒签名';
+  else if (policy.rejectExecutableFiles && (executableExtensions.has(extension) || (head[0] === 0x4d && head[1] === 0x5a))) reason = '禁止上传可执行或脚本文件';
+  else if (/powershell\s+-enc|<script[^>]+src\s*=\s*["']?javascript:/i.test(text)) reason = '检测到危险脚本签名';
+  if (!reason && policy.enableVirusScan) {
+    if (!config.clamavHost && !config.clamavSocket && !fsSync.existsSync('/usr/bin/clamscan') && !fsSync.existsSync('/usr/bin/clamdscan')) {
+      throw createError(503, 'VIRUS_SCANNER_UNAVAILABLE', '已启用病毒扫描，但 ClamAV 服务不可用');
+    }
+    const scanner = await new NodeClam().init({
+      removeInfected: false, quarantineInfected: false, preference: config.clamavHost || config.clamavSocket ? 'clamdscan' : 'clamscan',
+      clamdscan: { host: config.clamavHost || false, port: config.clamavPort, socket: config.clamavSocket || false, timeout: 120000, localFallback: true, active: true },
+      clamscan: { path: '/usr/bin/clamscan', scanArchives: true, active: true }
+    });
+    const result = await scanner.isInfected(filePath);
+    if (result.isInfected) reason = `ClamAV 检测到病毒：${(result.viruses || []).join(', ') || 'unknown'}`;
+    if (result.isInfected === null) throw createError(503, 'VIRUS_SCAN_FAILED', 'ClamAV 无法完成文件扫描');
+  }
+  if (reason) {
+    const quarantine = await quarantineUploadedFile(db, filePath, originalFilename, reason, actorId);
+    await saveDb(db);
+    const error = createError(400, 'FILE_QUARANTINED', `文件未通过安全扫描：${reason}`);
+    error.data = { quarantineId: quarantine.id };
+    throw error;
+  }
+  return { clean: true, scannedBy: policy.enableVirusScan ? 'built-in+clamav' : 'built-in' };
 }
 
 function validateName(name) {
@@ -1833,6 +2212,37 @@ function trimPreviewContent(content) {
   return String(content || '').replace(/\r\n/g, '\n').slice(0, 200000);
 }
 
+function lineDiff(beforeText, afterText) {
+  const before = String(beforeText || '').replace(/\r\n/g, '\n').split('\n').slice(0, 5000);
+  const after = String(afterText || '').replace(/\r\n/g, '\n').split('\n').slice(0, 5000);
+  const maxCells = 2_000_000;
+  if (before.length * after.length > maxCells) {
+    const beforeSet = new Set(before);
+    return after.map((line) => ({ type: beforeSet.has(line) ? 'unchanged' : 'added', text: line }));
+  }
+  const table = Array.from({ length: before.length + 1 }, () => new Uint32Array(after.length + 1));
+  for (let left = before.length - 1; left >= 0; left -= 1) {
+    for (let right = after.length - 1; right >= 0; right -= 1) table[left][right] = before[left] === after[right] ? table[left + 1][right + 1] + 1 : Math.max(table[left + 1][right], table[left][right + 1]);
+  }
+  const rows = [];
+  let left = 0;
+  let right = 0;
+  while (left < before.length || right < after.length) {
+    if (left < before.length && right < after.length && before[left] === after[right]) { rows.push({ type: 'unchanged', text: before[left] }); left += 1; right += 1; }
+    else if (right < after.length && (left >= before.length || table[left][right + 1] >= table[left + 1][right])) { rows.push({ type: 'added', text: after[right] }); right += 1; }
+    else { rows.push({ type: 'removed', text: before[left] }); left += 1; }
+  }
+  return rows;
+}
+
+async function versionComparableText(db, node, version) {
+  const extension = extname(version.originalFilename || node.name);
+  const filePath = await ensureVersionLocalPath(db, version, node);
+  if (version.mimeType?.startsWith('text/') || TEXT_PREVIEW_EXTENSIONS.has(extension) || JSON_PREVIEW_EXTENSIONS.has(extension)) return fs.readFile(filePath, 'utf8');
+  if (['docx', 'xlsx', 'pptx'].includes(extension)) return extractSearchText(filePath, extension, version.mimeType, version.originalFilename);
+  throw createError(400, 'VERSION_DIFF_UNSUPPORTED', '当前格式无法可靠提取内容进行版本差异比较');
+}
+
 async function readPreviewText(version, node, db) {
   const filePath = versionFilePath(version, node, db);
   if (filePath && fsSync.existsSync(filePath)) {
@@ -1865,6 +2275,7 @@ function versionFilePath(version, node = null, db = null) {
 }
 
 async function createVersionFromUpload(db, node, file, userId, description = '') {
+  enforceStorageQuota(db, userId, Number(file.size || 0));
   const extension = extname(file.originalname);
   const versionNo = db.versions.filter((item) => item.nodeId === node.id).length + 1;
   const versionId = newId('ver_');
@@ -1892,6 +2303,7 @@ async function createVersionFromUpload(db, node, file, userId, description = '')
     createdAt: now()
   };
   db.versions.push(version);
+  await replicateVersionToConfiguredStorage(db, version, storageKey);
   node.currentVersionId = version.id;
   node.extension = extension;
   node.updatedBy = userId;
@@ -1902,6 +2314,7 @@ async function createVersionFromUpload(db, node, file, userId, description = '')
 async function createVersionFromFile(db, node, filePath, originalFilename, userId, description = '') {
   const extension = extname(originalFilename);
   const stats = await fs.stat(filePath);
+  enforceStorageQuota(db, userId, Number(stats.size || 0));
   const versionNo = db.versions.filter((item) => item.nodeId === node.id).length + 1;
   const versionId = newId('ver_');
   const storageName = `${versionId}-${safeFilename(originalFilename)}`;
@@ -1935,6 +2348,7 @@ async function createVersionFromFile(db, node, filePath, originalFilename, userI
     createdBy: userId,
     createdAt: now()
   };
+  await replicateVersionToConfiguredStorage(db, version, storagePath);
   db.versions.push(version);
   node.currentVersionId = version.id;
   node.extension = extension;
@@ -1943,8 +2357,40 @@ async function createVersionFromFile(db, node, filePath, originalFilename, userI
   return version;
 }
 
-function streamVersion(res, version, downloadName = null, options = {}) {
-  const filePath = versionFilePath(version, options.node, options.db);
+function createFileNode(db, parent, name, userId, businessStatus = 'effective') {
+  const node = {
+    id: newId('n_'),
+    parentId: parent.id,
+    nodeType: 'file',
+    name,
+    fullPath: childPath(parent, name),
+    extension: extname(name),
+    currentVersionId: null,
+    ownerId: userId,
+    spaceType: parent.spaceType || 'enterprise',
+    personalOwnerId: parent.spaceType === 'personal' ? parent.personalOwnerId : null,
+    createdBy: userId,
+    updatedBy: userId,
+    lockedBy: null,
+    lockedAt: null,
+    status: 'normal',
+    businessStatus,
+    securityLevel: parent.securityLevel || 'internal',
+    sensitive: false,
+    sensitiveReason: '',
+    securityUpdatedBy: null,
+    securityUpdatedAt: null,
+    tags: [],
+    createdAt: now(),
+    updatedAt: now(),
+    deletedAt: null
+  };
+  db.nodes.push(node);
+  return node;
+}
+
+async function streamVersion(res, version, downloadName = null, options = {}) {
+  const filePath = await ensureVersionLocalPath(options.db, version, options.node);
   if (!fsSync.existsSync(filePath)) {
     const message = (version?.storageType || 'local') === 'external'
       ? '同步源文件不存在，请重新同步目录或检查服务器路径'
@@ -1958,14 +2404,14 @@ function streamVersion(res, version, downloadName = null, options = {}) {
   fsSync.createReadStream(filePath).pipe(res);
 }
 
-function recursiveZipNodes(db, archive, node, user, req = null) {
+async function recursiveZipNodes(db, archive, node, user, req = null) {
   if (req && !isNodePasswordAccessible(req, node)) return;
   if (node.nodeType === 'file') {
     if (!hasAction(db, user, node, 'file:download')) return;
     if (sensitiveDownloadBlocked(db, user, node)) return;
     const version = currentVersion(db, node);
     if (version) {
-      const filePath = versionFilePath(version, node, db);
+      const filePath = await ensureVersionLocalPath(db, version, node);
       if (fsSync.existsSync(filePath)) archive.file(filePath, { name: node.fullPath.replace(/^\//, '') });
     }
     return;
@@ -1973,7 +2419,7 @@ function recursiveZipNodes(db, archive, node, user, req = null) {
   if (!hasAction(db, user, node, 'visible')) return;
   const children = db.nodes.filter((item) => item.parentId === node.id && item.status !== 'deleted');
   if (!children.length) archive.append('', { name: `${node.fullPath.replace(/^\//, '')}/` });
-  children.forEach((child) => recursiveZipNodes(db, archive, child, user, req));
+  await Promise.all(children.map((child) => recursiveZipNodes(db, archive, child, user, req)));
 }
 
 function blockedSensitiveDownloadNodes(db, user, node) {
@@ -2007,6 +2453,10 @@ function normalizeCondition(condition = null) {
   const filenameContains = String(condition.filenameContains || '').trim();
   const pathPrefix = String(condition.pathPrefix || '').trim();
   const businessStatus = String(condition.businessStatus || '').trim();
+  const categoryIds = Array.isArray(condition.categoryIds) ? [...new Set(condition.categoryIds.map(String).filter(Boolean))] : [];
+  const propertyId = String(condition.propertyId || '').trim();
+  const propertyOperator = condition.propertyOperator === 'contains' ? 'contains' : 'equals';
+  const propertyValue = String(condition.propertyValue || '').trim();
   const extensions = Array.isArray(condition.extensions)
     ? condition.extensions.map((item) => String(item).replace(/^\./, '').trim().toLowerCase()).filter(Boolean)
     : String(condition.extensions || '')
@@ -2017,6 +2467,12 @@ function normalizeCondition(condition = null) {
   if (pathPrefix) normalized.pathPrefix = pathPrefix;
   if (extensions.length) normalized.extensions = [...new Set(extensions)];
   if (businessStatus) normalized.businessStatus = businessStatus;
+  if (categoryIds.length) normalized.categoryIds = categoryIds;
+  if (propertyId) {
+    normalized.propertyId = propertyId;
+    normalized.propertyOperator = propertyOperator;
+    if (propertyValue) normalized.propertyValue = propertyValue;
+  }
   return Object.keys(normalized).length ? normalized : null;
 }
 
@@ -2109,6 +2565,29 @@ function notifySubscribers(db, actorId, node, eventType, version = null) {
   });
 }
 
+function notifyRelatedFileUpdate(db, actorId, node, version) {
+  const actor = db.users.find((item) => item.id === actorId);
+  const relations = (db.fileRelations || []).filter((item) => item.nodeId === node.id || item.relatedNodeId === node.id);
+  relations.forEach((relation) => {
+    const otherNodeId = relation.nodeId === node.id ? relation.relatedNodeId : relation.nodeId;
+    const otherNode = nodeById(db, otherNodeId);
+    if (!otherNode) return;
+    const receivers = new Set([otherNode.ownerId, otherNode.createdBy, relation.createdBy].filter(Boolean));
+    (db.subscriptions || [])
+      .filter((item) => item.nodeId === otherNode.id && item.status === 'active')
+      .forEach((item) => receivers.add(item.userId));
+    receivers.delete(actorId);
+    receivers.forEach((userId) => addMessage(
+      db,
+      userId,
+      'relation.updated',
+      '关联文件已更新',
+      `${actor?.displayName || actor?.username || '用户'} 更新了“${node.fullPath}”${version ? `（版本 ${version.versionNo}）` : ''}，该文件与“${otherNode.fullPath}”存在关联`,
+      otherNode.id
+    ));
+  });
+}
+
 function publicShare(db, share) {
   const node = includeDeletedNodeById(db, share.nodeId);
   return {
@@ -2116,6 +2595,55 @@ function publicShare(db, share) {
     nodeName: node?.name || '',
     nodePath: node?.fullPath || ''
   };
+}
+
+function publicExternalLink(db, link, { includeToken = false } = {}) {
+  const node = includeDeletedNodeById(db, link.nodeId);
+  const result = {
+    id: link.id,
+    nodeId: link.nodeId,
+    nodeName: node?.name || '',
+    nodePath: node?.fullPath || '',
+    description: link.description || '',
+    allowPreview: link.allowPreview !== false,
+    allowDownload: Boolean(link.allowDownload),
+    hasPassword: Boolean(link.passwordHash),
+    effectiveAt: link.effectiveAt || null,
+    expiresAt: link.expiresAt || null,
+    maxAccessCount: Number(link.maxAccessCount || 0),
+    accessCount: Number(link.accessCount || 0),
+    status: link.status || 'active',
+    createdBy: link.createdBy,
+    createdAt: link.createdAt,
+    updatedAt: link.updatedAt
+  };
+  if (includeToken) {
+    result.token = link.token;
+    result.publicUrl = `/?externalLink=${encodeURIComponent(link.token)}`;
+  }
+  return result;
+}
+
+function validateExternalLink(db, token, { enforceAccessLimit = true } = {}) {
+  const link = db.externalLinks.find((item) => item.token === token);
+  if (!link || link.status !== 'active') throw createError(404, 'NOT_FOUND', '外链不存在或已撤销');
+  if (link.effectiveAt && new Date(link.effectiveAt).getTime() > Date.now()) throw createError(403, 'NOT_EFFECTIVE', '外链尚未生效');
+  if (link.expiresAt && new Date(link.expiresAt).getTime() < Date.now()) throw createError(410, 'EXPIRED', '外链已过期');
+  if (enforceAccessLimit && Number(link.maxAccessCount || 0) > 0 && Number(link.accessCount || 0) >= Number(link.maxAccessCount)) {
+    throw createError(410, 'ACCESS_LIMIT_REACHED', '外链访问次数已用完');
+  }
+  const node = nodeById(db, link.nodeId);
+  if (!node || node.nodeType !== 'file') throw createError(404, 'NOT_FOUND', '外链文件不存在');
+  return { link, node };
+}
+
+function externalLinkAccessFromRequest(req, link) {
+  const token = String(req.headers['x-external-access-token'] || req.query.accessToken || '');
+  const payload = verifyToken(token);
+  if (!payload || payload.type !== 'external_link' || payload.externalLinkId !== link.id) {
+    throw createError(401, 'UNAUTHORIZED', '外链访问凭证无效或已过期');
+  }
+  return payload;
 }
 
 function publicSubscription(db, subscription) {
@@ -2178,6 +2706,99 @@ function publicCredential(db, credential, secret = null) {
   };
   if (secret) result.secret = secret;
   return result;
+}
+
+function publicWebhookSubscription(subscription, secret = null) {
+  const result = {
+    id: subscription.id,
+    name: subscription.name,
+    url: subscription.url,
+    eventPatterns: subscription.eventPatterns || ['*'],
+    status: subscription.status || 'enabled',
+    hasSecret: Boolean(subscription.secret),
+    createdBy: subscription.createdBy,
+    createdAt: subscription.createdAt,
+    updatedAt: subscription.updatedAt,
+    lastDeliveredAt: subscription.lastDeliveredAt || null,
+    lastError: subscription.lastError || ''
+  };
+  if (secret) result.secret = secret;
+  return result;
+}
+
+function webhookEventMatches(patterns, eventType) {
+  return (patterns || ['*']).some((pattern) => pattern === '*' || pattern === eventType || (pattern.endsWith('.*') && eventType.startsWith(pattern.slice(0, -1))));
+}
+
+async function deliverWebhook(db, subscription, event) {
+  const payload = JSON.stringify(event);
+  const timestamp = String(Math.floor(Date.now() / 1000));
+  const signature = crypto.createHmac('sha256', subscription.secret).update(`${timestamp}.${payload}`).digest('hex');
+  const delivery = {
+    id: newId('whd_'), subscriptionId: subscription.id, eventId: event.id, eventType: event.type,
+    status: 'pending', attempts: 1, responseStatus: null, lastError: '', createdAt: now(), updatedAt: now(), deliveredAt: null
+  };
+  db.webhookDeliveries.unshift(delivery);
+  db.webhookDeliveries = db.webhookDeliveries.slice(0, 10000);
+  try {
+    const response = await fetch(subscription.url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Document-Event': event.type,
+        'X-Document-Delivery': delivery.id,
+        'X-Document-Timestamp': timestamp,
+        'X-Document-Signature': `sha256=${signature}`
+      },
+      body: payload,
+      signal: AbortSignal.timeout(10000)
+    });
+    delivery.responseStatus = response.status;
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    delivery.status = 'delivered';
+    delivery.deliveredAt = now();
+    subscription.lastDeliveredAt = delivery.deliveredAt;
+    subscription.lastError = '';
+  } catch (error) {
+    delivery.status = 'failed';
+    delivery.lastError = error.message;
+    subscription.lastError = error.message;
+  }
+  delivery.updatedAt = now();
+  subscription.updatedAt = now();
+  return delivery;
+}
+
+async function dispatchWebhookEvents(db, auditLogs) {
+  const subscriptions = (db.webhookSubscriptions || []).filter((item) => item.status === 'enabled');
+  for (const audit of auditLogs) {
+    const event = {
+      id: `evt_${audit.id}`,
+      type: audit.action,
+      occurredAt: audit.createdAt,
+      data: {
+        actorId: audit.actorId || null,
+        targetType: audit.targetType,
+        targetId: audit.targetId,
+        targetPath: audit.targetPath || '',
+        detail: audit.detail || {}
+      }
+    };
+    for (const subscription of subscriptions.filter((item) => webhookEventMatches(item.eventPatterns, event.type))) {
+      await deliverWebhook(db, subscription, event);
+    }
+  }
+  if (auditLogs.length && subscriptions.length) await saveDb(db);
+}
+
+function attachWebhookDispatcher(req, res) {
+  if (req.webhookDispatcherAttached || !req.db) return;
+  req.webhookDispatcherAttached = true;
+  const existingAuditIds = new Set((req.db.auditLogs || []).map((item) => item.id));
+  res.once('finish', () => {
+    const events = (req.db.auditLogs || []).filter((item) => !existingAuditIds.has(item.id));
+    if (events.length) void dispatchWebhookEvents(req.db, events).catch((error) => console.error('webhook dispatch failed', error));
+  });
 }
 
 function parseJsonField(value, fallback) {
@@ -2278,15 +2899,13 @@ function announcementVisibleToUser(announcement, user) {
 
 function publicAnnouncement(db, user, announcement) {
   const creator = db.users.find((item) => item.id === announcement.createdBy);
+  const attachments = announcement.attachments || (announcement.attachment ? [announcement.attachment] : []);
   return {
     ...announcement,
     createdByName: creator?.displayName || creator?.username || announcement.createdBy,
     canManage: isAdmin(user) || announcement.createdBy === user.id,
-    attachment: announcement.attachment ? {
-      originalFilename: announcement.attachment.originalFilename,
-      sizeBytes: announcement.attachment.sizeBytes,
-      mimeType: announcement.attachment.mimeType
-    } : null
+    attachment: attachments[0] ? { id: attachments[0].id, originalFilename: attachments[0].originalFilename, sizeBytes: attachments[0].sizeBytes, mimeType: attachments[0].mimeType } : null,
+    attachments: attachments.map((item) => ({ id: item.id, originalFilename: item.originalFilename, sizeBytes: item.sizeBytes, mimeType: item.mimeType, createdAt: item.createdAt }))
   };
 }
 
@@ -2392,9 +3011,13 @@ function storageConsistencyReport(db) {
   db.versions.forEach((version) => {
     const node = includeDeletedNodeById(db, version.nodeId);
     if (!node) issues.push({ type: 'orphan_version', severity: 'error', versionId: version.id, message: '版本关联文件不存在' });
-    if ((version.storageType || 'local') === 'local') {
+    if (['local', 'nas', 's3'].includes(version.storageType || 'local')) {
       referencedStorageKeys.add(version.storageKey);
-      if (!version.storageKey || !fsSync.existsSync(path.join(config.uploadDir, version.storageKey))) issues.push({ type: 'missing_version_file', severity: 'error', versionId: version.id, nodeId: version.nodeId, message: '版本文件缺失' });
+      const localExists = version.storageKey && fsSync.existsSync(path.join(config.uploadDir, version.storageKey));
+      const nasExists = version.storageType === 'nas' && version.nasPath && fsSync.existsSync(version.nasPath);
+      const s3Configured = version.storageType === 's3' && Boolean(version.s3Key && version.s3Bucket);
+      if (!localExists && !nasExists && !s3Configured) issues.push({ type: 'missing_version_file', severity: 'error', versionId: version.id, nodeId: version.nodeId, message: '版本文件缺失' });
+      else if (!localExists && (nasExists || s3Configured)) issues.push({ type: 'missing_local_cache', severity: 'warning', versionId: version.id, nodeId: version.nodeId, message: '远端版本存在，本地缓存缺失，将在读取时重建' });
     }
   });
   db.nodes.filter((node) => node.nodeType === 'file' && node.currentVersionId).forEach((node) => {
@@ -2404,9 +3027,12 @@ function storageConsistencyReport(db) {
     referencedStorageKeys.add(attachment.storageKey);
     if (!attachment.storageKey || !fsSync.existsSync(path.join(config.uploadDir, attachment.storageKey))) issues.push({ type: 'missing_attachment_file', severity: 'error', attachmentId: attachment.id, nodeId: attachment.nodeId, message: '文档附件文件缺失' });
   });
-  (db.announcements || []).filter((item) => item.attachment).forEach((announcement) => {
-    referencedStorageKeys.add(announcement.attachment.storageKey);
-    if (!announcement.attachment.storageKey || !fsSync.existsSync(path.join(config.uploadDir, announcement.attachment.storageKey))) issues.push({ type: 'missing_announcement_attachment', severity: 'error', announcementId: announcement.id, message: '公告附件文件缺失' });
+  (db.announcements || []).forEach((announcement) => {
+    const attachments = announcement.attachments || (announcement.attachment ? [announcement.attachment] : []);
+    attachments.forEach((attachment) => {
+      referencedStorageKeys.add(attachment.storageKey);
+      if (!attachment.storageKey || !fsSync.existsSync(path.join(config.uploadDir, attachment.storageKey))) issues.push({ type: 'missing_announcement_attachment', severity: 'error', announcementId: announcement.id, attachmentId: attachment.id, message: '公告附件文件缺失' });
+    });
   });
   const uploadFiles = fsSync.existsSync(config.uploadDir) ? fsSync.readdirSync(config.uploadDir, { withFileTypes: true }).filter((item) => item.isFile()).map((item) => item.name) : [];
   uploadFiles.filter((name) => !referencedStorageKeys.has(name)).forEach((name) => issues.push({ type: 'orphan_upload', severity: 'warning', storageKey: name, message: '上传目录存在未引用文件' }));
@@ -2458,6 +3084,15 @@ function backupSafeSnapshot(db) {
   const snapshot = structuredClone(db);
   if (snapshot.settings?.wecom) snapshot.settings.wecom.secret = '';
   if (snapshot.settings?.officePreview) snapshot.settings.officePreview.jwtSecret = '';
+  if (snapshot.settings?.identity?.oidc) snapshot.settings.identity.oidc.clientSecret = '';
+  if (snapshot.settings?.identity?.saml) snapshot.settings.identity.saml.idpCert = '';
+  if (snapshot.settings?.identity?.ldap) snapshot.settings.identity.ldap.bindPassword = '';
+  if (snapshot.settings?.identity?.hr) snapshot.settings.identity.hr.syncSecret = '';
+  if (snapshot.settings?.fileStorage?.s3) {
+    snapshot.settings.fileStorage.s3.accessKeyId = '';
+    snapshot.settings.fileStorage.s3.secretAccessKey = '';
+  }
+  (snapshot.webhookSubscriptions || []).forEach((item) => { item.secret = ''; });
   (snapshot.apiCredentials || []).forEach((item) => {
     item.secretHash = '';
     item.secretSalt = '';
@@ -2484,7 +3119,7 @@ async function createSystemBackup(db, actorId) {
     const storageKeys = new Set([
       ...db.versions.filter((version) => (version.storageType || 'local') === 'local').map((version) => version.storageKey),
       ...(db.attachments || []).map((attachment) => attachment.storageKey),
-      ...(db.announcements || []).map((announcement) => announcement.attachment?.storageKey)
+      ...(db.announcements || []).flatMap((announcement) => (announcement.attachments || (announcement.attachment ? [announcement.attachment] : [])).map((item) => item.storageKey))
     ].filter(Boolean));
     storageKeys.forEach((storageKey) => {
       const source = path.join(config.uploadDir, storageKey);
@@ -2519,11 +3154,11 @@ async function runBackupRestoreDrill(job) {
   const expectedFiles = [
     ...(snapshot.versions || []).filter((version) => (version.storageType || 'local') === 'local').map((version) => ({ kind: 'version', id: version.id, storageKey: version.storageKey })),
     ...(snapshot.attachments || []).map((attachment) => ({ kind: 'attachment', id: attachment.id, storageKey: attachment.storageKey })),
-    ...(snapshot.announcements || []).filter((announcement) => announcement.attachment).map((announcement) => ({ kind: 'announcement', id: announcement.id, storageKey: announcement.attachment.storageKey }))
+    ...(snapshot.announcements || []).flatMap((announcement) => (announcement.attachments || (announcement.attachment ? [announcement.attachment] : [])).map((item) => ({ kind: 'announcement', id: announcement.id, storageKey: item.storageKey })))
   ].filter((item) => item.storageKey);
   const archivedFiles = new Set(entries.filter((entry) => entry.entryName.startsWith('uploads/') && !entry.isDirectory).map((entry) => entry.entryName.slice('uploads/'.length)));
   const missingFiles = expectedFiles.filter((item) => !archivedFiles.has(item.storageKey));
-  const drill = { checkedAt: now(), valid: missingFiles.length === 0, nodeCount: (snapshot.nodes || []).length, versionCount: (snapshot.versions || []).length, attachmentCount: (snapshot.attachments || []).length, announcementAttachmentCount: (snapshot.announcements || []).filter((item) => item.attachment).length, archivedFileCount: archivedFiles.size, missingVersionIds: missingFiles.filter((item) => item.kind === 'version').map((item) => item.id).slice(0, 100), missingFiles: missingFiles.slice(0, 100) };
+  const drill = { checkedAt: now(), valid: missingFiles.length === 0, nodeCount: (snapshot.nodes || []).length, versionCount: (snapshot.versions || []).length, attachmentCount: (snapshot.attachments || []).length, announcementAttachmentCount: (snapshot.announcements || []).reduce((sum, item) => sum + (item.attachments || (item.attachment ? [item.attachment] : [])).length, 0), archivedFileCount: archivedFiles.size, missingVersionIds: missingFiles.filter((item) => item.kind === 'version').map((item) => item.id).slice(0, 100), missingFiles: missingFiles.slice(0, 100) };
   job.drill = drill;
   return drill;
 }
@@ -3058,6 +3693,10 @@ async function announcementAttachmentFromUpload(file) {
   };
 }
 
+async function announcementAttachmentsFromUploads(files = []) {
+  return Promise.all((files || []).map((file) => announcementAttachmentFromUpload(file)));
+}
+
 function notifyAnnouncementAudience(db, actor, announcement) {
   if (announcement.status !== 'published' || announcement.notifiedAt) return;
   collectAudienceUsers(db, announcement.audience)
@@ -3125,8 +3764,258 @@ function ensurePersonalRoot(db, user) {
   return root;
 }
 
-function propertyValueFor(db, nodeId, propertyId) {
-  return db.propertyValues.find((item) => item.nodeId === nodeId && item.propertyId === propertyId);
+function propertyValueFor(db, nodeId, propertyId, categoryId = null) {
+  return db.propertyValues.find((item) => item.nodeId === nodeId && item.propertyId === propertyId && (item.categoryId || null) === (categoryId || null));
+}
+
+function attachmentPurposes(db) {
+  db.settings = db.settings || {};
+  db.settings.attachmentPurposes = Array.isArray(db.settings.attachmentPurposes) && db.settings.attachmentPurposes.length
+    ? db.settings.attachmentPurposes
+    : DEFAULT_ATTACHMENT_PURPOSES.map((item) => ({ ...item }));
+  return db.settings.attachmentPurposes;
+}
+
+function normalizeAttachmentPurposes(input) {
+  const rows = Array.isArray(input) ? input : [];
+  const seen = new Set();
+  const normalized = rows.map((item) => {
+    const code = String(item.code || '').trim().toLowerCase().replace(/[^a-z0-9_-]/g, '_').slice(0, 40);
+    const name = String(item.name || '').trim().slice(0, 40);
+    if (!code || !name || seen.has(code)) throw createError(400, 'VALIDATION_ERROR', '附件用途编码和名称不能为空，编码不能重复');
+    seen.add(code);
+    return { code, name, enabled: item.enabled !== false };
+  });
+  if (!normalized.some((item) => item.enabled)) throw createError(400, 'VALIDATION_ERROR', '至少保留一个启用的附件用途');
+  return normalized;
+}
+
+function normalizeIdentitySettings(input = {}, existing = DEFAULT_IDENTITY_SETTINGS) {
+  const merge = (name) => ({ ...DEFAULT_IDENTITY_SETTINGS[name], ...(existing?.[name] || {}), ...(input?.[name] || {}) });
+  const oidc = merge('oidc');
+  const saml = merge('saml');
+  const ldap = merge('ldap');
+  const hr = merge('hr');
+  return {
+    oidc: {
+      enabled: normalizeBoolean(oidc.enabled), issuer: String(oidc.issuer || '').trim().replace(/\/+$/, ''), clientId: String(oidc.clientId || '').trim(),
+      clientSecret: String(input?.oidc?.clientSecret || '') || String(existing?.oidc?.clientSecret || ''), redirectUri: String(oidc.redirectUri || '').trim(), scopes: String(oidc.scopes || 'openid profile email').trim(),
+      usernameClaim: String(oidc.usernameClaim || 'preferred_username').trim(), displayNameClaim: String(oidc.displayNameClaim || 'name').trim(), emailClaim: String(oidc.emailClaim || 'email').trim(), autoProvision: normalizeBoolean(oidc.autoProvision)
+    },
+    saml: {
+      enabled: normalizeBoolean(saml.enabled), entryPoint: String(saml.entryPoint || '').trim(), issuer: String(saml.issuer || 'document-platform').trim(), callbackUrl: String(saml.callbackUrl || '').trim(),
+      idpCert: String(input?.saml?.idpCert || '') || String(existing?.saml?.idpCert || ''), usernameAttribute: String(saml.usernameAttribute || 'nameID').trim(), displayNameAttribute: String(saml.displayNameAttribute || 'displayName').trim(),
+      emailAttribute: String(saml.emailAttribute || 'email').trim(), autoProvision: normalizeBoolean(saml.autoProvision)
+    },
+    ldap: {
+      enabled: normalizeBoolean(ldap.enabled), url: String(ldap.url || '').trim(), bindDn: String(ldap.bindDn || '').trim(), bindPassword: String(input?.ldap?.bindPassword || '') || String(existing?.ldap?.bindPassword || ''),
+      baseDn: String(ldap.baseDn || '').trim(), userFilter: String(ldap.userFilter || '(objectClass=person)').trim(), usernameAttribute: String(ldap.usernameAttribute || 'sAMAccountName').trim(),
+      displayNameAttribute: String(ldap.displayNameAttribute || 'displayName').trim(), emailAttribute: String(ldap.emailAttribute || 'mail').trim(), departmentAttribute: String(ldap.departmentAttribute || 'department').trim(), syncUsers: normalizeBoolean(ldap.syncUsers, true)
+    },
+    hr: { enabled: normalizeBoolean(hr.enabled), syncSecret: String(input?.hr?.syncSecret || '') || String(existing?.hr?.syncSecret || ''), autoDisableMissing: normalizeBoolean(hr.autoDisableMissing) }
+  };
+}
+
+function sanitizeIdentitySettings(settings = {}) {
+  const normalized = normalizeIdentitySettings(settings, settings);
+  return {
+    oidc: { ...normalized.oidc, clientSecret: undefined, hasClientSecret: Boolean(normalized.oidc.clientSecret) },
+    saml: { ...normalized.saml, idpCert: undefined, hasIdpCert: Boolean(normalized.saml.idpCert) },
+    ldap: { ...normalized.ldap, bindPassword: undefined, hasBindPassword: Boolean(normalized.ldap.bindPassword) },
+    hr: { ...normalized.hr, syncSecret: undefined, hasSyncSecret: Boolean(normalized.hr.syncSecret) }
+  };
+}
+
+function currentIdentitySettings(db) {
+  db.settings = db.settings || {};
+  db.settings.identity = normalizeIdentitySettings(db.settings.identity || {});
+  return db.settings.identity;
+}
+
+function externalIdentityUser(db, { provider, externalId, username, displayName, email, autoProvision }) {
+  const identityKey = `${provider}:${externalId}`;
+  let user = db.users.find((item) => (item.externalIdentities || []).includes(identityKey));
+  if (!user && username) user = db.users.find((item) => item.username === username);
+  if (!user && !autoProvision) throw createError(403, 'EXTERNAL_USER_NOT_PROVISIONED', '外部身份尚未映射到平台用户');
+  if (!user) {
+    const hp = hashPassword(crypto.randomBytes(32).toString('base64url'));
+    user = {
+      id: newId('u_'), username: validateName(username || `${provider}_${externalId}`), displayName: displayName || username || externalId,
+      passwordHash: hp.hash, passwordSalt: hp.salt, email: email || '', phone: '', avatarUrl: '', status: 'enabled', departmentIds: [], roleIds: ['r_employee'],
+      sourceType: provider, externalIdentities: [identityKey], lastLoginAt: null, failedLoginCount: 0, lastFailedLoginAt: null, lockedUntil: null, createdAt: now(), updatedAt: now()
+    };
+    db.users.push(user);
+  } else {
+    user.externalIdentities = [...new Set([...(user.externalIdentities || []), identityKey])];
+    user.displayName = displayName || user.displayName;
+    user.email = email || user.email;
+    user.updatedAt = now();
+  }
+  if (user.status !== 'enabled') throw createError(403, 'FORBIDDEN', '账号已被禁用');
+  return user;
+}
+
+function encodeIdentityState(provider, redirectUri = '') {
+  const payload = Buffer.from(JSON.stringify({ provider, redirectUri, nonce: crypto.randomBytes(12).toString('hex'), expiresAt: Date.now() + 10 * 60 * 1000 })).toString('base64url');
+  return `${payload}.${crypto.createHmac('sha256', config.jwtSecret).update(payload).digest('base64url')}`;
+}
+
+function verifyIdentityState(state, provider) {
+  const [payload, signature] = String(state || '').split('.');
+  if (!payload || !signature) throw createError(400, 'VALIDATION_ERROR', '身份登录 state 无效');
+  const expected = crypto.createHmac('sha256', config.jwtSecret).update(payload).digest('base64url');
+  if (signature.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) throw createError(400, 'VALIDATION_ERROR', '身份登录 state 校验失败');
+  const decoded = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+  if (decoded.provider !== provider || decoded.expiresAt < Date.now()) throw createError(400, 'VALIDATION_ERROR', '身份登录请求无效或已过期');
+  return decoded;
+}
+
+async function oidcDiscovery(settings) {
+  const response = await fetch(`${settings.issuer}/.well-known/openid-configuration`, { signal: AbortSignal.timeout(10000) });
+  if (!response.ok) throw createError(502, 'OIDC_DISCOVERY_FAILED', `OIDC 发现失败（HTTP ${response.status}）`);
+  return response.json();
+}
+
+function samlClient(settings) {
+  return new SAML({
+    entryPoint: settings.entryPoint, issuer: settings.issuer, callbackUrl: settings.callbackUrl,
+    idpCert: settings.idpCert, wantAssertionsSigned: true, wantAuthnResponseSigned: true,
+    disableRequestAcsUrl: false, acceptedClockSkewMs: 120000
+  });
+}
+
+function normalizeFileStorageSettings(input = {}, existing = DEFAULT_FILE_STORAGE_SETTINGS) {
+  const s3 = { ...DEFAULT_FILE_STORAGE_SETTINGS.s3, ...(existing.s3 || {}), ...(input.s3 || {}) };
+  const quota = { ...DEFAULT_FILE_STORAGE_SETTINGS.quota, ...(existing.quota || {}), ...(input.quota || {}) };
+  const lifecycle = { ...DEFAULT_FILE_STORAGE_SETTINGS.lifecycle, ...(existing.lifecycle || {}), ...(input.lifecycle || {}) };
+  const provider = ['local', 'nas', 's3'].includes(input.provider ?? existing.provider) ? (input.provider ?? existing.provider) : 'local';
+  return {
+    provider,
+    nasRoot: String(input.nasRoot ?? existing.nasRoot ?? '').trim(),
+    s3: {
+      endpoint: String(s3.endpoint || '').trim().replace(/\/+$/, ''), region: String(s3.region || 'us-east-1').trim(), bucket: String(s3.bucket || '').trim(),
+      accessKeyId: String(input.s3?.accessKeyId || '') || String(existing.s3?.accessKeyId || ''),
+      secretAccessKey: String(input.s3?.secretAccessKey || '') || String(existing.s3?.secretAccessKey || ''), forcePathStyle: normalizeBoolean(s3.forcePathStyle, true)
+    },
+    quota: {
+      totalGb: Math.max(0, Number(quota.totalGb || 0)), defaultUserGb: Math.max(0, Number(quota.defaultUserGb || 0)),
+      userLimitsGb: Object.fromEntries(Object.entries(quota.userLimitsGb || {}).map(([key, value]) => [key, Math.max(0, Number(value || 0))]))
+    },
+    lifecycle: {
+      uploadSessionDays: Math.max(1, Number(lifecycle.uploadSessionDays || 7)), quarantineDays: Math.max(1, Number(lifecycle.quarantineDays || 30)),
+      historicalVersionDays: Math.max(0, Number(lifecycle.historicalVersionDays || 0)), keepLatestVersions: Math.max(1, Number(lifecycle.keepLatestVersions || 3))
+    },
+    updatedAt: input.updatedAt ?? existing.updatedAt ?? null,
+    updatedBy: input.updatedBy ?? existing.updatedBy ?? null
+  };
+}
+
+function currentFileStorageSettings(db) {
+  db.settings = db.settings || {};
+  db.settings.fileStorage = normalizeFileStorageSettings(db.settings.fileStorage || {});
+  return db.settings.fileStorage;
+}
+
+function sanitizeFileStorageSettings(settings = {}) {
+  const normalized = normalizeFileStorageSettings(settings, settings);
+  return { ...normalized, s3: { ...normalized.s3, accessKeyId: '', secretAccessKey: '', hasAccessKeyId: Boolean(normalized.s3.accessKeyId), hasSecretAccessKey: Boolean(normalized.s3.secretAccessKey) } };
+}
+
+function s3ClientFor(settings) {
+  return new S3Client({ endpoint: settings.endpoint || undefined, region: settings.region, forcePathStyle: settings.forcePathStyle, credentials: settings.accessKeyId ? { accessKeyId: settings.accessKeyId, secretAccessKey: settings.secretAccessKey } : undefined });
+}
+
+function storageUsage(db, userId = null) {
+  const versions = db.versions.filter((item) => (item.storageType || 'local') !== 'external' && (!userId || item.createdBy === userId));
+  return versions.reduce((sum, item) => sum + Number(item.sizeBytes || 0), 0);
+}
+
+function enforceStorageQuota(db, userId, incomingBytes) {
+  const quota = currentFileStorageSettings(db).quota;
+  const gib = 1024 ** 3;
+  if (quota.totalGb > 0 && storageUsage(db) + incomingBytes > quota.totalGb * gib) throw createError(413, 'STORAGE_QUOTA_EXCEEDED', '平台总容量配额不足');
+  const userLimitGb = Number(quota.userLimitsGb?.[userId] ?? quota.defaultUserGb ?? 0);
+  if (userLimitGb > 0 && storageUsage(db, userId) + incomingBytes > userLimitGb * gib) throw createError(413, 'USER_STORAGE_QUOTA_EXCEEDED', '个人容量配额不足');
+}
+
+async function replicateVersionToConfiguredStorage(db, version, localPath) {
+  const settings = currentFileStorageSettings(db);
+  if (settings.provider === 'local') return version;
+  if (settings.provider === 'nas') {
+    if (!settings.nasRoot) throw createError(503, 'NAS_NOT_CONFIGURED', 'NAS 根目录未配置');
+    await ensureDir(settings.nasRoot);
+    const targetPath = path.join(path.resolve(settings.nasRoot), path.basename(version.storageKey));
+    await fs.copyFile(localPath, targetPath);
+    version.storageType = 'nas';
+    version.nasPath = targetPath;
+    return version;
+  }
+  if (!settings.s3.bucket) throw createError(503, 'S3_NOT_CONFIGURED', 'S3 Bucket 未配置');
+  const key = `versions/${version.id}/${safeFilename(version.originalFilename)}`;
+  await s3ClientFor(settings.s3).send(new PutObjectCommand({ Bucket: settings.s3.bucket, Key: key, Body: fsSync.createReadStream(localPath), ContentType: version.mimeType }));
+  version.storageType = 's3';
+  version.s3Bucket = settings.s3.bucket;
+  version.s3Key = key;
+  return version;
+}
+
+async function ensureVersionLocalPath(db, version, node = null) {
+  const localPath = path.join(config.uploadDir, version.storageKey || '');
+  if (fsSync.existsSync(localPath)) return localPath;
+  if (version.storageType === 'nas' && version.nasPath && fsSync.existsSync(version.nasPath)) {
+    await fs.copyFile(version.nasPath, localPath);
+    return localPath;
+  }
+  if (version.storageType === 's3' && version.s3Key) {
+    const settings = currentFileStorageSettings(db).s3;
+    const response = await s3ClientFor(settings).send(new GetObjectCommand({ Bucket: version.s3Bucket || settings.bucket, Key: version.s3Key }));
+    await ensureDir(path.dirname(localPath));
+    const output = fsSync.createWriteStream(localPath);
+    await new Promise((resolve, reject) => { response.Body.pipe(output).on('finish', resolve).on('error', reject); });
+    return localPath;
+  }
+  return versionFilePath(version, node, db);
+}
+
+async function deleteVersionStorage(db, version) {
+  await fs.rm(path.join(config.uploadDir, version.storageKey || ''), { force: true }).catch(() => {});
+  if (version.storageType === 'nas' && version.nasPath) await fs.rm(version.nasPath, { force: true }).catch(() => {});
+  if (version.storageType === 's3' && version.s3Key) {
+    const settings = currentFileStorageSettings(db).s3;
+    await s3ClientFor(settings).send(new DeleteObjectCommand({ Bucket: version.s3Bucket || settings.bucket, Key: version.s3Key })).catch(() => {});
+  }
+}
+
+async function runStorageLifecycle(db, actorId, req = null) {
+  const settings = currentFileStorageSettings(db).lifecycle;
+  const current = Date.now();
+  let expiredSessions = 0;
+  let expiredQuarantine = 0;
+  let expiredVersions = 0;
+  for (const session of db.uploadSessions.filter((item) => item.status !== 'completed' && new Date(item.updatedAt || item.createdAt).getTime() < current - settings.uploadSessionDays * 86400000)) {
+    session.status = 'expired';
+    await fs.rm(path.join(config.tmpDir, session.id), { recursive: true, force: true });
+    expiredSessions += 1;
+  }
+  for (const item of db.quarantineItems.filter((entry) => entry.status === 'quarantined' && new Date(entry.createdAt).getTime() < current - settings.quarantineDays * 86400000)) {
+    await fs.rm(path.join(config.quarantineDir, item.storageKey), { force: true });
+    item.status = 'expired_deleted';
+    item.deletedAt = now();
+    expiredQuarantine += 1;
+  }
+  if (settings.historicalVersionDays > 0) {
+    for (const node of db.nodes.filter((item) => item.nodeType === 'file')) {
+      const versions = db.versions.filter((item) => item.nodeId === node.id).sort((a, b) => b.versionNo - a.versionNo);
+      for (const version of versions.slice(settings.keepLatestVersions).filter((item) => item.id !== node.currentVersionId && new Date(item.createdAt).getTime() < current - settings.historicalVersionDays * 86400000)) {
+        await deleteVersionStorage(db, version);
+        db.versions = db.versions.filter((item) => item.id !== version.id);
+        expiredVersions += 1;
+      }
+    }
+  }
+  const result = { expiredSessions, expiredQuarantine, expiredVersions, completedAt: now() };
+  addAudit(db, actorId, 'system.storage.lifecycle', 'system_setting', 'file_storage', result, req);
+  return result;
 }
 
 function nextReminderTime(reminder) {
@@ -3202,11 +4091,11 @@ function openApiDocument() {
       responses: { 200: { description: 'OK' } }
     }
   });
-  return {
+  const document = {
     openapi: '3.0.3',
     info: {
       title: '文档管理平台 API',
-      version: '0.1.0',
+      version: '1.0.0-rc.1',
       description: '文档管理平台 REST API，支持 JWT 和 AccessKey/Secret 鉴权。'
     },
     servers: [{ url: '/api/v1' }],
@@ -3219,6 +4108,49 @@ function openApiDocument() {
           name: 'X-Access-Key',
           description: '需同时传 X-Access-Secret'
         }
+      },
+      schemas: {
+        ApiResponse: {
+          type: 'object', required: ['code', 'message'],
+          properties: { code: { type: 'string', example: 'OK' }, message: { type: 'string', example: 'success' }, data: { nullable: true } }
+        },
+        ApiError: {
+          type: 'object', required: ['code', 'message'],
+          properties: { code: { type: 'string', example: 'VALIDATION_ERROR' }, message: { type: 'string', example: '请求参数不正确' }, data: { nullable: true } }
+        },
+        User: {
+          type: 'object', required: ['id', 'username', 'displayName', 'status'],
+          properties: {
+            id: { type: 'string', example: 'u_admin' }, username: { type: 'string', example: 'admin' }, displayName: { type: 'string', example: '系统管理员' },
+            email: { type: 'string' }, phone: { type: 'string' }, status: { type: 'string', enum: ['enabled', 'disabled'] },
+            departmentIds: { type: 'array', items: { type: 'string' } }, roleIds: { type: 'array', items: { type: 'string' } }, avatarUrl: { type: 'string' }, defaultWorkPathId: { type: 'string', nullable: true }
+          }
+        },
+        Node: {
+          type: 'object', required: ['id', 'nodeType', 'name', 'fullPath'],
+          properties: {
+            id: { type: 'string', example: 'n_root' }, parentId: { type: 'string', nullable: true }, nodeType: { type: 'string', enum: ['file', 'folder'] },
+            name: { type: 'string' }, fullPath: { type: 'string' }, extension: { type: 'string' }, status: { type: 'string' }, businessStatus: { type: 'string' },
+            permissions: { type: 'array', items: { type: 'string' } }, createdAt: { type: 'string', format: 'date-time' }, updatedAt: { type: 'string', format: 'date-time' }
+          }
+        },
+        Page: {
+          type: 'object', required: ['items', 'page', 'pageSize', 'total'],
+          properties: { items: { type: 'array', items: {} }, page: { type: 'integer', example: 1 }, pageSize: { type: 'integer', example: 20 }, total: { type: 'integer', example: 1 } }
+        },
+        WebhookEvent: {
+          type: 'object', required: ['id', 'type', 'occurredAt', 'data'],
+          properties: { id: { type: 'string' }, type: { type: 'string', example: 'file.upload' }, occurredAt: { type: 'string', format: 'date-time' }, data: { type: 'object' } },
+          example: { id: 'evt_audit_123', type: 'file.upload', occurredAt: '2026-07-11T10:00:00.000Z', data: { actorId: 'u_admin', targetType: 'node', targetId: 'n_123', targetPath: '/质量手册.docx' } }
+        }
+      },
+      responses: {
+        Success: { description: '请求成功', content: { 'application/json': { schema: { $ref: '#/components/schemas/ApiResponse' } } } },
+        BadRequest: { description: '请求参数错误', content: { 'application/json': { schema: { $ref: '#/components/schemas/ApiError' } } } },
+        Unauthorized: { description: '未登录或凭证无效', content: { 'application/json': { schema: { $ref: '#/components/schemas/ApiError' } } } },
+        Forbidden: { description: '权限不足', content: { 'application/json': { schema: { $ref: '#/components/schemas/ApiError' } } } },
+        NotFound: { description: '资源不存在', content: { 'application/json': { schema: { $ref: '#/components/schemas/ApiError' } } } },
+        Conflict: { description: '资源状态冲突', content: { 'application/json': { schema: { $ref: '#/components/schemas/ApiError' } } } }
       }
     },
     paths: {
@@ -3228,10 +4160,26 @@ function openApiDocument() {
       '/nodes/tree': endpoint('企业文档库目录树'),
       '/personal-drive/tree': endpoint('个人网盘目录树'),
       '/personal-drive/summary': endpoint('个人网盘空间概况'),
+      '/personal-drive/trash': endpoint('个人网盘回收站'),
+      '/personal-drive/logs': endpoint('个人网盘操作记录'),
       '/nodes/{id}/children': endpoint('查询目录子节点'),
       '/folders': endpoint('创建文件夹', 'post'),
       '/files': endpoint('上传文件', 'post'),
+      '/files/office': endpoint('在线新建 Word/Excel/PPT', 'post'),
+      '/files/{id}/export-pdf': endpoint('导出带水印 PDF'),
+      '/files/{id}/print': endpoint('打印文件或历史版本'),
+      '/profile': endpoint('个人资料'),
+      '/profile/avatar': endpoint('上传个人头像', 'post'),
+      '/public/avatars/{userId}': endpoint('读取用户头像'),
+      '/nodes/{id}/external-links': endpoint('创建文件外链', 'post'),
+      '/external-links': endpoint('外链管理'),
+      '/external-links/{id}/revoke': endpoint('撤销外链', 'patch'),
+      '/public/external-links/{token}': endpoint('外链公开信息'),
+      '/public/external-links/{token}/access': endpoint('验证并访问外链', 'post'),
+      '/public/external-links/{token}/content': endpoint('外链预览内容'),
+      '/public/external-links/{token}/download': endpoint('外链下载'),
       '/files/{id}/versions': endpoint('版本列表/上传新版本'),
+      '/files/{id}/versions/{versionId}': endpoint('删除非当前历史版本', 'delete'),
       '/files/{id}/version-logs': endpoint('版本变更记录'),
       '/files/{id}/download': endpoint('文件下载'),
       '/files/{id}/preview': endpoint('文件预览'),
@@ -3300,12 +4248,60 @@ function openApiDocument() {
       '/system-settings/office-preview/test': endpoint('测试 Office 在线预览配置', 'post'),
       '/system-settings/wecom': endpoint('企业微信配置'),
       '/system-settings/wecom/test': endpoint('测试企业微信配置', 'post'),
+      '/system-settings/wecom/sync': endpoint('同步企业微信通讯录', 'post'),
+      '/system-settings/wecom/sync-jobs': endpoint('企业微信同步日志'),
       '/system-settings/storage': endpoint('数据存储配置'),
       '/system-settings/storage/test': endpoint('测试 MySQL 连接', 'post'),
       '/system-settings/storage/sync': endpoint('同步当前账本到 MySQL', 'post'),
-      '/wecom/auth/callback': endpoint('企业微信免登回调预留')
+      '/wecom/auth/config': endpoint('企业微信登录公开配置'),
+      '/wecom/auth/url': endpoint('生成企业微信 OAuth 地址'),
+      '/wecom/auth/callback': endpoint('企业微信免登回调'),
+      '/webhooks': endpoint('Webhook 订阅列表/新增'),
+      '/webhooks/{id}': endpoint('Webhook 修改/停用'),
+      '/webhook-deliveries': endpoint('Webhook 投递记录'),
+      '/webhook-deliveries/{id}/retry': endpoint('重试 Webhook 投递', 'post')
     }
   };
+  const publicPaths = new Set(['/health', '/openapi.json', '/auth/captcha', '/auth/login', '/sso/consume', '/wecom/auth/config', '/wecom/auth/url', '/wecom/auth/callback']);
+  const existingSummaries = new Map(Object.entries(document.paths).flatMap(([pathName, operations]) => Object.entries(operations).map(([method, operation]) => [`${method}:${pathName}`, operation.summary])));
+  const routeLayers = app?._router?.stack?.filter((layer) => layer.route && typeof layer.route.path === 'string') || [];
+  routeLayers.forEach((layer) => {
+    if (!layer.route.path.startsWith('/api/v1')) return;
+    const pathName = layer.route.path.slice('/api/v1'.length).replace(/:([A-Za-z0-9_]+)/g, '{$1}') || '/';
+    document.paths[pathName] = document.paths[pathName] || {};
+    Object.keys(layer.route.methods).filter((method) => layer.route.methods[method]).forEach((method) => {
+      const pathParameters = [...pathName.matchAll(/\{([^}]+)\}/g)].map((match) => ({ name: match[1], in: 'path', required: true, schema: { type: 'string' } }));
+      const parameters = [...pathParameters];
+      if (method === 'get') parameters.push(
+        { name: 'page', in: 'query', required: false, schema: { type: 'integer', minimum: 1, default: 1 } },
+        { name: 'pageSize', in: 'query', required: false, schema: { type: 'integer', minimum: 1, maximum: 1000, default: 20 } }
+      );
+      const operation = {
+        summary: existingSummaries.get(`${method}:${pathName}`) || existingSummaries.get(`get:${pathName}`) || `${method.toUpperCase()} ${pathName}`,
+        operationId: `${method}_${pathName.replace(/[{}]/g, '').replace(/[^A-Za-z0-9]+/g, '_').replace(/^_|_$/g, '') || 'root'}`,
+        tags: [pathName.split('/').filter(Boolean)[0] || 'system'],
+        parameters,
+        responses: {
+          200: { $ref: '#/components/responses/Success' }, 400: { $ref: '#/components/responses/BadRequest' },
+          401: { $ref: '#/components/responses/Unauthorized' }, 403: { $ref: '#/components/responses/Forbidden' },
+          404: { $ref: '#/components/responses/NotFound' }, 409: { $ref: '#/components/responses/Conflict' }
+        }
+      };
+      if (!publicPaths.has(pathName)) operation.security = [{ bearerAuth: [] }, { apiKeyAuth: [] }];
+      if (['post', 'put', 'patch'].includes(method)) {
+        operation.requestBody = {
+          required: false,
+          content: {
+            'application/json': { schema: { type: 'object', additionalProperties: true }, example: {} },
+            'multipart/form-data': { schema: { type: 'object', additionalProperties: true } }
+          }
+        };
+      }
+      document.paths[pathName][method] = operation;
+    });
+  });
+  document['x-generated-from-express-routes'] = true;
+  return document;
 }
 
 app.get('/api/v1/health', (_req, res) => {
@@ -3389,6 +4385,64 @@ app.post('/api/v1/auth/change-password', requireAuth, asyncRoute(async (req, res
   addAudit(req.db, req.user.id, 'user.change_password', 'user', req.user.id, {}, req);
   await saveDb(req.db);
   res.json(ok(true));
+}));
+
+app.get('/api/v1/profile', requireAuth, (req, res) => {
+  res.json(ok(pickPublicUser(req.user)));
+});
+
+app.put('/api/v1/profile', requireAuth, asyncRoute(async (req, res) => {
+  const displayName = String(req.body.displayName ?? req.user.displayName ?? '').trim();
+  if (!displayName) throw createError(400, 'VALIDATION_ERROR', '姓名不能为空');
+  const defaultWorkPathId = req.body.defaultWorkPathId || null;
+  if (defaultWorkPathId) {
+    const folder = nodeById(req.db, defaultWorkPathId);
+    if (!folder || folder.nodeType !== 'folder' || !hasAction(req.db, req.user, folder, 'visible')) {
+      throw createError(400, 'VALIDATION_ERROR', '默认工作目录不存在或无权访问');
+    }
+  }
+  Object.assign(req.user, {
+    displayName,
+    email: String(req.body.email ?? req.user.email ?? '').trim(),
+    phone: String(req.body.phone ?? req.user.phone ?? '').trim(),
+    defaultWorkPathId,
+    updatedAt: now()
+  });
+  addAudit(req.db, req.user.id, 'profile.update', 'user', req.user.id, { defaultWorkPathId }, req);
+  await saveDb(req.db);
+  res.json(ok(pickPublicUser(req.user)));
+}));
+
+app.post('/api/v1/profile/avatar', requireAuth, upload.single('avatar'), asyncRoute(async (req, res) => {
+  if (!req.file) throw createError(400, 'VALIDATION_ERROR', '请选择头像文件');
+  const allowedMimeTypes = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
+  if (!allowedMimeTypes.has(req.file.mimetype) || req.file.size > 2 * 1024 * 1024) {
+    await fs.rm(req.file.path, { force: true });
+    throw createError(400, 'VALIDATION_ERROR', '头像仅支持 PNG、JPG、WebP、GIF，且不能超过 2MB');
+  }
+  const extension = mime.extension(req.file.mimetype) || 'img';
+  const storageKey = `avatar-${req.user.id}-${crypto.randomBytes(8).toString('hex')}.${extension}`;
+  const targetPath = path.join(config.uploadDir, storageKey);
+  await fs.rename(req.file.path, targetPath);
+  if (req.user.avatarStorageKey) await fs.rm(path.join(config.uploadDir, req.user.avatarStorageKey), { force: true }).catch(() => {});
+  req.user.avatarStorageKey = storageKey;
+  req.user.avatarMimeType = req.file.mimetype;
+  req.user.avatarUrl = '';
+  req.user.updatedAt = now();
+  addAudit(req.db, req.user.id, 'profile.avatar.update', 'user', req.user.id, {}, req);
+  await saveDb(req.db);
+  res.json(ok(pickPublicUser(req.user)));
+}));
+
+app.get('/api/v1/public/avatars/:userId', asyncRoute(async (req, res) => {
+  const db = ensureDbShape(await loadDb());
+  const user = db.users.find((item) => item.id === req.params.userId);
+  if (!user?.avatarStorageKey) throw createError(404, 'NOT_FOUND', '头像不存在');
+  const filePath = path.join(config.uploadDir, path.basename(user.avatarStorageKey));
+  if (!fsSync.existsSync(filePath)) throw createError(404, 'NOT_FOUND', '头像文件不存在');
+  res.setHeader('Content-Type', user.avatarMimeType || mime.lookup(filePath) || 'application/octet-stream');
+  res.setHeader('Cache-Control', 'public, max-age=3600');
+  fsSync.createReadStream(filePath).pipe(res);
 }));
 
 app.get('/api/v1/users', requireAuth, (req, res) => {
@@ -3501,15 +4555,16 @@ app.delete('/api/v1/departments/:id', requireAuth, asyncRoute(async (req, res) =
   if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以删除部门');
   const dep = req.db.departments.find((item) => item.id === req.params.id);
   if (!dep) throw createError(404, 'NOT_FOUND', '部门不存在');
+  const userReferences = req.db.users.filter((user) => (user.departmentIds || []).includes(dep.id)).length;
+  const permissionReferences = req.db.permissionRules.filter((rule) => rule.subjectType === 'department' && rule.subjectId === dep.id).length;
+  if (userReferences || permissionReferences) {
+    throw createError(409, 'REFERENCE_CONFLICT', `部门仍被 ${userReferences} 个用户和 ${permissionReferences} 条权限规则引用，请先解除引用`);
+  }
   req.db.departments.filter((item) => item.parentId === dep.id).forEach((child) => {
     child.parentId = dep.parentId || null;
     child.updatedAt = now();
   });
   req.db.departments = req.db.departments.filter((item) => item.id !== req.params.id);
-  req.db.users.forEach((user) => {
-    user.departmentIds = (user.departmentIds || []).filter((id) => id !== req.params.id);
-  });
-  req.db.permissionRules = req.db.permissionRules.filter((rule) => !(rule.subjectType === 'department' && rule.subjectId === req.params.id));
   addAudit(req.db, req.user.id, 'department.delete', 'department', req.params.id, {}, req);
   await saveDb(req.db);
   res.json(ok(true));
@@ -3561,15 +4616,16 @@ app.delete('/api/v1/roles/:id', requireAuth, asyncRoute(async (req, res) => {
   if (req.params.id === 'r_admin') throw createError(409, 'CONFLICT', '系统管理员角色不能删除');
   const role = req.db.roles.find((item) => item.id === req.params.id);
   if (!role) throw createError(404, 'NOT_FOUND', '角色不存在');
+  const userReferences = req.db.users.filter((user) => (user.roleIds || []).includes(role.id)).length;
+  const permissionReferences = req.db.permissionRules.filter((rule) => rule.subjectType === 'role' && rule.subjectId === role.id).length;
+  if (userReferences || permissionReferences) {
+    throw createError(409, 'REFERENCE_CONFLICT', `角色仍被 ${userReferences} 个用户和 ${permissionReferences} 条权限规则引用，请先解除引用`);
+  }
   req.db.roles.filter((item) => item.parentId === role.id).forEach((child) => {
     child.parentId = role.parentId || null;
     child.updatedAt = now();
   });
   req.db.roles = req.db.roles.filter((item) => item.id !== req.params.id);
-  req.db.users.forEach((user) => {
-    user.roleIds = (user.roleIds || []).filter((id) => id !== req.params.id);
-  });
-  req.db.permissionRules = req.db.permissionRules.filter((rule) => !(rule.subjectType === 'role' && rule.subjectId === req.params.id));
   addAudit(req.db, req.user.id, 'role.delete', 'role', req.params.id, {}, req);
   await saveDb(req.db);
   res.json(ok(true));
@@ -3623,6 +4679,29 @@ app.get('/api/v1/personal-drive/summary', requireAuth, asyncRoute(async (req, re
     versions: versions.length,
     sizeBytes: currentSizeBytes
   }));
+}));
+
+app.get('/api/v1/personal-drive/trash', requireAuth, asyncRoute(async (req, res) => {
+  const root = ensurePersonalRoot(req.db, req.user);
+  const deleted = req.db.nodes
+    .filter((node) => node.status === 'deleted' && node.spaceType === 'personal' && node.personalOwnerId === req.user.id)
+    .filter((node) => !node.parentId || includeDeletedNodeById(req.db, node.parentId)?.status !== 'deleted')
+    .sort((a, b) => String(b.deletedAt || '').localeCompare(String(a.deletedAt || '')))
+    .map((node) => publicNode(req.db, req.user, node));
+  await saveDb(req.db);
+  sendPage(res, deleted, req.query.page, req.query.pageSize || 100);
+}));
+
+app.get('/api/v1/personal-drive/logs', requireAuth, asyncRoute(async (req, res) => {
+  const root = ensurePersonalRoot(req.db, req.user);
+  const personalNodeIds = new Set(req.db.nodes.filter((node) => node.spaceType === 'personal' && node.personalOwnerId === req.user.id).map((node) => node.id));
+  const rootPath = `${root.fullPath.replace(/\/$/, '')}/`;
+  const logs = req.db.auditLogs
+    .filter((item) => item.actorId === req.user.id)
+    .filter((item) => personalNodeIds.has(item.targetId) || item.targetPath === root.fullPath || String(item.targetPath || '').startsWith(rootPath))
+    .sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
+  await saveDb(req.db);
+  sendPage(res, logs, req.query.page, req.query.pageSize || 100);
 }));
 
 app.get('/api/v1/nodes/:id/children', requireAuth, (req, res) => {
@@ -3989,42 +5068,153 @@ app.get('/api/v1/nodes/:id/permissions/effective', requireAuth, (req, res) => {
   res.json(ok({ nodeId: node.id, user: pickPublicUser(targetUser), actions: effectiveActions(req.db, targetUser, node) }));
 });
 
+app.post('/api/v1/files/office', requireAuth, asyncRoute(async (req, res) => {
+  const parent = nodeById(req.db, req.body.parentId || 'n_root');
+  requireNodeAction(req, parent, 'file:create');
+  requireNodePasswordAccess(req, parent);
+  const officeType = String(req.body.officeType || '').replace(/^\./, '').toLowerCase();
+  if (!OFFICE_EDIT_EXTENSIONS.has(officeType)) throw createError(400, 'VALIDATION_ERROR', '在线新建仅支持 docx、xlsx、pptx');
+  const inputName = String(req.body.name || '').trim();
+  const defaultNames = { docx: '新建文档.docx', xlsx: '新建表格.xlsx', pptx: '新建演示文稿.pptx' };
+  const name = validateName(inputName || defaultNames[officeType]);
+  if (extname(name) !== officeType) throw createError(400, 'VALIDATION_ERROR', `文件名必须使用 .${officeType} 扩展名`);
+  ensureSiblingNameAvailable(req.db, parent.id, name);
+  const node = createFileNode(req.db, parent, name, req.user.id, req.body.businessStatus || 'draft');
+  const tempPath = path.join(config.tmpDir, `${node.id}-${Date.now()}.${officeType}`);
+  try {
+    const buffer = await createBlankOfficeBuffer(officeType);
+    await fs.writeFile(tempPath, buffer);
+    const version = await createVersionFromFile(req.db, node, tempPath, name, req.user.id, req.body.description || '在线新建');
+    addVersionChangeLog(req.db, node, version, req.user.id, 'create', { description: version.description, source: 'office_template' });
+    addAudit(req.db, req.user.id, 'file.office_create', 'node', node.id, { targetPath: node.fullPath, officeType, versionNo: version.versionNo }, req);
+    notifyVisibleUsersAboutNewFile(req.db, req.user.id, node);
+    await saveDb(req.db);
+    res.json(ok(publicNode(req.db, req.user, node)));
+  } catch (error) {
+    await fs.rm(tempPath, { force: true }).catch(() => {});
+    req.db.nodes = req.db.nodes.filter((item) => item.id !== node.id);
+    req.db.versions = req.db.versions.filter((item) => item.nodeId !== node.id);
+    throw error;
+  }
+}));
+
+app.post('/api/v1/uploads/chunked/init', requireAuth, asyncRoute(async (req, res) => {
+  const parent = nodeById(req.db, req.body.parentId || 'n_root');
+  requireNodeAction(req, parent, 'file:create');
+  requireNodePasswordAccess(req, parent);
+  const filename = validateName(req.body.filename);
+  const sizeBytes = Math.max(0, Number(req.body.sizeBytes || 0));
+  const totalChunks = Math.max(1, Math.min(Number(req.body.totalChunks || 1), 100000));
+  const fileMd5 = String(req.body.md5 || '').trim().toLowerCase();
+  const policy = currentFilePolicy(req.db);
+  if (sizeBytes > Number(policy.maxSizeMb) * 1024 * 1024) throw createError(413, 'FILE_TOO_LARGE', `文件大小不能超过 ${policy.maxSizeMb} MB`);
+  if (fileMd5 && !/^[a-f0-9]{32}$/.test(fileMd5)) throw createError(400, 'VALIDATION_ERROR', 'MD5 格式不正确');
+  const existingVersion = fileMd5 ? req.db.versions.find((item) => item.md5 === fileMd5 && Number(item.sizeBytes || 0) === sizeBytes && (item.storageType || 'local') === 'local' && fsSync.existsSync(path.join(config.uploadDir, item.storageKey || ''))) : null;
+  const existing = req.db.uploadSessions.find((item) => item.userId === req.user.id && item.parentId === parent.id && item.filename === filename && item.md5 === fileMd5 && item.status === 'uploading');
+  if (existing) return res.json(ok({ ...existing, uploadedChunks: [...(existing.uploadedChunks || [])], instantAvailable: Boolean(existingVersion) }));
+  ensureSiblingNameAvailable(req.db, parent.id, filename);
+  const session = {
+    id: newId('upl_'), userId: req.user.id, parentId: parent.id, filename, sizeBytes, md5: fileMd5, totalChunks,
+    uploadedChunks: [], status: existingVersion ? 'instant_ready' : 'uploading', sourceVersionId: existingVersion?.id || null,
+    description: String(req.body.description || '分片上传'), createdAt: now(), updatedAt: now(), expiresAt: new Date(Date.now() + 7 * 86400000).toISOString()
+  };
+  req.db.uploadSessions.unshift(session);
+  await ensureDir(path.join(config.tmpDir, session.id));
+  await saveDb(req.db);
+  res.json(ok({ ...session, instantAvailable: Boolean(existingVersion) }));
+}));
+
+app.get('/api/v1/uploads/chunked/:id', requireAuth, (req, res) => {
+  const session = req.db.uploadSessions.find((item) => item.id === req.params.id && item.userId === req.user.id);
+  if (!session) throw createError(404, 'NOT_FOUND', '上传会话不存在');
+  res.json(ok({ ...session, uploadedChunks: [...(session.uploadedChunks || [])] }));
+});
+
+app.put('/api/v1/uploads/chunked/:id/chunks/:index', requireAuth, upload.single('chunk'), asyncRoute(async (req, res) => {
+  const session = req.db.uploadSessions.find((item) => item.id === req.params.id && item.userId === req.user.id);
+  if (!session || session.status !== 'uploading') throw createError(404, 'NOT_FOUND', '上传会话不存在或已结束');
+  if (!req.file) throw createError(400, 'VALIDATION_ERROR', '缺少分片内容');
+  const index = Number(req.params.index);
+  if (!Number.isInteger(index) || index < 0 || index >= session.totalChunks) { await fs.rm(req.file.path, { force: true }); throw createError(400, 'VALIDATION_ERROR', '分片序号无效'); }
+  const chunkDir = path.join(config.tmpDir, session.id);
+  await ensureDir(chunkDir);
+  const targetPath = path.join(chunkDir, String(index).padStart(8, '0'));
+  await fs.rename(req.file.path, targetPath);
+  session.uploadedChunks = [...new Set([...(session.uploadedChunks || []), index])].sort((a, b) => a - b);
+  session.updatedAt = now();
+  await saveDb(req.db);
+  res.json(ok({ index, uploadedChunks: session.uploadedChunks, received: session.uploadedChunks.length, totalChunks: session.totalChunks }));
+}));
+
+app.post('/api/v1/uploads/chunked/:id/complete', requireAuth, asyncRoute(async (req, res) => {
+  const session = req.db.uploadSessions.find((item) => item.id === req.params.id && item.userId === req.user.id);
+  if (!session) throw createError(404, 'NOT_FOUND', '上传会话不存在');
+  if (session.status === 'completed' && session.nodeId) {
+    const completedNode = nodeById(req.db, session.nodeId);
+    if (completedNode) return res.json(ok(publicNode(req.db, req.user, completedNode)));
+  }
+  const parent = nodeById(req.db, session.parentId);
+  requireNodeAction(req, parent, 'file:create');
+  ensureSiblingNameAvailable(req.db, parent.id, session.filename);
+  const assembledPath = path.join(config.tmpDir, `${session.id}-${safeFilename(session.filename)}`);
+  try {
+    if (session.sourceVersionId) {
+      const source = versionById(req.db, session.sourceVersionId);
+      if (!source) throw createError(409, 'CONFLICT', '秒传源文件已失效，请重新上传');
+      await fs.copyFile(path.join(config.uploadDir, source.storageKey), assembledPath);
+    } else {
+      if ((session.uploadedChunks || []).length !== session.totalChunks) throw createError(409, 'UPLOAD_INCOMPLETE', `仍有 ${session.totalChunks - (session.uploadedChunks || []).length} 个分片未上传`);
+      const output = await fs.open(assembledPath, 'w');
+      try {
+        for (let index = 0; index < session.totalChunks; index += 1) {
+          const bytes = await fs.readFile(path.join(config.tmpDir, session.id, String(index).padStart(8, '0')));
+          await output.write(bytes);
+        }
+      } finally { await output.close(); }
+    }
+    const stats = await fs.stat(assembledPath);
+    if (Number(session.sizeBytes || 0) && stats.size !== Number(session.sizeBytes)) throw createError(409, 'UPLOAD_SIZE_MISMATCH', '合并后的文件大小与声明不一致');
+    const assembledMd5 = await fileMd5FromPath(assembledPath);
+    if (session.md5 && assembledMd5 !== session.md5) throw createError(409, 'UPLOAD_MD5_MISMATCH', '合并后的文件 MD5 校验失败');
+    await scanIncomingFile(req.db, assembledPath, session.filename, req.user.id);
+    const node = createFileNode(req.db, parent, session.filename, req.user.id, 'effective');
+    const version = await createVersionFromFile(req.db, node, assembledPath, session.filename, req.user.id, session.description);
+    addVersionChangeLog(req.db, node, version, req.user.id, 'create', { description: version.description, source: session.sourceVersionId ? 'instant_upload' : 'chunked_upload' });
+    session.status = 'completed';
+    session.nodeId = node.id;
+    session.completedAt = now();
+    session.updatedAt = now();
+    addAudit(req.db, req.user.id, 'file.chunked_upload', 'node', node.id, { targetPath: node.fullPath, totalChunks: session.totalChunks, instant: Boolean(session.sourceVersionId) }, req);
+    notifyVisibleUsersAboutNewFile(req.db, req.user.id, node);
+    await fs.rm(path.join(config.tmpDir, session.id), { recursive: true, force: true });
+    await saveDb(req.db);
+    res.json(ok(publicNode(req.db, req.user, node)));
+  } catch (error) {
+    if (error.code !== 'FILE_QUARANTINED') await fs.rm(assembledPath, { force: true }).catch(() => {});
+    throw error;
+  }
+}));
+
+app.delete('/api/v1/uploads/chunked/:id', requireAuth, asyncRoute(async (req, res) => {
+  const session = req.db.uploadSessions.find((item) => item.id === req.params.id && item.userId === req.user.id);
+  if (!session) throw createError(404, 'NOT_FOUND', '上传会话不存在');
+  session.status = 'cancelled';
+  session.updatedAt = now();
+  await fs.rm(path.join(config.tmpDir, session.id), { recursive: true, force: true });
+  await saveDb(req.db);
+  res.json(ok(true));
+}));
+
 app.post('/api/v1/files', requireAuth, upload.single('file'), asyncRoute(async (req, res) => {
   if (!req.file) throw createError(400, 'VALIDATION_ERROR', '请选择要上传的文件');
   await validateUploadedFileByPolicy(req.db, req.file);
+  await scanIncomingFile(req.db, req.file.path, req.file.originalname, req.user.id);
   const parent = nodeById(req.db, req.body.parentId || 'n_root');
   requireNodeAction(req, parent, 'file:create');
   requireNodePasswordAccess(req, parent);
   const name = validateName(req.body.name || req.file.originalname);
   ensureSiblingNameAvailable(req.db, parent.id, name);
-  const node = {
-    id: newId('n_'),
-    parentId: parent.id,
-    nodeType: 'file',
-    name,
-    fullPath: childPath(parent, name),
-    extension: extname(name),
-    currentVersionId: null,
-    ownerId: req.user.id,
-    spaceType: parent.spaceType || 'enterprise',
-    personalOwnerId: parent.spaceType === 'personal' ? parent.personalOwnerId : null,
-    createdBy: req.user.id,
-    updatedBy: req.user.id,
-    lockedBy: null,
-    lockedAt: null,
-    status: 'normal',
-    businessStatus: req.body.businessStatus || 'effective',
-    securityLevel: parent.securityLevel || 'internal',
-    sensitive: false,
-    sensitiveReason: '',
-    securityUpdatedBy: null,
-    securityUpdatedAt: null,
-    tags: [],
-    createdAt: now(),
-    updatedAt: now(),
-    deletedAt: null
-  };
-  req.db.nodes.push(node);
+  const node = createFileNode(req.db, parent, name, req.user.id, req.body.businessStatus || 'effective');
   const version = await createVersionFromUpload(req.db, node, req.file, req.user.id, req.body.description || '初始版本');
   addVersionChangeLog(req.db, node, version, req.user.id, 'create', { description: version.description });
   addAudit(req.db, req.user.id, 'file.upload', 'node', node.id, { targetPath: node.fullPath, versionNo: version.versionNo }, req);
@@ -4036,6 +5226,7 @@ app.post('/api/v1/files', requireAuth, upload.single('file'), asyncRoute(async (
 app.post('/api/v1/files/:id/versions', requireAuth, upload.single('file'), asyncRoute(async (req, res) => {
   if (!req.file) throw createError(400, 'VALIDATION_ERROR', '请选择要上传的文件');
   await validateUploadedFileByPolicy(req.db, req.file);
+  await scanIncomingFile(req.db, req.file.path, req.file.originalname, req.user.id);
   const node = nodeById(req.db, req.params.id);
   requireNodeAction(req, node, 'file:update');
   requireNodePasswordAccess(req, node);
@@ -4054,6 +5245,7 @@ app.post('/api/v1/files/:id/versions', requireAuth, upload.single('file'), async
   }
   addAudit(req.db, req.user.id, 'file.version.create', 'node', node.id, { targetPath: node.fullPath, versionNo: version.versionNo }, req);
   notifySubscribers(req.db, req.user.id, node, 'update', version);
+  notifyRelatedFileUpdate(req.db, req.user.id, node, version);
   await saveDb(req.db);
   res.json(ok(publicVersion(version)));
 }));
@@ -4078,6 +5270,21 @@ app.get('/api/v1/files/:id/version-logs', requireAuth, (req, res) => {
   res.json(ok(logs));
 });
 
+app.get('/api/v1/files/:id/version-diff', requireAuth, asyncRoute(async (req, res) => {
+  const node = nodeById(req.db, req.params.id);
+  requireNodeAction(req, node, 'file:preview');
+  requireNodePasswordAccess(req, node);
+  const from = req.db.versions.find((item) => item.id === req.query.fromVersionId && item.nodeId === node.id);
+  const to = req.db.versions.find((item) => item.id === req.query.toVersionId && item.nodeId === node.id);
+  if (!from || !to) throw createError(404, 'NOT_FOUND', '请选择有效的两个版本');
+  const [before, after] = await Promise.all([versionComparableText(req.db, node, from), versionComparableText(req.db, node, to)]);
+  const rows = lineDiff(before, after);
+  res.json(ok({
+    from: publicVersion(from), to: publicVersion(to), rows,
+    summary: { added: rows.filter((item) => item.type === 'added').length, removed: rows.filter((item) => item.type === 'removed').length, unchanged: rows.filter((item) => item.type === 'unchanged').length }
+  }));
+}));
+
 app.post('/api/v1/files/:id/versions/:versionId/rollback', requireAuth, asyncRoute(async (req, res) => {
   const node = nodeById(req.db, req.params.id);
   requireNodeAction(req, node, 'file:update');
@@ -4096,6 +5303,59 @@ app.post('/api/v1/files/:id/versions/:versionId/rollback', requireAuth, asyncRou
   addAudit(req.db, req.user.id, 'file.version.rollback', 'node', node.id, { targetPath: node.fullPath, versionNo: version.versionNo }, req);
   await saveDb(req.db);
   res.json(ok(publicNode(req.db, req.user, node)));
+}));
+
+app.delete('/api/v1/files/:id/versions/:versionId', requireAuth, asyncRoute(async (req, res) => {
+  if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以删除历史版本');
+  const node = nodeById(req.db, req.params.id);
+  requireNodePasswordAccess(req, node);
+  const version = req.db.versions.find((item) => item.id === req.params.versionId && item.nodeId === node.id);
+  if (!version) throw createError(404, 'NOT_FOUND', '版本不存在');
+  if (node.currentVersionId === version.id) throw createError(409, 'CONFLICT', '当前版本不能删除');
+  const nodeVersions = req.db.versions.filter((item) => item.nodeId === node.id);
+  if (nodeVersions.length <= 1) throw createError(409, 'CONFLICT', '文件至少需要保留一个版本');
+
+  const originalPath = ['local', 'nas', 's3'].includes(version.storageType || 'local') ? path.join(config.uploadDir, version.storageKey || '') : '';
+  const quarantinePath = originalPath && fsSync.existsSync(originalPath)
+    ? path.join(config.tmpDir, `${version.id}-${Date.now()}.deleted`)
+    : '';
+  const previousVersions = req.db.versions;
+  const previousLogs = [...req.db.versionChangeLogs];
+  const previousAudits = [...req.db.auditLogs];
+  let saved = false;
+  try {
+    if (quarantinePath) await fs.rename(originalPath, quarantinePath);
+    req.db.versions = req.db.versions.filter((item) => item.id !== version.id);
+    addVersionChangeLog(req.db, node, version, req.user.id, 'delete', {
+      description: `删除历史版本 ${version.versionNo}`,
+      deletedVersionId: version.id,
+      deletedVersionNo: version.versionNo
+    });
+    addAudit(req.db, req.user.id, 'file.version.delete', 'node', node.id, {
+      targetPath: node.fullPath,
+      versionId: version.id,
+      versionNo: version.versionNo
+    }, req);
+    await saveDb(req.db);
+    saved = true;
+    if (version.storageType === 'nas' && version.nasPath) await fs.rm(version.nasPath, { force: true }).catch((error) => console.error('failed to remove NAS version', error));
+    if (version.storageType === 's3' && version.s3Key) {
+      const settings = currentFileStorageSettings(req.db).s3;
+      await s3ClientFor(settings).send(new DeleteObjectCommand({ Bucket: version.s3Bucket || settings.bucket, Key: version.s3Key })).catch((error) => console.error('failed to remove S3 version', error));
+    }
+    if (quarantinePath) await fs.rm(quarantinePath, { force: true }).catch((error) => console.error('failed to remove deleted version quarantine', error));
+    res.json(ok(true));
+  } catch (error) {
+    if (!saved) {
+      req.db.versions = previousVersions;
+      req.db.versionChangeLogs = previousLogs;
+      req.db.auditLogs = previousAudits;
+      if (quarantinePath && fsSync.existsSync(quarantinePath) && !fsSync.existsSync(originalPath)) {
+        await fs.rename(quarantinePath, originalPath).catch(() => {});
+      }
+    }
+    throw error;
+  }
 }));
 
 app.get('/api/v1/files/:id/office-edit-session', requireAuth, (req, res) => {
@@ -4239,6 +5499,7 @@ app.post('/api/v1/office-edit/callback', asyncRoute(async (req, res) => {
       versionNo: version.versionNo
     });
     notifySubscribers(db, user.id, node, 'update', version);
+    notifyRelatedFileUpdate(db, user.id, node, version);
     await saveDb(db);
     return res.json({ error: 0 });
   } catch (error) {
@@ -4288,6 +5549,23 @@ app.get('/api/v1/files/:id/download', requireAuth, asyncRoute(async (req, res) =
     await saveDb(req.db);
     throw sensitiveDownloadBlockError(node);
   }
+  const securityPolicy = currentSecurityPolicy(req.db);
+  const downloadExtension = extname(version.originalFilename || node.name);
+  if (securityPolicy.enableDownloadWatermark && (downloadExtension === 'pdf' || OFFICE_PREVIEW_EXTENSIONS.has(downloadExtension))) {
+    const converted = await convertVersionToPdf(req, node, version);
+    const output = await addPdfWatermark(converted, pdfWatermarkText(req.db, req.user, node));
+    const baseName = String(version.originalFilename || node.name).replace(/\.[^.]+$/, '');
+    addAudit(req.db, req.user.id, 'file.download.watermarked', 'node', node.id, {
+      targetPath: node.fullPath, versionNo: version.versionNo, securityLevel: node.securityLevel, sensitive: Boolean(node.sensitive)
+    }, req);
+    recordRecentAccess(req.db, req.user, node, 'download');
+    await saveDb(req.db);
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Length', output.length);
+    res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(`${baseName}-watermarked.pdf`)}`);
+    res.end(output);
+    return;
+  }
   const action = node.sensitive ? 'sensitive.download' : 'file.download';
   addAudit(req.db, req.user.id, action, 'node', node.id, {
     targetPath: node.fullPath,
@@ -4297,7 +5575,15 @@ app.get('/api/v1/files/:id/download', requireAuth, asyncRoute(async (req, res) =
   }, req);
   recordRecentAccess(req.db, req.user, node, 'download');
   void saveDbBestEffort(req.db, 'download access log');
-  streamVersion(res, version, version.originalFilename || node.name, { db: req.db, node });
+  await streamVersion(res, version, version.originalFilename || node.name, { db: req.db, node });
+}));
+
+app.get('/api/v1/files/:id/export-pdf', requireAuth, asyncRoute(async (req, res) => {
+  await controlledPdfOutput(req, res, { action: 'file:export_pdf', inline: false });
+}));
+
+app.get('/api/v1/files/:id/print', requireAuth, asyncRoute(async (req, res) => {
+  await controlledPdfOutput(req, res, { action: 'file:print', inline: true });
 }));
 
 app.get('/storage/raw/:versionId', requireAuth, asyncRoute(async (req, res) => {
@@ -4306,7 +5592,7 @@ app.get('/storage/raw/:versionId', requireAuth, asyncRoute(async (req, res) => {
   const node = nodeById(req.db, version.nodeId);
   requireNodeAction(req, node, 'file:preview');
   requireNodePasswordAccess(req, node);
-  streamVersion(res, version, null, { db: req.db, node });
+  await streamVersion(res, version, null, { db: req.db, node });
 }));
 
 app.get('/api/v1/files/:id/preview', requireAuth, asyncRoute(async (req, res) => {
@@ -4417,7 +5703,7 @@ app.post('/api/v1/files/batch-download', requireAuth, asyncRoute(async (req, res
   res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent('文档打包下载.zip')}`);
   const archive = archiver('zip', { zlib: { level: 9 } });
   archive.pipe(res);
-  nodes.forEach((node) => recursiveZipNodes(req.db, archive, node, req.user, req));
+  await Promise.all(nodes.map((node) => recursiveZipNodes(req.db, archive, node, req.user, req)));
   addAudit(req.db, req.user.id, 'file.batch_download', 'node', 'batch', { count: nodes.length }, req);
   await saveDb(req.db);
   await archive.finalize();
@@ -4645,6 +5931,7 @@ app.get('/api/v1/nodes/:id/attachments', requireAuth, (req, res) => {
   requireNodePasswordAccess(req, node);
   const items = req.db.attachments
     .filter((item) => item.nodeId === node.id)
+    .filter((item) => !req.query.purpose || item.purposeCode === req.query.purpose)
     .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
     .map((item) => publicAttachment(req.db, item));
   res.json(ok(items));
@@ -4657,6 +5944,12 @@ app.post('/api/v1/nodes/:id/attachments', requireAuth, upload.single('file'), as
   requireNodeAction(req, node, 'file:update');
   requireNodePasswordAccess(req, node);
   const attachmentId = newId('att_');
+  const purposeCode = String(req.body.purposeCode || '').trim();
+  const purpose = attachmentPurposes(req.db).find((item) => item.code === purposeCode && item.enabled);
+  if (!purpose) {
+    await fs.rm(req.file.path, { force: true });
+    throw createError(400, 'VALIDATION_ERROR', '请选择有效的附件用途');
+  }
   const storageName = `${attachmentId}-${safeFilename(req.file.originalname)}`;
   const storageKey = path.join(config.uploadDir, storageName);
   await fs.rename(req.file.path, storageKey);
@@ -4669,6 +5962,8 @@ app.post('/api/v1/nodes/:id/attachments', requireAuth, upload.single('file'), as
     sizeBytes: req.file.size,
     mimeType: req.file.mimetype || mime.lookup(req.file.originalname) || 'application/octet-stream',
     description: req.body.description || '',
+    purposeCode: purpose.code,
+    purposeName: purpose.name,
     createdBy: req.user.id,
     createdAt: now()
   };
@@ -4676,6 +5971,23 @@ app.post('/api/v1/nodes/:id/attachments', requireAuth, upload.single('file'), as
   addAudit(req.db, req.user.id, 'attachment.create', 'node', node.id, { targetPath: node.fullPath, attachmentId }, req);
   await saveDb(req.db);
   res.json(ok(publicAttachment(req.db, attachment)));
+}));
+
+app.get('/api/v1/attachment-purposes', requireAuth, (req, res) => {
+  res.json(ok(attachmentPurposes(req.db).filter((item) => item.enabled)));
+});
+
+app.get('/api/v1/system-settings/attachment-purposes', requireAuth, (req, res) => {
+  if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以维护附件用途');
+  res.json(ok(attachmentPurposes(req.db)));
+});
+
+app.put('/api/v1/system-settings/attachment-purposes', requireAuth, asyncRoute(async (req, res) => {
+  if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以维护附件用途');
+  req.db.settings.attachmentPurposes = normalizeAttachmentPurposes(req.body.purposes);
+  addAudit(req.db, req.user.id, 'system.attachment_purposes.update', 'system_setting', 'attachment_purposes', { count: req.db.settings.attachmentPurposes.length }, req);
+  await saveDb(req.db);
+  res.json(ok(req.db.settings.attachmentPurposes));
 }));
 
 app.get('/api/v1/attachments/:id/download', requireAuth, asyncRoute(async (req, res) => {
@@ -5790,8 +7102,11 @@ app.get('/api/v1/messages', requireAuth, asyncRoute(async (req, res) => {
   const unreadUploadCounts = unreadUploadCountsByNode(req.db, req.user);
   const unreadOnly = String(req.query.unread || '').toLowerCase() === 'true';
   const messageType = String(req.query.type || '').trim();
+  const archived = String(req.query.archived || 'false').toLowerCase();
   const messages = req.db.messages
     .filter((item) => item.receiverId === req.user.id)
+    .filter((item) => !item.deletedAt)
+    .filter((item) => archived === 'all' || (archived === 'true' ? Boolean(item.archivedAt) : !item.archivedAt))
     .filter((item) => !unreadOnly || !item.readAt)
     .filter((item) => !messageType || item.messageType === messageType || item.messageType.startsWith(`${messageType}.`))
     .map((item) => publicMessage(req.db, req.user, item, { unreadUploadCounts }));
@@ -5802,26 +7117,50 @@ app.get('/api/v1/messages/unread-count', requireAuth, asyncRoute(async (req, res
   dispatchDueReminders(req.db, req.user.id);
   dispatchOperationalReminders(req.db);
   await saveDb(req.db);
-  res.json(ok(req.db.messages.filter((item) => item.receiverId === req.user.id && !item.readAt).length));
+  res.json(ok(req.db.messages.filter((item) => item.receiverId === req.user.id && !item.readAt && !item.archivedAt && !item.deletedAt).length));
 }));
 
 app.post('/api/v1/messages/:id/read', requireAuth, asyncRoute(async (req, res) => {
-  const message = req.db.messages.find((item) => item.id === req.params.id && item.receiverId === req.user.id);
+  const message = req.db.messages.find((item) => item.id === req.params.id && item.receiverId === req.user.id && !item.deletedAt);
   if (!message) throw createError(404, 'NOT_FOUND', '消息不存在');
   message.readAt = now();
   await saveDb(req.db);
   res.json(ok(publicMessage(req.db, req.user, message, { unreadUploadCounts: unreadUploadCountsByNode(req.db, req.user) })));
 }));
 
+app.post('/api/v1/messages/:id/unread', requireAuth, asyncRoute(async (req, res) => {
+  const message = req.db.messages.find((item) => item.id === req.params.id && item.receiverId === req.user.id && !item.deletedAt);
+  if (!message) throw createError(404, 'NOT_FOUND', '消息不存在');
+  message.readAt = null;
+  await saveDb(req.db);
+  res.json(ok(publicMessage(req.db, req.user, message, { unreadUploadCounts: unreadUploadCountsByNode(req.db, req.user) })));
+}));
+
+app.patch('/api/v1/messages/:id/archive', requireAuth, asyncRoute(async (req, res) => {
+  const message = req.db.messages.find((item) => item.id === req.params.id && item.receiverId === req.user.id && !item.deletedAt);
+  if (!message) throw createError(404, 'NOT_FOUND', '消息不存在');
+  message.archivedAt = req.body.archived === false ? null : now();
+  await saveDb(req.db);
+  res.json(ok(publicMessage(req.db, req.user, message, { unreadUploadCounts: unreadUploadCountsByNode(req.db, req.user) })));
+}));
+
+app.delete('/api/v1/messages/:id', requireAuth, asyncRoute(async (req, res) => {
+  const message = req.db.messages.find((item) => item.id === req.params.id && item.receiverId === req.user.id && !item.deletedAt);
+  if (!message) throw createError(404, 'NOT_FOUND', '消息不存在');
+  message.deletedAt = now();
+  await saveDb(req.db);
+  res.json(ok(true));
+}));
+
 app.get('/api/v1/messages/:id', requireAuth, (req, res) => {
-  const message = req.db.messages.find((item) => item.id === req.params.id && item.receiverId === req.user.id);
+  const message = req.db.messages.find((item) => item.id === req.params.id && item.receiverId === req.user.id && !item.deletedAt);
   if (!message) throw createError(404, 'NOT_FOUND', '消息不存在');
   res.json(ok(publicMessage(req.db, req.user, message, { unreadUploadCounts: unreadUploadCountsByNode(req.db, req.user) })));
 });
 
 app.post('/api/v1/messages/read-all', requireAuth, asyncRoute(async (req, res) => {
   const messageType = String(req.body.type || '').trim();
-  req.db.messages.filter((item) => item.receiverId === req.user.id && (!messageType || item.messageType === messageType || item.messageType.startsWith(`${messageType}.`))).forEach((item) => {
+  req.db.messages.filter((item) => item.receiverId === req.user.id && !item.deletedAt && !item.archivedAt && (!messageType || item.messageType === messageType || item.messageType.startsWith(`${messageType}.`))).forEach((item) => {
     item.readAt = item.readAt || now();
   });
   await saveDb(req.db);
@@ -5867,9 +7206,9 @@ app.get('/api/v1/announcements', requireAuth, (req, res) => {
   sendPage(res, items, req.query.page, req.query.pageSize || 100);
 });
 
-app.post('/api/v1/announcements', requireAuth, upload.single('file'), asyncRoute(async (req, res) => {
+app.post('/api/v1/announcements', requireAuth, upload.array('files', 10), asyncRoute(async (req, res) => {
   if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以发布公告');
-  await validateUploadedFileByPolicy(req.db, req.file);
+  for (const file of req.files || []) { await validateUploadedFileByPolicy(req.db, file); await scanIncomingFile(req.db, file.path, file.originalname, req.user.id); }
   const status = req.body.status === 'draft' ? 'draft' : 'published';
   const announcement = {
     id: newId('ann_'),
@@ -5879,7 +7218,7 @@ app.post('/api/v1/announcements', requireAuth, upload.single('file'), asyncRoute
     status,
     effectiveAt: req.body.effectiveAt || now(),
     expiresAt: req.body.expiresAt || null,
-    attachment: await announcementAttachmentFromUpload(req.file),
+    attachments: await announcementAttachmentsFromUploads(req.files),
     createdBy: req.user.id,
     createdAt: now(),
     updatedAt: now(),
@@ -5894,9 +7233,9 @@ app.post('/api/v1/announcements', requireAuth, upload.single('file'), asyncRoute
   res.json(ok(publicAnnouncement(req.db, req.user, announcement)));
 }));
 
-app.put('/api/v1/announcements/:id', requireAuth, upload.single('file'), asyncRoute(async (req, res) => {
+app.put('/api/v1/announcements/:id', requireAuth, upload.array('files', 10), asyncRoute(async (req, res) => {
   if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以维护公告');
-  await validateUploadedFileByPolicy(req.db, req.file);
+  for (const file of req.files || []) { await validateUploadedFileByPolicy(req.db, file); await scanIncomingFile(req.db, file.path, file.originalname, req.user.id); }
   const announcement = req.db.announcements.find((item) => item.id === req.params.id);
   if (!announcement) throw createError(404, 'NOT_FOUND', '公告不存在');
   const previousStatus = announcement.status;
@@ -5906,13 +7245,11 @@ app.put('/api/v1/announcements/:id', requireAuth, upload.single('file'), asyncRo
   announcement.status = req.body.status || announcement.status;
   announcement.effectiveAt = req.body.effectiveAt === undefined ? announcement.effectiveAt : (req.body.effectiveAt || now());
   announcement.expiresAt = req.body.expiresAt === undefined ? announcement.expiresAt : (req.body.expiresAt || null);
-  if (req.file) {
-    if (announcement.attachment?.storageKey) {
-      const oldPath = path.join(config.uploadDir, announcement.attachment.storageKey);
-      if (fsSync.existsSync(oldPath)) await fs.unlink(oldPath);
-    }
-    announcement.attachment = await announcementAttachmentFromUpload(req.file);
-  }
+  const existingAttachments = announcement.attachments || (announcement.attachment ? [announcement.attachment] : []);
+  const removedAttachmentIds = new Set(parseJsonField(req.body.removeAttachmentIds, []));
+  for (const attachment of existingAttachments.filter((item) => removedAttachmentIds.has(item.id))) await fs.rm(path.join(config.uploadDir, attachment.storageKey), { force: true });
+  announcement.attachments = [...existingAttachments.filter((item) => !removedAttachmentIds.has(item.id)), ...await announcementAttachmentsFromUploads(req.files)];
+  announcement.attachment = null;
   if (!announcement.content) throw createError(400, 'VALIDATION_ERROR', '公告内容不能为空');
   if (announcement.status === 'published' && previousStatus !== 'published') {
     announcement.publishedAt = now();
@@ -5956,10 +7293,8 @@ app.delete('/api/v1/announcements/:id', requireAuth, asyncRoute(async (req, res)
   if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以删除公告');
   const announcement = req.db.announcements.find((item) => item.id === req.params.id);
   if (!announcement) throw createError(404, 'NOT_FOUND', '公告不存在');
-  if (announcement.attachment?.storageKey) {
-    const filePath = path.join(config.uploadDir, announcement.attachment.storageKey);
-    if (fsSync.existsSync(filePath)) await fs.unlink(filePath);
-  }
+  const attachments = announcement.attachments || (announcement.attachment ? [announcement.attachment] : []);
+  await Promise.all(attachments.map((item) => fs.rm(path.join(config.uploadDir, item.storageKey), { force: true })));
   req.db.announcements = req.db.announcements.filter((item) => item.id !== announcement.id);
   addAudit(req.db, req.user.id, 'announcement.delete', 'announcement', announcement.id, { title: announcement.title }, req);
   await saveDb(req.db);
@@ -5977,25 +7312,95 @@ app.get('/api/v1/announcements/:id/attachment', requireAuth, asyncRoute(async (r
   fsSync.createReadStream(filePath).pipe(res);
 }));
 
+app.get('/api/v1/announcements/:id/attachments/:attachmentId', requireAuth, asyncRoute(async (req, res) => {
+  const announcement = req.db.announcements.find((item) => item.id === req.params.id);
+  if (!announcement || !announcementVisibleToUser(announcement, req.user)) throw createError(404, 'NOT_FOUND', '公告不存在');
+  const attachments = announcement.attachments || (announcement.attachment ? [announcement.attachment] : []);
+  const attachment = attachments.find((item) => item.id === req.params.attachmentId);
+  if (!attachment) throw createError(404, 'NOT_FOUND', '公告附件不存在');
+  const filePath = path.join(config.uploadDir, attachment.storageKey);
+  if (!fsSync.existsSync(filePath)) throw createError(404, 'NOT_FOUND', '公告附件内容不存在');
+  res.setHeader('Content-Type', attachment.mimeType || 'application/octet-stream');
+  res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(attachment.originalFilename)}`);
+  fsSync.createReadStream(filePath).pipe(res);
+}));
+
 app.get('/api/v1/favorites', requireAuth, (req, res) => {
   const items = req.db.favorites
     .filter((item) => item.userId === req.user.id)
-    .map((fav) => ({ ...fav, node: nodeById(req.db, fav.nodeId) ? publicNode(req.db, req.user, nodeById(req.db, fav.nodeId)) : null }))
+    .map((fav) => {
+      const folder = req.db.favoriteFolders.find((item) => item.id === fav.folderId && item.userId === req.user.id);
+      return { ...fav, folderId: folder?.id || null, folderName: folder?.name || fav.folderName || '默认收藏夹', node: nodeById(req.db, fav.nodeId) ? publicNode(req.db, req.user, nodeById(req.db, fav.nodeId)) : null };
+    })
     .filter((item) => item.node);
   res.json(ok(items));
 });
+
+app.get('/api/v1/favorite-folders', requireAuth, (req, res) => {
+  const folders = [{ id: null, name: '默认收藏夹', system: true, userId: req.user.id }, ...req.db.favoriteFolders.filter((item) => item.userId === req.user.id)];
+  res.json(ok(folders.map((folder) => ({ ...folder, itemCount: req.db.favorites.filter((item) => item.userId === req.user.id && (item.folderId || null) === folder.id).length }))));
+});
+
+app.post('/api/v1/favorite-folders', requireAuth, asyncRoute(async (req, res) => {
+  const name = validateName(req.body.name);
+  if (req.db.favoriteFolders.some((item) => item.userId === req.user.id && item.name === name)) throw createError(409, 'CONFLICT', '收藏夹名称已存在');
+  const folder = { id: newId('favf_'), userId: req.user.id, name, createdAt: now(), updatedAt: now() };
+  req.db.favoriteFolders.push(folder);
+  await saveDb(req.db);
+  res.json(ok(folder));
+}));
+
+app.put('/api/v1/favorite-folders/:id', requireAuth, asyncRoute(async (req, res) => {
+  const folder = req.db.favoriteFolders.find((item) => item.id === req.params.id && item.userId === req.user.id);
+  if (!folder) throw createError(404, 'NOT_FOUND', '收藏夹不存在');
+  const name = validateName(req.body.name);
+  if (req.db.favoriteFolders.some((item) => item.userId === req.user.id && item.id !== folder.id && item.name === name)) throw createError(409, 'CONFLICT', '收藏夹名称已存在');
+  folder.name = name;
+  folder.updatedAt = now();
+  req.db.favorites.filter((item) => item.userId === req.user.id && item.folderId === folder.id).forEach((item) => { item.folderName = name; });
+  await saveDb(req.db);
+  res.json(ok(folder));
+}));
+
+app.delete('/api/v1/favorite-folders/:id', requireAuth, asyncRoute(async (req, res) => {
+  const folder = req.db.favoriteFolders.find((item) => item.id === req.params.id && item.userId === req.user.id);
+  if (!folder) throw createError(404, 'NOT_FOUND', '收藏夹不存在');
+  req.db.favoriteFolders = req.db.favoriteFolders.filter((item) => item.id !== folder.id);
+  req.db.favorites.filter((item) => item.userId === req.user.id && item.folderId === folder.id).forEach((item) => {
+    item.folderId = null;
+    item.folderName = '默认收藏夹';
+  });
+  await saveDb(req.db);
+  res.json(ok(true));
+}));
 
 app.post('/api/v1/favorites', requireAuth, asyncRoute(async (req, res) => {
   const node = nodeById(req.db, req.body.nodeId);
   requireNodeAction(req, node, 'visible');
   let fav = req.db.favorites.find((item) => item.userId === req.user.id && item.nodeId === node.id);
+  const folderId = req.body.folderId || null;
+  const folder = folderId ? req.db.favoriteFolders.find((item) => item.id === folderId && item.userId === req.user.id) : null;
+  if (folderId && !folder) throw createError(404, 'NOT_FOUND', '收藏夹不存在');
   if (!fav) {
-    fav = { id: newId('fav_'), userId: req.user.id, nodeId: node.id, folderName: req.body.folderName || '默认收藏夹', createdAt: now() };
+    fav = { id: newId('fav_'), userId: req.user.id, nodeId: node.id, folderId: folder?.id || null, folderName: folder?.name || '默认收藏夹', createdAt: now() };
     req.db.favorites.push(fav);
     addAudit(req.db, req.user.id, 'favorite.create', 'node', node.id, { targetPath: node.fullPath }, req);
     await saveDb(req.db);
   }
   res.json(ok(fav));
+}));
+
+app.put('/api/v1/favorites/:id', requireAuth, asyncRoute(async (req, res) => {
+  const favorite = req.db.favorites.find((item) => item.id === req.params.id && item.userId === req.user.id);
+  if (!favorite) throw createError(404, 'NOT_FOUND', '收藏记录不存在');
+  const folderId = req.body.folderId || null;
+  const folder = folderId ? req.db.favoriteFolders.find((item) => item.id === folderId && item.userId === req.user.id) : null;
+  if (folderId && !folder) throw createError(404, 'NOT_FOUND', '收藏夹不存在');
+  favorite.folderId = folder?.id || null;
+  favorite.folderName = folder?.name || '默认收藏夹';
+  favorite.updatedAt = now();
+  await saveDb(req.db);
+  res.json(ok(favorite));
 }));
 
 app.delete('/api/v1/favorites/:id', requireAuth, asyncRoute(async (req, res) => {
@@ -6011,6 +7416,141 @@ app.get('/api/v1/shares', requireAuth, (req, res) => {
     .map((share) => publicShare(req.db, share));
   sendPage(res, shares, req.query.page, req.query.pageSize || 100);
 });
+
+app.get('/api/v1/external-links', requireAuth, (req, res) => {
+  const items = req.db.externalLinks
+    .filter((item) => isAdmin(req.user) || item.createdBy === req.user.id)
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+    .map((item) => publicExternalLink(req.db, item, { includeToken: true }));
+  sendPage(res, items, req.query.page, req.query.pageSize || 100);
+});
+
+app.post('/api/v1/nodes/:id/external-links', requireAuth, asyncRoute(async (req, res) => {
+  const node = nodeById(req.db, req.params.id);
+  requireNodeAction(req, node, 'file:share_external');
+  requireNodePasswordAccess(req, node);
+  if (node.nodeType !== 'file') throw createError(400, 'VALIDATION_ERROR', '只能为文件创建外链');
+  const password = String(req.body.password || '');
+  if (password && (password.length < 4 || password.length > 64)) throw createError(400, 'VALIDATION_ERROR', '提取码长度应为 4-64 个字符');
+  const passwordData = password ? hashPassword(password) : { hash: '', salt: '' };
+  const maxAccessCount = Math.max(0, Math.min(Number(req.body.maxAccessCount || 0), 1000000));
+  const link = {
+    id: newId('ext_'),
+    token: crypto.randomBytes(24).toString('base64url'),
+    nodeId: node.id,
+    description: String(req.body.description || '').trim(),
+    allowPreview: req.body.allowPreview !== false,
+    allowDownload: Boolean(req.body.allowDownload),
+    passwordHash: passwordData.hash,
+    passwordSalt: passwordData.salt,
+    effectiveAt: req.body.effectiveAt || now(),
+    expiresAt: req.body.expiresAt || null,
+    maxAccessCount,
+    accessCount: 0,
+    status: 'active',
+    createdBy: req.user.id,
+    createdAt: now(),
+    updatedAt: now()
+  };
+  if (!link.allowPreview && !link.allowDownload) throw createError(400, 'VALIDATION_ERROR', '外链至少需要允许预览或下载');
+  if (link.expiresAt && new Date(link.expiresAt).getTime() <= new Date(link.effectiveAt).getTime()) {
+    throw createError(400, 'VALIDATION_ERROR', '失效时间必须晚于生效时间');
+  }
+  req.db.externalLinks.unshift(link);
+  addAudit(req.db, req.user.id, 'external_link.create', 'external_link', link.id, {
+    nodeId: node.id, targetPath: node.fullPath, allowPreview: link.allowPreview, allowDownload: link.allowDownload,
+    hasPassword: Boolean(link.passwordHash), expiresAt: link.expiresAt, maxAccessCount
+  }, req);
+  await saveDb(req.db);
+  res.json(ok(publicExternalLink(req.db, link, { includeToken: true })));
+}));
+
+app.patch('/api/v1/external-links/:id/revoke', requireAuth, asyncRoute(async (req, res) => {
+  const link = req.db.externalLinks.find((item) => item.id === req.params.id);
+  if (!link) throw createError(404, 'NOT_FOUND', '外链不存在');
+  if (!isAdmin(req.user) && link.createdBy !== req.user.id) throw createError(403, 'FORBIDDEN', '没有权限撤销该外链');
+  link.status = 'revoked';
+  link.updatedAt = now();
+  addAudit(req.db, req.user.id, 'external_link.revoke', 'external_link', link.id, { nodeId: link.nodeId }, req);
+  await saveDb(req.db);
+  res.json(ok(publicExternalLink(req.db, link, { includeToken: true })));
+}));
+
+app.get('/api/v1/public/external-links/:token', asyncRoute(async (req, res) => {
+  const db = ensureDbShape(await loadDb());
+  const { link, node } = validateExternalLink(db, req.params.token);
+  const version = currentVersion(db, node);
+  res.json(ok({
+    name: node.name,
+    description: link.description,
+    extension: node.extension,
+    sizeBytes: Number(version?.sizeBytes || 0),
+    allowPreview: link.allowPreview !== false,
+    allowDownload: Boolean(link.allowDownload),
+    hasPassword: Boolean(link.passwordHash),
+    expiresAt: link.expiresAt,
+    maxAccessCount: Number(link.maxAccessCount || 0),
+    remainingAccessCount: Number(link.maxAccessCount || 0) > 0 ? Math.max(Number(link.maxAccessCount) - Number(link.accessCount || 0), 0) : null
+  }));
+}));
+
+app.post('/api/v1/public/external-links/:token/access', asyncRoute(async (req, res) => {
+  const db = ensureDbShape(await loadDb());
+  const { link, node } = validateExternalLink(db, req.params.token);
+  if (link.passwordHash && !verifyPassword(String(req.body.password || ''), { passwordHash: link.passwordHash, passwordSalt: link.passwordSalt })) {
+    db.externalLinkAccessLogs.unshift({ id: newId('ela_'), linkId: link.id, action: 'password_failed', ip: req.ip || '', userAgent: req.headers['user-agent'] || '', createdAt: now() });
+    db.externalLinkAccessLogs = db.externalLinkAccessLogs.slice(0, 10000);
+    await saveDb(db);
+    throw createError(401, 'INVALID_PASSWORD', '提取码错误');
+  }
+  link.accessCount = Number(link.accessCount || 0) + 1;
+  link.lastAccessAt = now();
+  link.updatedAt = now();
+  db.externalLinkAccessLogs.unshift({ id: newId('ela_'), linkId: link.id, action: 'access', ip: req.ip || '', userAgent: req.headers['user-agent'] || '', createdAt: now() });
+  db.externalLinkAccessLogs = db.externalLinkAccessLogs.slice(0, 10000);
+  addAudit(db, null, 'external_link.access', 'external_link', link.id, { nodeId: node.id, ip: req.ip || '' }, req);
+  await saveDb(db);
+  res.json(ok({
+    accessToken: signToken({ type: 'external_link', externalLinkId: link.id }, 30 * 60 * 1000),
+    expiresInSeconds: 1800,
+    name: node.name,
+    allowPreview: link.allowPreview !== false,
+    allowDownload: Boolean(link.allowDownload)
+  }));
+}));
+
+app.get('/api/v1/public/external-links/:token/content', asyncRoute(async (req, res) => {
+  const db = ensureDbShape(await loadDb());
+  const { link, node } = validateExternalLink(db, req.params.token, { enforceAccessLimit: false });
+  externalLinkAccessFromRequest(req, link);
+  if (link.allowPreview === false) throw createError(403, 'FORBIDDEN', '该外链不允许预览');
+  const version = currentVersion(db, node);
+  if (!version) throw createError(404, 'NOT_FOUND', '文件版本不存在');
+  const filePath = versionFilePath(version, node, db);
+  if (!fsSync.existsSync(filePath)) throw createError(404, 'NOT_FOUND', '文件内容不存在');
+  db.externalLinkAccessLogs.unshift({ id: newId('ela_'), linkId: link.id, action: 'preview', ip: req.ip || '', userAgent: req.headers['user-agent'] || '', createdAt: now() });
+  await saveDb(db);
+  res.setHeader('Content-Type', version.mimeType || mime.lookup(node.name) || 'application/octet-stream');
+  res.setHeader('Content-Disposition', `inline; filename*=UTF-8''${encodeURIComponent(node.name)}`);
+  fsSync.createReadStream(filePath).pipe(res);
+}));
+
+app.get('/api/v1/public/external-links/:token/download', asyncRoute(async (req, res) => {
+  const db = ensureDbShape(await loadDb());
+  const { link, node } = validateExternalLink(db, req.params.token, { enforceAccessLimit: false });
+  externalLinkAccessFromRequest(req, link);
+  if (!link.allowDownload) throw createError(403, 'FORBIDDEN', '该外链不允许下载');
+  const version = currentVersion(db, node);
+  if (!version) throw createError(404, 'NOT_FOUND', '文件版本不存在');
+  const filePath = versionFilePath(version, node, db);
+  if (!fsSync.existsSync(filePath)) throw createError(404, 'NOT_FOUND', '文件内容不存在');
+  db.externalLinkAccessLogs.unshift({ id: newId('ela_'), linkId: link.id, action: 'download', ip: req.ip || '', userAgent: req.headers['user-agent'] || '', createdAt: now() });
+  addAudit(db, null, 'external_link.download', 'external_link', link.id, { nodeId: node.id, ip: req.ip || '' }, req);
+  await saveDb(db);
+  res.setHeader('Content-Type', version.mimeType || 'application/octet-stream');
+  res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(node.name)}`);
+  fsSync.createReadStream(filePath).pipe(res);
+}));
 
 app.post('/api/v1/nodes/:id/share', requireAuth, asyncRoute(async (req, res) => {
   const node = nodeById(req.db, req.params.id);
@@ -6252,6 +7792,10 @@ app.delete('/api/v1/categories/:id', requireAuth, asyncRoute(async (req, res) =>
   }
   req.db.categories = req.db.categories.filter((item) => !ids.has(item.id));
   req.db.documentCategories = req.db.documentCategories.filter((item) => !ids.has(item.categoryId));
+  req.db.propertyValues = req.db.propertyValues.filter((item) => !ids.has(item.categoryId));
+  req.db.propertyDefinitions.forEach((item) => {
+    item.categoryIds = (item.categoryIds || []).filter((categoryId) => !ids.has(categoryId));
+  });
   await saveDb(req.db);
   res.json(ok(true));
 }));
@@ -6282,6 +7826,8 @@ app.get('/api/v1/property-definitions', requireAuth, (req, res) => {
 
 app.post('/api/v1/property-definitions', requireAuth, asyncRoute(async (req, res) => {
   if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以维护属性定义');
+  const categoryIds = [...new Set((req.body.categoryIds || []).map(String))];
+  if (categoryIds.some((id) => !req.db.categories.some((item) => item.id === id))) throw createError(400, 'VALIDATION_ERROR', '绑定分类不存在');
   const definition = {
     id: newId('prop_'),
     targetType: req.body.targetType || 'file',
@@ -6289,6 +7835,7 @@ app.post('/api/v1/property-definitions', requireAuth, asyncRoute(async (req, res
     dataType: req.body.dataType || 'string',
     required: Boolean(req.body.required),
     options: normalizeOptions(req.body.options),
+    categoryIds,
     createdAt: now(),
     updatedAt: now()
   };
@@ -6306,6 +7853,11 @@ app.put('/api/v1/property-definitions/:id', requireAuth, asyncRoute(async (req, 
   definition.dataType = req.body.dataType ?? definition.dataType;
   definition.required = req.body.required ?? definition.required;
   definition.options = req.body.options === undefined ? definition.options : normalizeOptions(req.body.options);
+  if (req.body.categoryIds !== undefined) {
+    const categoryIds = [...new Set((req.body.categoryIds || []).map(String))];
+    if (categoryIds.some((id) => !req.db.categories.some((item) => item.id === id))) throw createError(400, 'VALIDATION_ERROR', '绑定分类不存在');
+    definition.categoryIds = categoryIds;
+  }
   definition.updatedAt = now();
   await saveDb(req.db);
   res.json(ok(definition));
@@ -6324,10 +7876,23 @@ app.get('/api/v1/nodes/:id/properties', requireAuth, (req, res) => {
   requireNodeAction(req, node, 'visible');
   requireNodePasswordAccess(req, node);
   const categories = req.db.documentCategories.filter((item) => item.nodeId === node.id).map((item) => item.categoryId);
-  const values = req.db.propertyDefinitions.map((definition) => ({
-    definition,
-    value: propertyValueFor(req.db, node.id, definition.id)?.value || ''
-  }));
+  const values = [];
+  req.db.propertyDefinitions.forEach((definition) => {
+    const boundCategoryIds = definition.categoryIds || [];
+    if (!boundCategoryIds.length) {
+      values.push({ key: definition.id, definition, categoryId: null, categoryName: '', value: propertyValueFor(req.db, node.id, definition.id, null)?.value || '' });
+      return;
+    }
+    categories.filter((categoryId) => boundCategoryIds.includes(categoryId)).forEach((categoryId) => {
+      values.push({
+        key: `${categoryId}:${definition.id}`,
+        definition,
+        categoryId,
+        categoryName: req.db.categories.find((item) => item.id === categoryId)?.name || categoryId,
+        value: propertyValueFor(req.db, node.id, definition.id, categoryId)?.value || ''
+      });
+    });
+  });
   res.json(ok({ tags: node.tags || [], categories, values }));
 });
 
@@ -6337,12 +7902,22 @@ app.put('/api/v1/nodes/:id/properties', requireAuth, asyncRoute(async (req, res)
   requireNodePasswordAccess(req, node);
   node.tags = req.body.tags || [];
   const categoryIds = req.body.categoryIds || [];
+  if (categoryIds.some((id) => !req.db.categories.some((item) => item.id === id))) throw createError(400, 'VALIDATION_ERROR', '分类不存在');
   req.db.documentCategories = req.db.documentCategories.filter((item) => item.nodeId !== node.id);
   categoryIds.forEach((categoryId) => req.db.documentCategories.push({ nodeId: node.id, categoryId }));
-  Object.entries(req.body.values || {}).forEach(([propertyId, value]) => {
-    let existing = propertyValueFor(req.db, node.id, propertyId);
+  const applicable = [];
+  req.db.propertyDefinitions.forEach((definition) => {
+    const boundCategoryIds = definition.categoryIds || [];
+    if (!boundCategoryIds.length) applicable.push({ key: definition.id, definition, categoryId: null });
+    else categoryIds.filter((id) => boundCategoryIds.includes(id)).forEach((categoryId) => applicable.push({ key: `${categoryId}:${definition.id}`, definition, categoryId }));
+  });
+  const values = req.body.values || {};
+  applicable.forEach(({ key, definition, categoryId }) => {
+    const value = values[key] ?? '';
+    if (definition.required && String(value ?? '').trim() === '') throw createError(400, 'VALIDATION_ERROR', `${definition.name}为必填属性`);
+    let existing = propertyValueFor(req.db, node.id, definition.id, categoryId);
     if (!existing) {
-      existing = { nodeId: node.id, propertyId, categoryId: null, value: '' };
+      existing = { nodeId: node.id, propertyId: definition.id, categoryId, value: '' };
       req.db.propertyValues.push(existing);
     }
     existing.value = String(value ?? '');
@@ -6437,11 +8012,19 @@ app.post('/api/v1/nodes/:id/rating', requireAuth, asyncRoute(async (req, res) =>
   res.json(ok(rating));
 }));
 
+function filterAuditLogs(items, filters = {}) {
+  let logs = items;
+  if (filters.actorId) logs = logs.filter((item) => item.actorId === filters.actorId);
+  if (filters.action) logs = logs.filter((item) => String(item.action || '').includes(String(filters.action)));
+  if (filters.targetPath) logs = logs.filter((item) => String(item.targetPath || '').includes(String(filters.targetPath)));
+  if (filters.startAt) logs = logs.filter((item) => new Date(item.createdAt).getTime() >= new Date(filters.startAt).getTime());
+  if (filters.endAt) logs = logs.filter((item) => new Date(item.createdAt).getTime() <= new Date(filters.endAt).getTime());
+  return logs;
+}
+
 app.get('/api/v1/audit-logs', requireAuth, (req, res) => {
   if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以查看审计日志');
-  let logs = req.db.auditLogs;
-  if (req.query.actorId) logs = logs.filter((item) => item.actorId === req.query.actorId);
-  if (req.query.action) logs = logs.filter((item) => item.action.includes(req.query.action));
+  let logs = filterAuditLogs(req.db.auditLogs, req.query);
   sendPage(res, logs, req.query.page, req.query.pageSize || 100);
 });
 
@@ -6536,9 +8119,7 @@ app.post('/api/v1/system/alerts/:id/resolve', requireAuth, asyncRoute(async (req
 
 app.post('/api/v1/audit-logs/export', requireAuth, asyncRoute(async (req, res) => {
   if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以导出审计日志');
-  let logs = req.db.auditLogs;
-  if (req.body.actorId) logs = logs.filter((item) => item.actorId === req.body.actorId);
-  if (req.body.action) logs = logs.filter((item) => item.action.includes(req.body.action));
+  const logs = filterAuditLogs(req.db.auditLogs, req.body || {});
   const rows = [
     ['时间', '操作者', '动作', '目标类型', '目标ID', '对象路径', 'IP', '浏览器'],
     ...logs.map((item) => [
@@ -6568,11 +8149,72 @@ app.get('/api/v1/system-settings/file-policy', requireAuth, (req, res) => {
 app.put('/api/v1/system-settings/file-policy', requireAuth, asyncRoute(async (req, res) => {
   if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以维护系统设置');
   const allowedExtensions = normalizeExtensions(req.body.allowedExtensions || DEFAULT_FILE_POLICY.allowedExtensions);
-  const maxSizeMb = Math.max(1, Math.min(Number(req.body.maxSizeMb || DEFAULT_FILE_POLICY.maxSizeMb), 300));
-  req.db.settings.filePolicy = { allowedExtensions, maxSizeMb };
-  addAudit(req.db, req.user.id, 'system.file_policy.update', 'system_setting', 'file_policy', { allowedExtensions, maxSizeMb }, req);
+  const maxSizeMb = Math.max(1, Math.min(Number(req.body.maxSizeMb || DEFAULT_FILE_POLICY.maxSizeMb), 10240));
+  const chunkSizeMb = Math.max(1, Math.min(Number(req.body.chunkSizeMb || DEFAULT_FILE_POLICY.chunkSizeMb), 64));
+  const enableVirusScan = normalizeBoolean(req.body.enableVirusScan, false);
+  const rejectExecutableFiles = normalizeBoolean(req.body.rejectExecutableFiles, true);
+  req.db.settings.filePolicy = { allowedExtensions, maxSizeMb, chunkSizeMb, enableVirusScan, rejectExecutableFiles };
+  addAudit(req.db, req.user.id, 'system.file_policy.update', 'system_setting', 'file_policy', req.db.settings.filePolicy, req);
   await saveDb(req.db);
   res.json(ok(currentFilePolicy(req.db)));
+}));
+
+app.get('/api/v1/system-settings/file-storage', requireAuth, (req, res) => {
+  if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以查看文件存储配置');
+  const settings = currentFileStorageSettings(req.db);
+  res.json(ok({ ...sanitizeFileStorageSettings(settings), usage: { totalBytes: storageUsage(req.db), userBytes: storageUsage(req.db, req.user.id) } }));
+});
+
+app.put('/api/v1/system-settings/file-storage', requireAuth, asyncRoute(async (req, res) => {
+  if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以维护文件存储配置');
+  const next = normalizeFileStorageSettings(req.body || {}, currentFileStorageSettings(req.db));
+  if (next.provider === 'nas') {
+    if (!next.nasRoot) throw createError(400, 'VALIDATION_ERROR', '请填写 NAS 根目录');
+    await ensureDir(next.nasRoot);
+    const probe = path.join(next.nasRoot, `.document-platform-${crypto.randomBytes(6).toString('hex')}`);
+    await fs.writeFile(probe, 'storage-test');
+    await fs.rm(probe, { force: true });
+  }
+  if (next.provider === 's3') {
+    if (!next.s3.bucket) throw createError(400, 'VALIDATION_ERROR', '请填写 S3 Bucket');
+    await s3ClientFor(next.s3).send(new HeadBucketCommand({ Bucket: next.s3.bucket }));
+  }
+  next.updatedBy = req.user.id;
+  next.updatedAt = now();
+  req.db.settings.fileStorage = next;
+  addAudit(req.db, req.user.id, 'system.file_storage.update', 'system_setting', 'file_storage', sanitizeFileStorageSettings(next), req);
+  await saveDb(req.db);
+  res.json(ok({ ...sanitizeFileStorageSettings(next), usage: { totalBytes: storageUsage(req.db), userBytes: storageUsage(req.db, req.user.id) } }));
+}));
+
+app.post('/api/v1/system-settings/file-storage/test', requireAuth, asyncRoute(async (req, res) => {
+  if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以测试文件存储');
+  const settings = normalizeFileStorageSettings(req.body || {}, currentFileStorageSettings(req.db));
+  if (settings.provider === 'local') return res.json(ok({ provider: 'local', connected: true, path: config.uploadDir }));
+  if (settings.provider === 'nas') {
+    await ensureDir(settings.nasRoot);
+    const probe = path.join(settings.nasRoot, `.document-platform-${crypto.randomBytes(6).toString('hex')}`);
+    await fs.writeFile(probe, 'storage-test');
+    await fs.rm(probe, { force: true });
+    return res.json(ok({ provider: 'nas', connected: true, path: settings.nasRoot }));
+  }
+  await s3ClientFor(settings.s3).send(new HeadBucketCommand({ Bucket: settings.s3.bucket }));
+  res.json(ok({ provider: 's3', connected: true, bucket: settings.s3.bucket }));
+}));
+
+app.get('/api/v1/storage/usage', requireAuth, (req, res) => {
+  const settings = currentFileStorageSettings(req.db);
+  const totalBytes = storageUsage(req.db);
+  const userBytes = storageUsage(req.db, req.user.id);
+  const userLimitGb = Number(settings.quota.userLimitsGb?.[req.user.id] ?? settings.quota.defaultUserGb ?? 0);
+  res.json(ok({ provider: settings.provider, totalBytes, totalLimitBytes: settings.quota.totalGb > 0 ? settings.quota.totalGb * 1024 ** 3 : null, userBytes, userLimitBytes: userLimitGb > 0 ? userLimitGb * 1024 ** 3 : null }));
+});
+
+app.post('/api/v1/system/storage/lifecycle/run', requireAuth, asyncRoute(async (req, res) => {
+  if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以执行存储生命周期任务');
+  const result = await runStorageLifecycle(req.db, req.user.id, req);
+  await saveDb(req.db);
+  res.json(ok(result));
 }));
 
 app.get('/api/v1/system-settings/security-policy', requireAuth, (req, res) => {
@@ -6687,24 +8329,240 @@ app.post('/api/v1/system-settings/wecom/test', requireAuth, asyncRoute(async (re
   if (!settings.corpId) missing.push('CorpID');
   if (!settings.agentId) missing.push('AgentID');
   if (!settings.secret) missing.push('Secret');
-  const result = {
-    ok: missing.length === 0,
-    message: missing.length ? `缺少 ${missing.join('、')}` : '配置项完整，等待企业微信真实应用联调',
-    checkedAt: now()
-  };
+  let result;
+  if (missing.length) {
+    result = { ok: false, message: `缺少 ${missing.join('、')}`, checkedAt: now() };
+  } else {
+    await getWecomAccessToken(settings);
+    result = { ok: true, message: '企业微信连接成功，凭据有效', checkedAt: now() };
+  }
   req.db.settings.wecom = { ...settings, lastTestAt: result.checkedAt, lastTestResult: result };
   addAudit(req.db, req.user.id, 'system.wecom.test', 'system_setting', 'wecom', result, req);
   await saveDb(req.db);
   res.json(ok(result));
 }));
 
-app.get('/api/v1/wecom/auth/callback', (req, res) => {
-  res.json(ok({
-    status: 'reserved',
-    message: '企业微信免登录回调接口已预留，正式联调时根据 code 换取用户身份',
-    codeReceived: Boolean(req.query.code)
-  }));
+app.post('/api/v1/system-settings/wecom/sync', requireAuth, asyncRoute(async (req, res) => {
+  if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以同步企业微信通讯录');
+  try {
+    const job = await syncWecomDirectory(req.db, req.user.id, req);
+    await saveDb(req.db);
+    res.json(ok(job));
+  } catch (error) {
+    await saveDb(req.db);
+    throw error;
+  }
+}));
+
+app.get('/api/v1/system-settings/wecom/sync-jobs', requireAuth, (req, res) => {
+  if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以查看企业微信同步日志');
+  sendPage(res, req.db.wecomSyncJobs || [], req.query.page, req.query.pageSize || 20);
 });
+
+app.get('/api/v1/wecom/auth/config', asyncRoute(async (_req, res) => {
+  const db = ensureDbShape(await loadDb());
+  const settings = currentWecomSettings(db);
+  res.json(ok({ enabled: Boolean(settings.enabled && settings.corpId && settings.secret), corpId: settings.corpId, agentId: settings.agentId }));
+}));
+
+app.get('/api/v1/wecom/auth/url', asyncRoute(async (req, res) => {
+  const db = ensureDbShape(await loadDb());
+  const settings = currentWecomSettings(db);
+  if (!settings.enabled || !settings.corpId || !settings.secret) throw createError(400, 'WECOM_NOT_CONFIGURED', '企业微信免登尚未启用');
+  const redirectUri = String(req.query.redirectUri || '').trim();
+  if (!/^https?:\/\//i.test(redirectUri)) throw createError(400, 'VALIDATION_ERROR', 'redirectUri 必须是 HTTP(S) 地址');
+  const state = encodeWecomState(redirectUri);
+  const authorizeUrl = new URL('https://open.weixin.qq.com/connect/oauth2/authorize');
+  authorizeUrl.searchParams.set('appid', settings.corpId);
+  authorizeUrl.searchParams.set('redirect_uri', redirectUri);
+  authorizeUrl.searchParams.set('response_type', 'code');
+  authorizeUrl.searchParams.set('scope', 'snsapi_base');
+  authorizeUrl.searchParams.set('state', state);
+  res.json(ok({ authorizeUrl: `${authorizeUrl.toString()}#wechat_redirect`, stateExpiresInSeconds: 600 }));
+}));
+
+app.get('/api/v1/wecom/auth/callback', asyncRoute(async (req, res) => {
+  const db = ensureDbShape(await loadDb());
+  const settings = currentWecomSettings(db);
+  const code = String(req.query.code || '').trim();
+  if (!code) throw createError(400, 'VALIDATION_ERROR', '缺少企业微信授权 code');
+  if (req.query.state) verifyWecomState(req.query.state);
+  const accessToken = await getWecomAccessToken(settings);
+  const identity = await requestWecomJson(settings, '/cgi-bin/auth/getuserinfo', { access_token: accessToken, code });
+  const wecomUserId = String(identity.UserId || identity.userid || '').trim();
+  if (!wecomUserId) throw createError(403, 'WECOM_USER_NOT_FOUND', '当前企业微信身份不是企业成员');
+  const user = db.users.find((item) => item.wecomUserId === wecomUserId || item.username === wecomUserId);
+  if (!user) throw createError(403, 'WECOM_USER_NOT_SYNCED', '企业微信用户尚未同步到文档平台，请联系管理员同步通讯录');
+  if (user.status !== 'enabled') throw createError(403, 'FORBIDDEN', '账号已被禁用');
+  user.wecomUserId = wecomUserId;
+  user.lastLoginAt = now();
+  user.updatedAt = now();
+  addAudit(db, user.id, 'auth.wecom_login', 'user', user.id, { wecomUserId }, req);
+  await saveDb(db);
+  res.json(ok({ token: signToken({ userId: user.id }), user: pickPublicUser(user) }));
+}));
+
+app.get('/api/v1/auth/providers', asyncRoute(async (_req, res) => {
+  const db = ensureDbShape(await loadDb());
+  const settings = currentIdentitySettings(db);
+  res.json(ok({ oidc: { enabled: settings.oidc.enabled, issuer: settings.oidc.issuer }, saml: { enabled: settings.saml.enabled, issuer: settings.saml.issuer } }));
+}));
+
+app.get('/api/v1/auth/oidc/url', asyncRoute(async (req, res) => {
+  const db = ensureDbShape(await loadDb());
+  const settings = currentIdentitySettings(db).oidc;
+  if (!settings.enabled || !settings.issuer || !settings.clientId || !settings.clientSecret || !settings.redirectUri) throw createError(400, 'OIDC_NOT_CONFIGURED', 'OIDC 配置不完整');
+  const discovery = await oidcDiscovery(settings);
+  const state = encodeIdentityState('oidc', String(req.query.redirectUri || ''));
+  const url = new URL(discovery.authorization_endpoint);
+  url.searchParams.set('response_type', 'code');
+  url.searchParams.set('client_id', settings.clientId);
+  url.searchParams.set('redirect_uri', settings.redirectUri);
+  url.searchParams.set('scope', settings.scopes);
+  url.searchParams.set('state', state);
+  res.json(ok({ authorizeUrl: url.toString() }));
+}));
+
+app.get('/api/v1/auth/oidc/callback', asyncRoute(async (req, res) => {
+  const state = verifyIdentityState(req.query.state, 'oidc');
+  const db = ensureDbShape(await loadDb());
+  const settings = currentIdentitySettings(db).oidc;
+  const discovery = await oidcDiscovery(settings);
+  const body = new URLSearchParams({ grant_type: 'authorization_code', code: String(req.query.code || ''), redirect_uri: settings.redirectUri, client_id: settings.clientId, client_secret: settings.clientSecret });
+  const tokenResponse = await fetch(discovery.token_endpoint, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body, signal: AbortSignal.timeout(10000) });
+  const tokens = await tokenResponse.json().catch(() => ({}));
+  if (!tokenResponse.ok || !tokens.id_token) throw createError(502, 'OIDC_TOKEN_FAILED', tokens.error_description || tokens.error || 'OIDC 换取令牌失败');
+  const jwks = createRemoteJWKSet(new URL(discovery.jwks_uri));
+  const { payload } = await jwtVerify(tokens.id_token, jwks, { issuer: settings.issuer, audience: settings.clientId });
+  const externalId = String(payload.sub || '');
+  const username = String(payload[settings.usernameClaim] || payload.preferred_username || payload.email || externalId);
+  const user = externalIdentityUser(db, { provider: 'oidc', externalId, username, displayName: String(payload[settings.displayNameClaim] || payload.name || username), email: String(payload[settings.emailClaim] || payload.email || ''), autoProvision: settings.autoProvision });
+  user.lastLoginAt = now();
+  addAudit(db, user.id, 'auth.oidc_login', 'user', user.id, { issuer: settings.issuer, subject: externalId }, req);
+  await saveDb(db);
+  res.json(ok({ token: signToken({ userId: user.id }), user: pickPublicUser(user), redirectUri: state.redirectUri || '' }));
+}));
+
+app.get('/api/v1/auth/saml/url', asyncRoute(async (req, res) => {
+  const db = ensureDbShape(await loadDb());
+  const settings = currentIdentitySettings(db).saml;
+  if (!settings.enabled || !settings.entryPoint || !settings.callbackUrl || !settings.idpCert) throw createError(400, 'SAML_NOT_CONFIGURED', 'SAML 配置不完整');
+  const relayState = encodeIdentityState('saml', String(req.query.redirectUri || ''));
+  res.json(ok({ authorizeUrl: await samlClient(settings).getAuthorizeUrlAsync(relayState, req.hostname, {}) }));
+}));
+
+app.post('/api/v1/auth/saml/callback', express.urlencoded({ extended: false, limit: '2mb' }), asyncRoute(async (req, res) => {
+  const state = verifyIdentityState(req.body.RelayState, 'saml');
+  const db = ensureDbShape(await loadDb());
+  const settings = currentIdentitySettings(db).saml;
+  const { profile } = await samlClient(settings).validatePostResponseAsync({ SAMLResponse: String(req.body.SAMLResponse || '') });
+  if (!profile) throw createError(401, 'SAML_LOGIN_FAILED', 'SAML 响应未包含用户身份');
+  const externalId = String(profile.nameID || profile[settings.usernameAttribute] || '');
+  const username = String(profile[settings.usernameAttribute] || profile.nameID || '');
+  const user = externalIdentityUser(db, { provider: 'saml', externalId, username, displayName: String(profile[settings.displayNameAttribute] || profile.displayName || username), email: String(profile[settings.emailAttribute] || profile.email || ''), autoProvision: settings.autoProvision });
+  user.lastLoginAt = now();
+  const ticket = {
+    id: newId('sso_'), userId: user.id, createdBy: user.id, createdAt: now(),
+    expiresAt: new Date(Date.now() + 5 * 60 * 1000).toISOString(), consumedAt: null, consumedByIp: ''
+  };
+  db.loginTickets.unshift(ticket);
+  addAudit(db, user.id, 'auth.saml_login', 'user', user.id, { issuer: profile.issuer || '', nameID: profile.nameID || '' }, req);
+  await saveDb(db);
+  const redirectUrl = new URL(state.redirectUri || requestPublicBaseUrl(req, {}));
+  redirectUrl.searchParams.set('ssoTicket', ticket.id);
+  res.redirect(303, redirectUrl.toString());
+}));
+
+app.get('/api/v1/system-settings/identity', requireAuth, (req, res) => {
+  if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以查看身份源配置');
+  res.json(ok(sanitizeIdentitySettings(currentIdentitySettings(req.db))));
+});
+
+app.put('/api/v1/system-settings/identity', requireAuth, asyncRoute(async (req, res) => {
+  if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以维护身份源配置');
+  req.db.settings.identity = normalizeIdentitySettings(req.body || {}, currentIdentitySettings(req.db));
+  addAudit(req.db, req.user.id, 'system.identity.update', 'system_setting', 'identity', sanitizeIdentitySettings(req.db.settings.identity), req);
+  await saveDb(req.db);
+  res.json(ok(sanitizeIdentitySettings(req.db.settings.identity)));
+}));
+
+app.post('/api/v1/system-settings/identity/ldap/test', requireAuth, asyncRoute(async (req, res) => {
+  if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以测试 LDAP');
+  const settings = currentIdentitySettings(req.db).ldap;
+  const client = new LdapClient({ url: settings.url, timeout: 10000, connectTimeout: 10000, strictDN: false });
+  try {
+    await client.bind(settings.bindDn, settings.bindPassword);
+    const result = await client.search(settings.baseDn, { scope: 'sub', filter: settings.userFilter, sizeLimit: 1, attributes: [settings.usernameAttribute] });
+    res.json(ok({ connected: true, sampleCount: result.searchEntries.length }));
+  } finally { await client.unbind().catch(() => {}); }
+}));
+
+app.post('/api/v1/system-settings/identity/ldap/sync', requireAuth, asyncRoute(async (req, res) => {
+  if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以同步 LDAP');
+  const settings = currentIdentitySettings(req.db).ldap;
+  if (!settings.enabled || !settings.url || !settings.bindDn || !settings.baseDn) throw createError(400, 'LDAP_NOT_CONFIGURED', 'LDAP 配置不完整');
+  const client = new LdapClient({ url: settings.url, timeout: 20000, connectTimeout: 10000, strictDN: false });
+  let created = 0;
+  let updated = 0;
+  try {
+    await client.bind(settings.bindDn, settings.bindPassword);
+    const attributes = [settings.usernameAttribute, settings.displayNameAttribute, settings.emailAttribute, settings.departmentAttribute].filter(Boolean);
+    const result = await client.search(settings.baseDn, { scope: 'sub', filter: settings.userFilter, attributes });
+    result.searchEntries.forEach((entry) => {
+      const username = String(entry[settings.usernameAttribute] || '').trim();
+      if (!username) return;
+      const existed = req.db.users.some((item) => item.username === username || (item.externalIdentities || []).includes(`ldap:${entry.dn}`));
+      const user = externalIdentityUser(req.db, { provider: 'ldap', externalId: entry.dn, username, displayName: String(entry[settings.displayNameAttribute] || username), email: String(entry[settings.emailAttribute] || ''), autoProvision: true });
+      const departmentName = String(entry[settings.departmentAttribute] || '').trim();
+      if (departmentName) {
+        let department = req.db.departments.find((item) => item.name === departmentName && item.sourceType === 'ldap');
+        if (!department) { department = { id: newId('d_'), parentId: null, name: departmentName, code: `ldap:${departmentName}`, sortOrder: 100, status: 'enabled', sourceType: 'ldap', createdAt: now(), updatedAt: now() }; req.db.departments.push(department); }
+        user.departmentIds = [department.id];
+      }
+      existed ? updated += 1 : created += 1;
+    });
+  } finally { await client.unbind().catch(() => {}); }
+  addAudit(req.db, req.user.id, 'system.ldap.sync', 'system_setting', 'ldap', { created, updated }, req);
+  await saveDb(req.db);
+  res.json(ok({ created, updated }));
+}));
+
+app.post('/api/v1/hr/sync', asyncRoute(async (req, res) => {
+  const db = ensureDbShape(await loadDb());
+  const settings = currentIdentitySettings(db).hr;
+  const incomingSecret = String(req.headers['x-hr-sync-secret'] || '');
+  if (!settings.enabled || !settings.syncSecret || incomingSecret.length !== settings.syncSecret.length || !crypto.timingSafeEqual(Buffer.from(incomingSecret), Buffer.from(settings.syncSecret))) throw createError(401, 'UNAUTHORIZED', 'HR 同步密钥无效');
+  const incomingDepartments = Array.isArray(req.body.departments) ? req.body.departments : [];
+  const incomingUsers = Array.isArray(req.body.users) ? req.body.users : [];
+  const departmentMap = new Map();
+  incomingDepartments.forEach((item) => {
+    const externalId = String(item.id || item.code || '').trim();
+    if (!externalId) return;
+    let department = db.departments.find((entry) => entry.hrDepartmentId === externalId);
+    if (!department) { department = { id: newId('d_'), createdAt: now() }; db.departments.push(department); }
+    Object.assign(department, { parentId: null, name: String(item.name || externalId), code: String(item.code || `hr:${externalId}`), sortOrder: Number(item.sortOrder || 100), status: item.status === 'disabled' ? 'disabled' : 'enabled', sourceType: 'hr', hrDepartmentId: externalId, updatedAt: now() });
+    departmentMap.set(externalId, department);
+  });
+  incomingDepartments.forEach((item) => {
+    const dep = departmentMap.get(String(item.id || item.code || ''));
+    if (dep) dep.parentId = departmentMap.get(String(item.parentId || ''))?.id || null;
+  });
+  const syncedIds = new Set();
+  incomingUsers.forEach((item) => {
+    const externalId = String(item.id || item.username || '').trim();
+    const username = String(item.username || externalId).trim();
+    if (!externalId || !username) return;
+    const user = externalIdentityUser(db, { provider: 'hr', externalId, username, displayName: String(item.displayName || item.name || username), email: String(item.email || ''), autoProvision: true });
+    user.phone = String(item.phone || user.phone || '');
+    user.departmentIds = (item.departmentIds || [item.departmentId]).map((id) => departmentMap.get(String(id))?.id).filter(Boolean);
+    user.status = item.status === 'disabled' ? 'disabled' : 'enabled';
+    syncedIds.add(externalId);
+  });
+  if (settings.autoDisableMissing) db.users.filter((item) => item.sourceType === 'hr').forEach((item) => { const id = (item.externalIdentities || []).find((entry) => entry.startsWith('hr:'))?.slice(3); if (id && !syncedIds.has(id)) item.status = 'disabled'; });
+  addAudit(db, null, 'system.hr.sync', 'system_setting', 'hr', { departments: incomingDepartments.length, users: incomingUsers.length }, req);
+  await saveDb(db);
+  res.json(ok({ departments: incomingDepartments.length, users: incomingUsers.length }));
+}));
 
 app.get('/api/v1/system-settings/storage', requireAuth, asyncRoute(async (req, res) => {
   if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以查看系统设置');
@@ -6896,6 +8754,80 @@ app.get('/api/v1/api-call-logs', requireAuth, (req, res) => {
   sendPage(res, logs, req.query.page, req.query.pageSize || 100);
 });
 
+app.get('/api/v1/webhooks', requireAuth, (req, res) => {
+  if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以管理 Webhook');
+  sendPage(res, req.db.webhookSubscriptions.map((item) => publicWebhookSubscription(item)), req.query.page, req.query.pageSize || 100);
+});
+
+app.post('/api/v1/webhooks', requireAuth, asyncRoute(async (req, res) => {
+  if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以创建 Webhook');
+  let url;
+  try { url = new URL(String(req.body.url || '')); } catch { throw createError(400, 'VALIDATION_ERROR', 'Webhook URL 格式无效'); }
+  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) throw createError(400, 'VALIDATION_ERROR', 'Webhook URL 必须是 HTTP(S) 地址');
+  const secret = crypto.randomBytes(32).toString('base64url');
+  const subscription = {
+    id: newId('wh_'), name: validateName(req.body.name || 'Webhook'), url: url.toString(),
+    eventPatterns: normalizeOptions(req.body.eventPatterns || ['*']), status: req.body.status === 'disabled' ? 'disabled' : 'enabled',
+    secret, createdBy: req.user.id, createdAt: now(), updatedAt: now(), lastDeliveredAt: null, lastError: ''
+  };
+  req.db.webhookSubscriptions.unshift(subscription);
+  addAudit(req.db, req.user.id, 'webhook.create', 'webhook', subscription.id, { name: subscription.name, url: subscription.url, eventPatterns: subscription.eventPatterns }, req);
+  await saveDb(req.db);
+  res.json(ok(publicWebhookSubscription(subscription, secret)));
+}));
+
+app.put('/api/v1/webhooks/:id', requireAuth, asyncRoute(async (req, res) => {
+  if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以维护 Webhook');
+  const subscription = req.db.webhookSubscriptions.find((item) => item.id === req.params.id);
+  if (!subscription) throw createError(404, 'NOT_FOUND', 'Webhook 不存在');
+  if (req.body.url !== undefined) {
+    let url;
+    try { url = new URL(String(req.body.url || '')); } catch { throw createError(400, 'VALIDATION_ERROR', 'Webhook URL 格式无效'); }
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) throw createError(400, 'VALIDATION_ERROR', 'Webhook URL 必须是 HTTP(S) 地址');
+    subscription.url = url.toString();
+  }
+  subscription.name = req.body.name ? validateName(req.body.name) : subscription.name;
+  subscription.eventPatterns = req.body.eventPatterns === undefined ? subscription.eventPatterns : normalizeOptions(req.body.eventPatterns || ['*']);
+  subscription.status = req.body.status || subscription.status;
+  subscription.updatedAt = now();
+  addAudit(req.db, req.user.id, 'webhook.update', 'webhook', subscription.id, { status: subscription.status }, req);
+  await saveDb(req.db);
+  res.json(ok(publicWebhookSubscription(subscription)));
+}));
+
+app.delete('/api/v1/webhooks/:id', requireAuth, asyncRoute(async (req, res) => {
+  if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以删除 Webhook');
+  const subscription = req.db.webhookSubscriptions.find((item) => item.id === req.params.id);
+  if (!subscription) throw createError(404, 'NOT_FOUND', 'Webhook 不存在');
+  subscription.status = 'disabled';
+  subscription.updatedAt = now();
+  await saveDb(req.db);
+  res.json(ok(publicWebhookSubscription(subscription)));
+}));
+
+app.get('/api/v1/webhook-deliveries', requireAuth, (req, res) => {
+  if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以查看 Webhook 投递');
+  let items = req.db.webhookDeliveries;
+  if (req.query.subscriptionId) items = items.filter((item) => item.subscriptionId === req.query.subscriptionId);
+  if (req.query.status) items = items.filter((item) => item.status === req.query.status);
+  sendPage(res, items, req.query.page, req.query.pageSize || 100);
+});
+
+app.post('/api/v1/webhook-deliveries/:id/retry', requireAuth, asyncRoute(async (req, res) => {
+  if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以重试 Webhook');
+  const existing = req.db.webhookDeliveries.find((item) => item.id === req.params.id);
+  if (!existing) throw createError(404, 'NOT_FOUND', 'Webhook 投递记录不存在');
+  const subscription = req.db.webhookSubscriptions.find((item) => item.id === existing.subscriptionId);
+  if (!subscription) throw createError(404, 'NOT_FOUND', 'Webhook 配置不存在');
+  const audit = req.db.auditLogs.find((item) => `evt_${item.id}` === existing.eventId);
+  if (!audit) throw createError(404, 'NOT_FOUND', 'Webhook 原始事件不存在');
+  const event = { id: existing.eventId, type: audit.action, occurredAt: audit.createdAt, data: { actorId: audit.actorId || null, targetType: audit.targetType, targetId: audit.targetId, targetPath: audit.targetPath || '', detail: audit.detail || {} } };
+  const delivery = await deliverWebhook(req.db, subscription, event);
+  delivery.attempts = Number(existing.attempts || 0) + 1;
+  await saveDb(req.db);
+  res.json(ok(delivery));
+}));
+
 app.post('/api/v1/sso/tickets', requireAuth, asyncRoute(async (req, res) => {
   if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以创建单点登录票据');
   const userId = req.body.userId;
@@ -6921,6 +8853,15 @@ app.post('/api/v1/sso/tickets', requireAuth, asyncRoute(async (req, res) => {
   }));
 }));
 
+app.get('/api/v1/sso/tickets/:id/user', requireAuth, (req, res) => {
+  if (!isAdmin(req.user) && !req.apiCredential) throw createError(403, 'FORBIDDEN', '只有管理员或 API 凭证可以反查登录票据');
+  const ticket = req.db.loginTickets.find((item) => item.id === req.params.id);
+  if (!ticket) throw createError(404, 'NOT_FOUND', '登录票据不存在');
+  const user = req.db.users.find((item) => item.id === ticket.userId);
+  if (!user) throw createError(404, 'NOT_FOUND', '票据关联用户不存在');
+  res.json(ok({ ticketId: ticket.id, user: pickPublicUser(user), expiresAt: ticket.expiresAt, expired: new Date(ticket.expiresAt).getTime() < Date.now(), consumedAt: ticket.consumedAt || null }));
+});
+
 app.get('/api/v1/sso/consume', asyncRoute(async (req, res) => {
   const db = ensureDbShape(await loadDb());
   const ticket = db.loginTickets.find((item) => item.id === req.query.ticket);
@@ -6943,7 +8884,23 @@ app.get('/api/v1/dashboard', requireAuth, asyncRoute(async (req, res) => {
   const visible = listVisibleDescendants(req.db, req.user);
   const files = visible.filter((item) => item.nodeType === 'file');
   const latestFiles = files.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).slice(0, 8).map((item) => publicNode(req.db, req.user, item));
-  const favorites = req.db.favorites.filter((item) => item.userId === req.user.id).slice(0, 8);
+  const favorites = req.db.favorites
+    .filter((item) => item.userId === req.user.id)
+    .map((item) => ({ ...item, node: nodeById(req.db, item.nodeId) }))
+    .filter((item) => item.node && hasAction(req.db, req.user, item.node, 'visible'))
+    .slice(0, 20)
+    .map((item) => ({ ...item, node: publicNode(req.db, req.user, item.node) }));
+  const pendingApprovals = (req.db.documentApprovals || [])
+    .filter((item) => item.status === 'pending' && (isAdmin(req.user) || currentApprovalStep(item)?.approverIds?.includes(req.user.id)))
+    .filter((item) => {
+      const node = nodeById(req.db, item.nodeId);
+      return node && hasAction(req.db, req.user, node, 'visible');
+    })
+    .slice(0, 20)
+    .map((item) => publicApproval(req.db, req.user, item));
+  const myShares = (req.db.shares || []).filter((item) => item.createdBy === req.user.id).slice(0, 20).map((item) => publicShare(req.db, item));
+  const mySubscriptions = (req.db.subscriptions || []).filter((item) => item.userId === req.user.id && item.status === 'active').slice(0, 20).map((item) => publicSubscription(req.db, item));
+  const lockedFiles = files.filter((item) => item.lockedBy).slice(0, 20).map((item) => publicNode(req.db, req.user, item));
   const fileIds = new Set(files.map((item) => item.id));
   const today = new Date();
   today.setUTCHours(0, 0, 0, 0);
@@ -6960,11 +8917,17 @@ app.get('/api/v1/dashboard', requireAuth, asyncRoute(async (req, res) => {
       folders: visible.filter((item) => item.nodeType === 'folder').length,
       files: files.length,
       versions: req.db.versions.filter((version) => fileIds.has(version.nodeId)).length,
-      unreadMessages: req.db.messages.filter((item) => item.receiverId === req.user.id && !item.readAt).length
+      unreadMessages: req.db.messages.filter((item) => item.receiverId === req.user.id && !item.readAt && !item.archivedAt && !item.deletedAt).length,
+      pendingApprovals: pendingApprovals.length,
+      lockedFiles: lockedFiles.length
     },
     growthTrend,
     latestFiles,
     favorites,
+    pendingApprovals,
+    myShares,
+    mySubscriptions,
+    lockedFiles,
     reminders: req.db.reminders.filter((item) => item.userId === req.user.id && item.status === 'active').slice(0, 8).map((item) => publicReminder(req.db, item)),
     recentAudits: req.db.auditLogs.filter((item) => item.actorId === req.user.id).slice(0, 8)
   }));
