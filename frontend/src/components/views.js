@@ -89,8 +89,8 @@ export const DashboardView = {
 };
 
 export const DocsView = {
-  props: ['tree', 'children', 'selectedFolder', 'users', 'departments', 'roles', 'formatDate', 'formatSize', 'actions', 'spaceSummary', 'isAdmin', 'enableSync', 'recentAccesses', 'storageScope', 'suggestSearch'],
-  emits: ['select-folder', 'create-folder', 'upload', 'rename', 'delete', 'download', 'preview', 'versions', 'lock', 'unlock', 'favorite', 'permissions', 'view-access', 'node-password', 'sync-external', 'search', 'batch-download', 'batch-move', 'batch-delete', 'batch-metadata', 'move', 'copy', 'copy-enterprise', 'share', 'subscribe', 'reminder', 'metadata', 'links', 'workflow', 'security', 'request-download', 'governance'],
+  props: ['tree', 'children', 'selectedFolder', 'users', 'departments', 'roles', 'categories', 'recentSearches', 'formatDate', 'formatSize', 'actions', 'spaceSummary', 'isAdmin', 'enableSync', 'recentAccesses', 'storageScope', 'suggestSearch'],
+  emits: ['select-folder', 'create-folder', 'upload', 'rename', 'delete', 'download', 'preview', 'office-edit', 'versions', 'lock', 'unlock', 'favorite', 'permissions', 'view-access', 'node-password', 'sync-external', 'search', 'clear-recent-searches', 'batch-download', 'batch-move', 'batch-delete', 'batch-metadata', 'move', 'copy', 'copy-enterprise', 'share', 'subscribe', 'reminder', 'metadata', 'links', 'workflow', 'security', 'request-approval', 'governance'],
   data: () => ({
     Download: DownloadIcon,
     MoreHorizontal: MoreHorizontalIcon,
@@ -104,6 +104,9 @@ export const DocsView = {
     selection: [],
     filtersVisible: false,
     fileTypesText: '',
+    securityLevels: [],
+    categoryIds: [],
+    tagsText: '',
     creatorId: '',
     updatedRange: [],
     sortBy: 'relevance',
@@ -140,6 +143,9 @@ export const DocsView = {
       const items = [];
       if (String(this.keyword || '').trim()) items.push(`关键词：${String(this.keyword).trim()}`);
       if (String(this.fileTypesText || '').trim()) items.push(`类型：${String(this.fileTypesText).trim()}`);
+      if (this.securityLevels.length) items.push(`密级：${this.securityLevels.map((item) => ({ public: '公开', internal: '内部', restricted: '受限', confidential: '机密' }[item] || item)).join('、')}`);
+      if (this.categoryIds.length) items.push(`分类：${this.categoryIds.length} 项`);
+      if (String(this.tagsText || '').trim()) items.push(`标签：${String(this.tagsText).trim()}`);
       const creator = this.users?.find((item) => item.id === this.creatorId);
       if (this.creatorId) items.push(`创建人：${creator?.displayName || creator?.username || this.creatorId}`);
       if (this.updatedRange?.[0] || this.updatedRange?.[1]) items.push('更新时间');
@@ -194,6 +200,12 @@ export const DocsView = {
     downloadBlocked(row) {
       return row?.nodeType === 'file' && row.sensitiveDownloadBlocked;
     },
+    canOfficeEdit(row) {
+      return row?.nodeType === 'file'
+        && ['docx', 'xlsx', 'pptx'].includes(String(row.extension || '').toLowerCase())
+        && (row.sourceType || 'local') !== 'external'
+        && this.can(row, 'file:update');
+    },
     securityLevelLabel(row) {
       return row.securityLevelLabel || { public: '公开', internal: '内部', restricted: '受限', confidential: '机密' }[row.securityLevel] || '-';
     },
@@ -215,6 +227,9 @@ export const DocsView = {
       return {
         keyword: this.keyword,
         fileTypesText: this.fileTypesText,
+        securityLevels: this.securityLevels,
+        categoryIds: this.categoryIds,
+        tagsText: this.tagsText,
         creatorId: this.creatorId,
         updatedRange: this.updatedRange,
         sortBy: this.sortBy,
@@ -224,6 +239,9 @@ export const DocsView = {
     applyFilterState(state, run = true) {
       this.keyword = state?.keyword || '';
       this.fileTypesText = state?.fileTypesText || '';
+      this.securityLevels = state?.securityLevels || [];
+      this.categoryIds = state?.categoryIds || [];
+      this.tagsText = state?.tagsText || '';
       this.creatorId = state?.creatorId || '';
       this.updatedRange = state?.updatedRange || [];
       this.sortBy = state?.sortBy || 'relevance';
@@ -243,6 +261,9 @@ export const DocsView = {
         name,
         keyword: this.keyword,
         fileTypesText: this.fileTypesText,
+        securityLevels: this.securityLevels,
+        categoryIds: this.categoryIds,
+        tagsText: this.tagsText,
         creatorId: this.creatorId,
         updatedRange: this.updatedRange,
         sortBy: this.sortBy,
@@ -307,8 +328,12 @@ export const DocsView = {
       const commands = {
         open: () => this.openRow(row),
         preview: () => this.$emit('preview', row, null, { searchKeyword: row.searchMatch?.keyword || this.keyword || '' }),
+        officeEdit: () => this.$emit('office-edit', row),
         download: () => this.$emit('download', row),
-        requestDownload: () => this.$emit('request-download', row),
+        requestDownload: () => this.$emit('request-approval', row, 'download'),
+        requestBorrow: () => this.$emit('request-approval', row, 'borrow'),
+        requestExternal: () => this.$emit('request-approval', row, 'external'),
+        requestPermission: () => this.$emit('request-approval', row, 'permission'),
         rename: () => this.$emit('rename', row),
         move: () => this.$emit('move', row, 'move'),
         copy: () => this.$emit('copy', row, 'copy'),
@@ -339,6 +364,9 @@ export const DocsView = {
       const criteria = {
         keyword: this.keyword,
         fileTypes: String(this.fileTypesText || '').split(/[,\s，]+/).map((item) => item.replace(/^\./, '').trim().toLowerCase()).filter(Boolean),
+        securityLevels: this.securityLevels,
+        categoryIds: this.categoryIds,
+        tags: String(this.tagsText || '').split(/[,\s，]+/).map((item) => item.trim()).filter(Boolean),
         creatorId: this.creatorId,
         updatedFrom: this.updatedRange?.[0] ? new Date(this.updatedRange[0]).toISOString() : '',
         updatedTo: this.updatedRange?.[1] ? new Date(this.updatedRange[1]).toISOString() : '',
@@ -351,6 +379,9 @@ export const DocsView = {
       this.applyFilterState({
         keyword: '',
         fileTypesText: '',
+        securityLevels: [],
+        categoryIds: [],
+        tagsText: '',
         creatorId: '',
         updatedRange: [],
         sortBy: 'relevance',
@@ -374,6 +405,20 @@ export const DocsView = {
     selectSearchSuggestion(item) {
       this.keyword = item?.value || this.keyword;
       this.runSearch();
+    },
+    applyRecentSearch(item) {
+      const filters = item?.filters || {};
+      this.applyFilterState({
+        keyword: item?.keyword || '',
+        fileTypesText: (filters.fileTypes || []).join(','),
+        securityLevels: filters.securityLevels || [],
+        categoryIds: filters.categoryIds || [],
+        tagsText: (filters.tags || []).join(','),
+        creatorId: filters.creatorId || '',
+        updatedRange: filters.updatedFrom || filters.updatedTo ? [filters.updatedFrom || '', filters.updatedTo || ''] : [],
+        sortBy: filters.sortBy || 'relevance',
+        sortDir: filters.sortDir || 'desc'
+      });
     },
     escapeHtml(value) {
       return String(value || '').replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
@@ -444,8 +489,12 @@ export const DocsView = {
                 <el-dropdown-menu v-if="singleSelection" class="docs-more-menu">
                   <el-dropdown-item v-if="singleSelection.nodeType === 'folder'" :command="{ action: 'open', row: singleSelection }">打开文件夹</el-dropdown-item>
                   <el-dropdown-item v-if="singleSelection.nodeType === 'file'" :command="{ action: 'preview', row: singleSelection }" :disabled="!can(singleSelection, 'file:preview')">预览</el-dropdown-item>
+                  <el-dropdown-item v-if="canOfficeEdit(singleSelection)" :command="{ action: 'officeEdit', row: singleSelection }">在线编辑</el-dropdown-item>
                   <el-dropdown-item v-if="!downloadBlocked(singleSelection)" :command="{ action: 'download', row: singleSelection }" :disabled="!canDownload(singleSelection)">{{ singleSelection.nodeType === 'folder' ? '打包下载' : '下载' }}</el-dropdown-item>
                   <el-dropdown-item v-if="downloadBlocked(singleSelection)" :command="{ action: 'requestDownload', row: singleSelection }">申请下载</el-dropdown-item>
+                  <el-dropdown-item v-if="singleSelection.nodeType === 'file'" :command="{ action: 'requestBorrow', row: singleSelection }">申请借阅</el-dropdown-item>
+                  <el-dropdown-item v-if="singleSelection.nodeType === 'file'" :command="{ action: 'requestExternal', row: singleSelection }">申请外发</el-dropdown-item>
+                  <el-dropdown-item :command="{ action: 'requestPermission', row: singleSelection }">申请权限</el-dropdown-item>
                   <el-dropdown-item v-if="singleSelection.nodeType === 'file'" :command="{ action: 'versions', row: singleSelection }">版本</el-dropdown-item>
                   <el-dropdown-item :command="{ action: 'rename', row: singleSelection }" :disabled="!canModify(singleSelection)">重命名</el-dropdown-item>
                   <el-dropdown-item :command="{ action: 'move', row: singleSelection }" :disabled="!canModify(singleSelection)">移动</el-dropdown-item>
@@ -499,12 +548,33 @@ export const DocsView = {
                   </div>
                 </template>
               </el-autocomplete>
+              <el-dropdown v-if="recentSearches?.length" trigger="click" @command="applyRecentSearch">
+                <el-button>最近</el-button>
+                <template #dropdown>
+                  <el-dropdown-menu class="docs-more-menu recent-search-menu">
+                    <el-dropdown-item v-for="item in recentSearches" :key="item.id" :command="item">
+                      {{ item.keyword || '组合筛选' }}（{{ item.resultCount }}）
+                    </el-dropdown-item>
+                    <el-dropdown-item divided @click="$emit('clear-recent-searches')">清空最近搜索</el-dropdown-item>
+                  </el-dropdown-menu>
+                </template>
+              </el-dropdown>
               <el-button aria-label="搜索" @click="runSearch"><Search class="toolbar-icon" /></el-button>
             </div>
           </div>
         </div>
         <div v-if="filtersVisible" class="toolbar filter-toolbar">
           <el-input v-model="fileTypesText" placeholder="扩展名：docx,pdf,xlsx" style="max-width: 220px" />
+          <el-select v-model="securityLevels" multiple collapse-tags clearable placeholder="密级" style="max-width: 190px">
+            <el-option label="公开" value="public" />
+            <el-option label="内部" value="internal" />
+            <el-option label="受限" value="restricted" />
+            <el-option label="机密" value="confidential" />
+          </el-select>
+          <el-select v-model="categoryIds" multiple collapse-tags clearable filterable placeholder="知识分类" style="max-width: 210px">
+            <el-option v-for="item in categories || []" :key="item.id" :label="item.fullPath || item.name" :value="item.id" />
+          </el-select>
+          <el-input v-model="tagsText" placeholder="标签：制度,质量" style="max-width: 190px" />
           <el-select v-model="creatorId" clearable filterable placeholder="创建人" style="max-width: 180px">
             <el-option v-for="item in users" :key="item.id" :label="item.displayName || item.username" :value="item.id" />
           </el-select>
@@ -721,8 +791,8 @@ export const CollaborationView = {
 };
 
 export const ApprovalCenterView = {
-  props: ['todo', 'mine', 'all', 'formatDate'],
-  emits: ['approve', 'reject', 'refresh'],
+  props: ['todo', 'mine', 'all', 'formatDate', 'isAdmin', 'templates'],
+  emits: ['approve', 'reject', 'withdraw', 'remind', 'transfer', 'addStep', 'refresh', 'manageTemplates'],
   data: () => ({ activeTab: 'todo', RefreshCwIcon }),
   components: { RefreshCwIcon },
   methods: {
@@ -742,7 +812,10 @@ export const ApprovalCenterView = {
     <section class="section">
       <div class="section-header">
         <h2 class="section-title">审批中心</h2>
-        <el-button :icon="RefreshCwIcon" @click="$emit('refresh')">刷新</el-button>
+        <div class="toolbar">
+          <el-button v-if="isAdmin" @click="$emit('manageTemplates')">审批模板（{{ templates?.length || 0 }}）</el-button>
+          <el-button :icon="RefreshCwIcon" @click="$emit('refresh')">刷新</el-button>
+        </div>
       </div>
       <el-tabs v-model="activeTab">
         <el-tab-pane label="待我审批" name="todo">
@@ -752,13 +825,17 @@ export const ApprovalCenterView = {
             <el-table-column prop="nodePath" label="文件/文件夹" min-width="260" />
             <el-table-column label="安全" width="120"><template #default="{ row }">{{ securityLabel(row) }}</template></el-table-column>
             <el-table-column prop="requesterName" label="申请人" width="120" />
+            <el-table-column prop="currentStepName" label="当前步骤" width="120" />
+            <el-table-column prop="currentApproverNames" label="当前审批人" width="150" />
             <el-table-column prop="requestComment" label="申请说明" min-width="180" />
             <el-table-column label="状态" width="100"><template #default="{ row }"><el-tag :type="statusTag(row.status)">{{ statusLabel(row.status) }}</el-tag></template></el-table-column>
             <el-table-column label="时间" width="170"><template #default="{ row }">{{ formatDate(row.createdAt) }}</template></el-table-column>
-            <el-table-column label="操作" width="150" fixed="right">
+            <el-table-column label="操作" width="270" fixed="right">
               <template #default="{ row }">
                 <el-button v-if="row.canDecide" size="small" type="primary" @click="$emit('approve', row)">通过</el-button>
                 <el-button v-if="row.canDecide" size="small" type="danger" @click="$emit('reject', row)">驳回</el-button>
+                <el-button v-if="row.canManageStep" size="small" @click="$emit('transfer', row)">转交</el-button>
+                <el-button v-if="row.canManageStep" size="small" @click="$emit('addStep', row)">加签</el-button>
                 <span v-if="!row.canDecide" class="muted">-</span>
               </template>
             </el-table-column>
@@ -770,10 +847,18 @@ export const ApprovalCenterView = {
             <el-table-column prop="actionLabel" label="动作" width="110" />
             <el-table-column prop="nodePath" label="文件/文件夹" min-width="280" />
             <el-table-column prop="approverName" label="审批人" width="120" />
+            <el-table-column prop="currentStepName" label="当前步骤" width="120" />
             <el-table-column prop="requestComment" label="申请说明" min-width="180" />
             <el-table-column prop="decisionComment" label="处理说明" min-width="180" />
             <el-table-column label="状态" width="100"><template #default="{ row }"><el-tag :type="statusTag(row.status)">{{ statusLabel(row.status) }}</el-tag></template></el-table-column>
             <el-table-column label="时间" width="170"><template #default="{ row }">{{ formatDate(row.createdAt) }}</template></el-table-column>
+            <el-table-column label="操作" width="160" fixed="right">
+              <template #default="{ row }">
+                <el-button v-if="row.canWithdraw" size="small" @click="$emit('remind', row)">催办</el-button>
+                <el-button v-if="row.canWithdraw" size="small" type="danger" @click="$emit('withdraw', row)">撤回</el-button>
+                <span v-if="!row.canWithdraw" class="muted">-</span>
+              </template>
+            </el-table-column>
           </el-table>
         </el-tab-pane>
         <el-tab-pane label="全部记录" name="all">
@@ -1047,10 +1132,10 @@ export const TrashView = {
 export const MessagesView = {
   props: ['messages', 'formatDate'],
   emits: ['open', 'read', 'read-all'],
-  data: () => ({ unreadOnly: false }),
+  data: () => ({ unreadOnly: false, typePrefix: '' }),
   computed: {
     visibleMessages() {
-      return this.unreadOnly ? (this.messages || []).filter((item) => !item.readAt) : (this.messages || []);
+      return (this.messages || []).filter((item) => !this.unreadOnly || !item.readAt).filter((item) => !this.typePrefix || String(item.messageType || '').startsWith(this.typePrefix));
     },
     unreadCount() {
       return (this.messages || []).filter((item) => !item.readAt).length;
@@ -1062,6 +1147,13 @@ export const MessagesView = {
         <h2 class="section-title">消息中心</h2>
         <div class="toolbar compact-toolbar">
           <el-switch v-model="unreadOnly" active-text="只看未读" />
+          <el-select v-model="typePrefix" clearable placeholder="消息类型" style="width: 150px">
+            <el-option label="文件更新" value="file" />
+            <el-option label="审批" value="approval" />
+            <el-option label="复审" value="review" />
+            <el-option label="提醒" value="reminder" />
+            <el-option label="评论" value="comment" />
+          </el-select>
           <el-tag type="primary">未读 {{ unreadCount }}</el-tag>
           <el-button @click="$emit('read-all')">全部已读</el-button>
         </div>
@@ -1418,8 +1510,8 @@ export const GovernanceView = {
 };
 
 export const SystemManagementView = {
-  props: ['dashboard', 'auditLogs', 'filePolicy', 'externalLibrary', 'storageSettings', 'securityPolicy', 'wecomSettings', 'officePreviewSettings', 'searchIndexStatus', 'runtimeStatus', 'auditReport', 'formatDate'],
-  emits: ['edit-file-policy', 'edit-external-library', 'edit-storage', 'sync-storage', 'export-audit', 'edit-security-policy', 'edit-office-preview', 'test-office-preview', 'rebuild-search-index', 'edit-wecom', 'test-wecom'],
+  props: ['dashboard', 'auditLogs', 'filePolicy', 'externalLibrary', 'storageSettings', 'securityPolicy', 'wecomSettings', 'officePreviewSettings', 'searchIndexStatus', 'runtimeStatus', 'consistencyReport', 'backupJobs', 'systemAlerts', 'notificationDeliveries', 'auditReport', 'formatDate'],
+  emits: ['edit-file-policy', 'edit-external-library', 'edit-storage', 'sync-storage', 'export-audit', 'edit-security-policy', 'edit-office-preview', 'test-office-preview', 'rebuild-search-index', 'edit-wecom', 'test-wecom', 'check-consistency', 'create-backup', 'drill-backup', 'resolve-alert', 'retry-notification'],
   computed: {
     stats() {
       return this.dashboard?.stats || {};
@@ -1466,6 +1558,15 @@ export const SystemManagementView = {
     },
     searchIndexCounts() {
       return this.searchIndexStatus?.counts || {};
+    }
+  },
+  methods: {
+    formatBytes(value) {
+      const bytes = Number(value || 0);
+      if (!bytes) return '-';
+      const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+      const index = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+      return `${(bytes / (1024 ** index)).toFixed(index ? 1 : 0)} ${units[index]}`;
     }
   },
   template: `
@@ -1601,6 +1702,10 @@ export const SystemManagementView = {
       <section class="section">
         <div class="section-header">
           <h2 class="section-title">运行与备份状态</h2>
+          <div class="toolbar compact-toolbar">
+            <el-button @click="$emit('check-consistency')">一致性检查</el-button>
+            <el-button type="primary" @click="$emit('create-backup')">创建备份</el-button>
+          </div>
         </div>
         <div class="storage-status-row">
           <div class="storage-status-item">
@@ -1619,13 +1724,55 @@ export const SystemManagementView = {
             <span>审计日志</span>
             <strong>{{ runtimeStatus?.counts?.auditLogs || 0 }}</strong>
           </div>
+          <div class="storage-status-item">
+            <span>开放告警</span>
+            <strong>{{ runtimeStatus?.counts?.openAlerts || systemAlerts?.length || 0 }}</strong>
+          </div>
+          <div class="storage-status-item">
+            <span>通知失败</span>
+            <strong>{{ runtimeStatus?.counts?.failedNotifications || notificationDeliveries?.length || 0 }}</strong>
+          </div>
         </div>
+        <el-descriptions :column="3" border style="margin-bottom: 12px">
+          <el-descriptions-item label="后端服务"><el-tag :type="runtimeStatus?.health?.backend?.status === 'up' ? 'success' : 'danger'">{{ runtimeStatus?.health?.backend?.message || '-' }}</el-tag></el-descriptions-item>
+          <el-descriptions-item label="MySQL"><el-tag :type="runtimeStatus?.health?.mysql?.status === 'up' ? 'success' : (runtimeStatus?.health?.mysql?.status === 'disabled' ? 'info' : 'danger')">{{ runtimeStatus?.health?.mysql?.message || '-' }}</el-tag></el-descriptions-item>
+          <el-descriptions-item label="ONLYOFFICE"><el-tag :type="runtimeStatus?.health?.onlyoffice?.status === 'up' ? 'success' : (runtimeStatus?.health?.onlyoffice?.status === 'disabled' ? 'info' : 'danger')">{{ runtimeStatus?.health?.onlyoffice?.message || '-' }}</el-tag></el-descriptions-item>
+          <el-descriptions-item label="磁盘使用率"><el-tag :type="runtimeStatus?.disk?.warning ? 'danger' : 'success'">{{ runtimeStatus?.disk?.usedPercent ?? '-' }}%</el-tag></el-descriptions-item>
+          <el-descriptions-item label="磁盘可用">{{ formatBytes(runtimeStatus?.disk?.freeBytes) }}</el-descriptions-item>
+          <el-descriptions-item label="告警阈值">{{ runtimeStatus?.disk?.warningPercent || 85 }}%</el-descriptions-item>
+        </el-descriptions>
+        <el-alert v-if="consistencyReport" :type="consistencyReport.healthy ? 'success' : 'error'" :closable="false" show-icon :title="consistencyReport.healthy ? '数据与文件一致' : '一致性检查发现异常'" :description="'错误 ' + consistencyReport.counts.errors + '，警告 ' + consistencyReport.counts.warnings" />
         <el-table class="compact-data-table" :data="runtimeStatus?.backupItems || []" border>
           <el-table-column prop="name" label="备份对象" width="150" />
           <el-table-column prop="path" label="路径" min-width="320" />
           <el-table-column label="状态" width="100">
             <template #default="{ row }"><el-tag :type="row.exists ? 'success' : 'danger'">{{ row.exists ? '存在' : '缺失' }}</el-tag></template>
           </el-table-column>
+        </el-table>
+        <h3>备份历史</h3>
+        <el-table class="compact-data-table" :data="backupJobs || []" border>
+          <el-table-column prop="filename" label="备份文件" min-width="280" />
+          <el-table-column prop="status" label="状态" width="100" />
+          <el-table-column label="创建时间" width="180"><template #default="{ row }">{{ formatDate(row.createdAt) }}</template></el-table-column>
+          <el-table-column label="演练" width="110"><template #default="{ row }">{{ row.drill ? (row.drill.valid ? '通过' : '异常') : '未执行' }}</template></el-table-column>
+          <el-table-column label="操作" width="120"><template #default="{ row }"><el-button size="small" :disabled="row.status !== 'completed'" @click="$emit('drill-backup', row)">恢复演练</el-button></template></el-table-column>
+        </el-table>
+      </section>
+      <section class="section">
+        <div class="section-header"><h2 class="section-title">系统告警与通知失败</h2></div>
+        <el-table class="compact-data-table" :data="systemAlerts || []" border empty-text="当前没有开放告警">
+          <el-table-column prop="severity" label="级别" width="100" />
+          <el-table-column prop="title" label="告警" min-width="180" />
+          <el-table-column prop="detail" label="详情" min-width="280" />
+          <el-table-column label="时间" width="180"><template #default="{ row }">{{ formatDate(row.updatedAt) }}</template></el-table-column>
+          <el-table-column label="操作" width="100"><template #default="{ row }"><el-button size="small" type="primary" @click="$emit('resolve-alert', row)">处理</el-button></template></el-table-column>
+        </el-table>
+        <el-table class="compact-data-table" :data="notificationDeliveries || []" border empty-text="当前没有通知失败" style="margin-top: 12px">
+          <el-table-column prop="channel" label="渠道" width="100" />
+          <el-table-column prop="title" label="消息" min-width="180" />
+          <el-table-column prop="lastError" label="失败原因" min-width="260" />
+          <el-table-column prop="attempts" label="次数" width="80" />
+          <el-table-column label="操作" width="100"><template #default="{ row }"><el-button size="small" @click="$emit('retry-notification', row)">重试</el-button></template></el-table-column>
         </el-table>
       </section>
       <section class="section">

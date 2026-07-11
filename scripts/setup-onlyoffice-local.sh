@@ -63,10 +63,13 @@ echo "启动 ONLYOFFICE Document Server..."
 docker run -d \
   --name "${CONTAINER_NAME}" \
   --restart unless-stopped \
+  --memory "${ONLYOFFICE_MEMORY_LIMIT:-8g}" \
+  --memory-swap "${ONLYOFFICE_MEMORY_SWAP_LIMIT:-10g}" \
   --platform linux/amd64 \
   -p "${DOCSERVER_PORT}:80" \
   -e JWT_ENABLED=true \
   -e JWT_SECRET="${JWT_SECRET}" \
+  -e PLUGINS_ENABLED=false \
   "${IMAGE}" >/dev/null
 
 echo "等待 Document Server 就绪：${DOCUMENT_SERVER_URL}"

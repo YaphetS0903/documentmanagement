@@ -1,6 +1,6 @@
 {
   "name": "document-platform",
-  "version": "0.1.0",
+  "version": "1.0.0-rc.1",
   "private": true,
   "type": "module",
   "scripts": {
@@ -11,6 +11,8 @@
     "start": "node backend/src/server.js",
     "seed": "node backend/src/seed.js",
     "test": "node backend/tests/api-smoke.mjs",
+    "release:check": "npm test && npm run build && node scripts/release-check.mjs",
+    "production:check": "node scripts/check-production-env.mjs",
     "onlyoffice:setup": "bash scripts/setup-onlyoffice-local.sh"
   },
   "dependencies": {

@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import { config } from './config.js';
 import {
@@ -73,8 +74,12 @@ function childFolder(id, parentId, name, path, createdBy = 'u_admin') {
 }
 
 export function createInitialDb() {
-  const adminPass = hashPassword('admin123');
-  const userPass = hashPassword('user123');
+  const initialAdminPassword = String(process.env.INITIAL_ADMIN_PASSWORD || (config.nodeEnv === 'production' ? '' : 'admin123'));
+  const initialDemoPassword = String(process.env.INITIAL_DEMO_PASSWORD || (config.nodeEnv === 'production' ? '' : 'user123'));
+  if (!initialAdminPassword) throw new Error('首次生产初始化必须配置 INITIAL_ADMIN_PASSWORD');
+  if (config.nodeEnv === 'production' && initialAdminPassword.length < 12) throw new Error('INITIAL_ADMIN_PASSWORD 至少需要 12 个字符');
+  const adminPass = hashPassword(initialAdminPassword);
+  const userPass = hashPassword(initialDemoPassword || crypto.randomBytes(24).toString('base64url'));
   const timestamp = now();
   const nodes = [rootFolder('n_root', '企业文档库')];
 
@@ -223,6 +228,9 @@ export function createInitialDb() {
     propertyDefinitions: [],
     propertyValues: [],
     messages: [],
+    notificationDeliveries: [],
+    backupJobs: [],
+    systemAlerts: [],
     favorites: [],
     comments: [],
     ratings: [],
@@ -230,8 +238,10 @@ export function createInitialDb() {
     fileRelations: [],
     reminders: [],
     documentApprovals: [],
+    approvalTemplates: [],
     documentReviews: [],
     versionChangeLogs: [],
+    officeEditSessions: [],
     announcements: [],
     auditLogs: [],
     apiCredentials: [],
@@ -314,7 +324,11 @@ export async function loadDb() {
   const storageConfig = await readStorageConfig({ includePassword: true });
   if (storageConfig.provider === 'mysql' && hasCompleteMysqlConfig(storageConfig.mysql)) {
     try {
-      const mysqlDb = await loadMysqlSnapshot(storageConfig);
+      const mysqlLoad = loadMysqlSnapshot(storageConfig);
+      const mysqlDb = await Promise.race([
+        mysqlLoad,
+        new Promise((_, reject) => setTimeout(() => reject(Object.assign(new Error('MySQL 启动连接超时（4 秒）'), { code: 'ETIMEDOUT' })), 4000))
+      ]);
       if (mysqlDb) {
         cache = mysqlDb;
       } else {
@@ -337,6 +351,8 @@ export async function loadDb() {
         lastLoadedAt: now()
       });
       console.error('failed to load mysql storage, falling back to json', error);
+      cache = await loadJsonDbOrInitial();
+      return cache;
     }
   }
   cache = await loadJsonDbOrInitial();

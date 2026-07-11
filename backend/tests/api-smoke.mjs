@@ -3,6 +3,7 @@ import fs from 'node:fs/promises';
 import http from 'node:http';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import AdmZip from 'adm-zip';
 
 const testPort = '3100';
 const officeTestPort = '3180';
@@ -47,8 +48,28 @@ async function loginPayload(username, password) {
 }
 
 await fs.rm(testRuntimeRoot, { recursive: true, force: true });
+let failWecomSend = false;
 
 const officeServer = http.createServer((req, res) => {
+  if (req.url?.startsWith('/cgi-bin/gettoken')) {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ errcode: 0, errmsg: 'ok', access_token: 'wecom-smoke-token', expires_in: 7200 }));
+    return;
+  }
+  if (req.url?.startsWith('/cgi-bin/message/send')) {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(failWecomSend ? { errcode: 40014, errmsg: 'invalid access_token smoke' } : { errcode: 0, errmsg: 'ok', msgid: 'wecom-smoke-message' }));
+    return;
+  }
+  if (req.url === '/edited.pptx' || req.url?.startsWith('/cache/files/')) {
+    const body = Buffer.from('edited ppt content from onlyoffice');
+    res.writeHead(200, {
+      'Content-Type': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+      'Content-Length': body.length
+    });
+    res.end(body);
+    return;
+  }
   res.writeHead(200, { 'Content-Type': 'application/javascript' });
   res.end(`window.__officeProxyPath = ${JSON.stringify(req.url)};`);
 });
@@ -141,6 +162,8 @@ try {
   assert.ok(openapi.paths['/system-settings/external-library']);
   assert.ok(openapi.paths['/external-library/sync']);
   assert.ok(openapi.paths['/permission-templates']);
+  assert.ok(openapi.paths['/approval-templates']);
+  assert.ok(openapi.paths['/approval-templates/{id}']);
   assert.ok(openapi.paths['/nodes/{id}/permission-rules/batch']);
   assert.ok(openapi.paths['/nodes/{id}/workflow']);
   assert.ok(openapi.paths['/nodes/{id}/workflow-actions']);
@@ -153,6 +176,7 @@ try {
   assert.ok(openapi.paths['/nodes/{id}/security']);
   assert.ok(openapi.paths['/nodes/batch-metadata']);
   assert.ok(openapi.paths['/search/suggestions']);
+  assert.ok(openapi.paths['/search/recent']);
   assert.ok(openapi.paths['/search/index/status']);
   assert.ok(openapi.paths['/search/index/rebuild']);
   assert.ok(openapi.paths['/governance/workspace']);
@@ -170,6 +194,10 @@ try {
   assert.ok(openapi.paths['/system-settings/office-preview/test']);
   assert.ok(openapi.paths['/system-settings/wecom']);
   assert.ok(openapi.paths['/system-settings/wecom/test']);
+  assert.ok(openapi.paths['/system/consistency']);
+  assert.ok(openapi.paths['/system/backups']);
+  assert.ok(openapi.paths['/system/alerts']);
+  assert.ok(openapi.paths['/notifications/deliveries']);
   assert.ok(openapi.paths['/recent-access']);
   assert.ok(openapi.paths['/audit-logs/report']);
   assert.ok(openapi.paths['/system/runtime-status']);
@@ -543,6 +571,102 @@ try {
   assert.equal(proxiedOfficeScript.status, 200);
   assert.match(await proxiedOfficeScript.text(), /web-apps\/apps\/api\/documents\/api\.js/);
 
+  for (const officeCase of [
+    { filename: '编辑测试.docx', mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', documentType: 'word' },
+    { filename: '编辑测试.xlsx', mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', documentType: 'cell' }
+  ]) {
+    const modernOfficeForm = new FormData();
+    modernOfficeForm.append('parentId', 'n_root');
+    modernOfficeForm.append('file', new Blob([Buffer.from(`${officeCase.documentType} placeholder`)], { type: officeCase.mimeType }), officeCase.filename);
+    const modernOfficeUpload = await request(`${base}/files`, { method: 'POST', headers: { Authorization: `Bearer ${token}` }, body: modernOfficeForm });
+    const modernOfficeEdit = await request(`${base}/files/${modernOfficeUpload.data.id}/office-edit-session`, {
+      method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: '{}'
+    });
+    assert.equal(modernOfficeEdit.data.editor.config.documentType, officeCase.documentType);
+    assert.equal(modernOfficeEdit.data.editor.config.editorConfig.mode, 'edit');
+    const modernOfficeClose = await requestRaw(modernOfficeEdit.data.editor.config.editorConfig.callbackUrl, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status: 4 })
+    });
+    assert.equal(modernOfficeClose.res.status, 200);
+    const closedModernOfficeSession = await request(`${base}/files/${modernOfficeUpload.data.id}/office-edit-session`, { headers: { Authorization: `Bearer ${token}` } });
+    assert.equal(closedModernOfficeSession.data, null);
+  }
+
+  const deniedOfficeEdit = await requestRaw(`${base}/files/${officeUpload.data.id}/office-edit-session`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${demoLoginForPrivateDrive.data.token}`, 'Content-Type': 'application/json' },
+    body: '{}'
+  });
+  assert.equal(deniedOfficeEdit.res.status, 403);
+  const officeEdit = await request(`${base}/files/${officeUpload.data.id}/office-edit-session`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: '{}'
+  });
+  assert.equal(officeEdit.data.session.status, 'active');
+  assert.equal(officeEdit.data.editor.config.editorConfig.mode, 'edit');
+  assert.equal(officeEdit.data.editor.config.document.permissions.edit, true);
+  assert.match(officeEdit.data.editor.config.editorConfig.callbackUrl, /\/api\/v1\/office-edit\/callback\?ticket=/);
+  const activeOfficeEdit = await request(`${base}/files/${officeUpload.data.id}/office-edit-session`, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  assert.equal(activeOfficeEdit.data.id, officeEdit.data.session.id);
+  const editCallbackUrl = officeEdit.data.editor.config.editorConfig.callbackUrl;
+  const saveOfficeEdit = await requestRaw(editCallbackUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ status: 2, url: 'http://127.0.0.1:9/cache/files/edit/output.pptx?token=proxy-host-smoke' })
+  });
+  assert.equal(saveOfficeEdit.res.status, 200);
+  assert.equal(saveOfficeEdit.body.error, 0);
+  const officeVersionsAfterEdit = await request(`${base}/files/${officeUpload.data.id}/versions`, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  assert.equal(officeVersionsAfterEdit.data.length, 2);
+  assert.equal(officeVersionsAfterEdit.data[0].description, 'ONLYOFFICE 在线编辑');
+  const repeatedSaveOfficeEdit = await requestRaw(editCallbackUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ status: 2, url: `http://127.0.0.1:${officeTestPort}/edited.pptx` })
+  });
+  assert.equal(repeatedSaveOfficeEdit.res.status, 200);
+  const officeVersionsAfterRepeatedCallback = await request(`${base}/files/${officeUpload.data.id}/versions`, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  assert.equal(officeVersionsAfterRepeatedCallback.data.length, 2);
+
+  const unsafeOfficeEdit = await request(`${base}/files/${officeUpload.data.id}/office-edit-session`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: '{}'
+  });
+  const unsafeCallback = await requestRaw(unsafeOfficeEdit.data.editor.config.editorConfig.callbackUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ status: 2, url: 'http://127.0.0.1:9/not-trusted.pptx' })
+  });
+  assert.equal(unsafeCallback.res.status, 502);
+  const officeVersionsAfterUnsafeCallback = await request(`${base}/files/${officeUpload.data.id}/versions`, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  assert.equal(officeVersionsAfterUnsafeCallback.data.length, 2);
+
+  const noChangesOfficeEdit = await request(`${base}/files/${officeUpload.data.id}/office-edit-session`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: '{}'
+  });
+  const noChangesCallback = await requestRaw(noChangesOfficeEdit.data.editor.config.editorConfig.callbackUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ status: 4 })
+  });
+  assert.equal(noChangesCallback.res.status, 200);
+  const officeVersionsAfterNoChanges = await request(`${base}/files/${officeUpload.data.id}/versions`, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  assert.equal(officeVersionsAfterNoChanges.data.length, 2);
+
   const demoUnreadChildren = await request(`${base}/nodes/n_root/children`, {
     headers: { Authorization: `Bearer ${demoLoginForPrivateDrive.data.token}` }
   });
@@ -590,6 +714,56 @@ try {
   });
   assert.equal(securityUpdatedNode.data.sensitive, true);
   assert.equal(securityUpdatedNode.data.securityLevel, 'confidential');
+  const conditionalApprovalTemplate = await request(`${base}/approval-templates`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      name: '机密文件外发审批',
+      description: '条件分支冒烟测试',
+      type: 'external',
+      ccUserIds: ['u_demo'],
+      steps: [
+        { name: '公开资料复核', mode: 'all', approverIds: ['u_admin'], condition: { securityLevels: ['public'] } },
+        { name: '机密敏感资料复核', mode: 'all', approverIds: ['u_admin'], condition: { securityLevels: ['confidential'], sensitive: true, extensions: ['txt'] } }
+      ]
+    })
+  });
+  assert.equal(conditionalApprovalTemplate.data.steps.length, 2);
+  assert.deepEqual(conditionalApprovalTemplate.data.steps[1].condition.securityLevels, ['confidential']);
+  const conditionalApprovalTemplates = await request(`${base}/approval-templates?type=external`, {
+    headers: { Authorization: `Bearer ${demoLoginForPrivateDrive.data.token}` }
+  });
+  assert.ok(conditionalApprovalTemplates.data.some((item) => item.id === conditionalApprovalTemplate.data.id));
+  const conditionalApproval = await request(`${base}/approvals`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${demoLoginForPrivateDrive.data.token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ nodeId: upload.data.id, type: 'external', templateId: conditionalApprovalTemplate.data.id, reason: 'conditional template smoke' })
+  });
+  assert.equal(conditionalApproval.data.templateId, conditionalApprovalTemplate.data.id);
+  assert.equal(conditionalApproval.data.steps.length, 1);
+  assert.equal(conditionalApproval.data.steps[0].name, '机密敏感资料复核');
+  await request(`${base}/approvals/${conditionalApproval.data.id}/withdraw`, {
+    method: 'POST', headers: { Authorization: `Bearer ${demoLoginForPrivateDrive.data.token}`, 'Content-Type': 'application/json' }, body: '{}'
+  });
+  const noMatchTemplate = await request(`${base}/approval-templates`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: '仅公开资料外发', type: 'external', steps: [{ name: '公开审批', approverIds: ['u_admin'], condition: { securityLevels: ['public'] } }] })
+  });
+  const noMatchApproval = await requestRaw(`${base}/approvals`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${demoLoginForPrivateDrive.data.token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ nodeId: upload.data.id, type: 'external', templateId: noMatchTemplate.data.id, reason: 'no match smoke' })
+  });
+  assert.equal(noMatchApproval.res.status, 400);
+  assert.match(noMatchApproval.body.message, /没有匹配的审批步骤/);
+  const updatedApprovalTemplate = await request(`${base}/approval-templates/${noMatchTemplate.data.id}`, {
+    method: 'PUT',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ description: '已验证无匹配分支', status: 'disabled' })
+  });
+  assert.equal(updatedApprovalTemplate.data.status, 'disabled');
+  await request(`${base}/approval-templates/${noMatchTemplate.data.id}`, { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } });
   const demoSensitivePreview = await request(`${base}/files/${upload.data.id}/preview`, {
     headers: { Authorization: `Bearer ${demoLoginForPrivateDrive.data.token}` }
   });
@@ -649,10 +823,33 @@ try {
   const wecomSettings = await request(`${base}/system-settings/wecom`, {
     method: 'PUT',
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ enabled: true, corpId: 'corp-smoke', agentId: 'agent-smoke', secret: '<test-wecom-secret>', callbackUrl: '/api/v1/wecom/auth/callback', pushMessages: true })
+    body: JSON.stringify({ enabled: true, corpId: 'corp-smoke', agentId: '100001', secret: '<test-wecom-secret>', apiBaseUrl: `http://127.0.0.1:${officeTestPort}`, callbackUrl: '/api/v1/wecom/auth/callback', pushMessages: true })
   });
   assert.equal(wecomSettings.data.enabled, true);
   assert.equal(wecomSettings.data.hasSecret, true);
+  failWecomSend = true;
+  const processedNotifications = await request(`${base}/notifications/process`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  assert.ok(processedNotifications.data.processed >= 1);
+  assert.ok(processedNotifications.data.failed >= 1);
+  const failedNotificationDeliveries = await request(`${base}/notifications/deliveries?channel=wecom&status=failed&pageSize=20`, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  assert.ok(failedNotificationDeliveries.data.items.length >= 1);
+  assert.match(failedNotificationDeliveries.data.items[0].lastError, /invalid access_token smoke/);
+  failWecomSend = false;
+  const retriedNotification = await request(`${base}/notifications/deliveries/${failedNotificationDeliveries.data.items[0].id}/retry`, {
+    method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: '{}'
+  });
+  assert.equal(retriedNotification.data.status, 'sent');
+  assert.ok(retriedNotification.data.attempts >= 2);
+  const notificationDeliveries = await request(`${base}/notifications/deliveries?channel=wecom&pageSize=20`, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  assert.ok(notificationDeliveries.data.items.length >= 1);
+  assert.ok(notificationDeliveries.data.items.every((item) => item.channel === 'wecom'));
   const wecomTest = await request(`${base}/system-settings/wecom/test`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${token}` }
@@ -660,12 +857,46 @@ try {
   assert.equal(wecomTest.data.ok, true);
   const wecomCallback = await request(`${base}/wecom/auth/callback?code=smoke-code`);
   assert.equal(wecomCallback.data.status, 'reserved');
+  const approvalMessagesOnly = await request(`${base}/messages?type=approval&pageSize=100`, {
+    headers: { Authorization: `Bearer ${demoLoginForPrivateDrive.data.token}` }
+  });
+  assert.ok(approvalMessagesOnly.data.items.every((item) => item.messageType === 'approval' || item.messageType.startsWith('approval.')));
   const runtime = await request(`${base}/system/runtime-status`, {
     headers: { Authorization: `Bearer ${token}` }
   });
   assert.equal(runtime.data.status, 'up');
   assert.equal(runtime.data.dataDirExists, true);
   assert.ok(runtime.data.backupItems.length >= 3);
+  const consistency = await request(`${base}/system/consistency`, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  assert.ok(Number.isInteger(consistency.data.counts.errors));
+  const backup = await request(`${base}/system/backups`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: '{}'
+  });
+  assert.equal(backup.data.status, 'completed');
+  assert.ok(backup.data.sizeBytes > 0);
+  const backupDownload = await fetch(`${base}/system/backups/${backup.data.id}/download`, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  assert.equal(backupDownload.status, 200);
+  assert.ok((await backupDownload.arrayBuffer()).byteLength > 0);
+  const restoreDrill = await request(`${base}/system/backups/${backup.data.id}/drill`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: '{}'
+  });
+  assert.equal(restoreDrill.data.valid, true);
+  const backupJobs = await request(`${base}/system/backups?pageSize=10`, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  assert.ok(backupJobs.data.items.some((item) => item.id === backup.data.id && item.drill?.valid));
+  const systemAlerts = await request(`${base}/system/alerts?pageSize=20`, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  assert.ok(Array.isArray(systemAlerts.data.items));
   const auditReport = await request(`${base}/audit-logs/report`, {
     headers: { Authorization: `Bearer ${token}` }
   });
@@ -788,6 +1019,79 @@ try {
   });
   assert.equal(previewPermission.data.user.id, 'u_demo');
   assert.equal(previewPermission.data.actions.includes('file:download'), false);
+
+  const serialBorrowApproval = await request(`${base}/approvals`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${demoLoginForPrivateDrive.data.token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      nodeId: upload.data.id,
+      type: 'borrow',
+      expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+      reason: 'serial borrow smoke',
+      ccUserIds: ['u_demo'],
+      steps: [
+        { name: '资料管理员审批', mode: 'all', approverIds: ['u_admin'] },
+        { name: '申请人确认', mode: 'all', approverIds: ['u_demo'] }
+      ]
+    })
+  });
+  assert.equal(serialBorrowApproval.data.steps.length, 2);
+  const serialFirstDecision = await request(`${base}/approvals/${serialBorrowApproval.data.id}/approve`, {
+    method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ comment: 'first level approved' })
+  });
+  assert.equal(serialFirstDecision.data.completed, false);
+  assert.equal(serialFirstDecision.data.approval.currentStepName, '申请人确认');
+  const serialFinalDecision = await request(`${base}/approvals/${serialBorrowApproval.data.id}/approve`, {
+    method: 'POST', headers: { Authorization: `Bearer ${demoLoginForPrivateDrive.data.token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ comment: 'second level approved' })
+  });
+  assert.equal(serialFinalDecision.data.completed, true);
+  assert.equal(serialFinalDecision.data.approval.status, 'approved');
+
+  const managedApproval = await request(`${base}/approvals`, {
+    method: 'POST', headers: { Authorization: `Bearer ${demoLoginForPrivateDrive.data.token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ nodeId: upload.data.id, type: 'borrow', approverId: 'u_admin', reason: 'managed approval smoke' })
+  });
+  const transferredApproval = await request(`${base}/approvals/${managedApproval.data.id}/transfer`, {
+    method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ userId: 'u_demo', comment: 'transfer smoke' })
+  });
+  assert.deepEqual(transferredApproval.data.steps[0].approverIds, ['u_demo']);
+  const approvalWithAddedStep = await request(`${base}/approvals/${managedApproval.data.id}/add-step`, {
+    method: 'POST', headers: { Authorization: `Bearer ${demoLoginForPrivateDrive.data.token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ position: 'after', name: '后加签复核', approverIds: ['u_admin'] })
+  });
+  assert.equal(approvalWithAddedStep.data.steps.length, 2);
+  assert.equal(approvalWithAddedStep.data.steps[1].name, '后加签复核');
+  const remindedApproval = await request(`${base}/approvals/${managedApproval.data.id}/remind`, {
+    method: 'POST', headers: { Authorization: `Bearer ${demoLoginForPrivateDrive.data.token}`, 'Content-Type': 'application/json' }, body: '{}'
+  });
+  assert.ok(remindedApproval.data.lastRemindedAt);
+  const withdrawnApproval = await request(`${base}/approvals/${managedApproval.data.id}/withdraw`, {
+    method: 'POST', headers: { Authorization: `Bearer ${demoLoginForPrivateDrive.data.token}`, 'Content-Type': 'application/json' }, body: '{}'
+  });
+  assert.equal(withdrawnApproval.data.status, 'cancelled');
+
+  const overdueApproval = await request(`${base}/approvals`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${demoLoginForPrivateDrive.data.token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ nodeId: upload.data.id, type: 'borrow', approverId: 'u_admin', dueAt: new Date(Date.now() - 60_000).toISOString(), reason: 'overdue reminder smoke' })
+  });
+  await request(`${base}/messages?pageSize=200`, { headers: { Authorization: `Bearer ${token}` } });
+  const overdueApprovalMessages = await request(`${base}/messages?type=approval.overdue&pageSize=200`, { headers: { Authorization: `Bearer ${token}` } });
+  assert.equal(overdueApprovalMessages.data.items.filter((item) => item.relatedNodeId === upload.data.id).length, 1);
+  await request(`${base}/messages?pageSize=200`, { headers: { Authorization: `Bearer ${token}` } });
+  const repeatedOverdueApprovalMessages = await request(`${base}/messages?type=approval.overdue&pageSize=200`, { headers: { Authorization: `Bearer ${token}` } });
+  assert.equal(repeatedOverdueApprovalMessages.data.items.filter((item) => item.relatedNodeId === upload.data.id).length, 1);
+  await request(`${base}/approvals/${overdueApproval.data.id}/withdraw`, { method: 'POST', headers: { Authorization: `Bearer ${demoLoginForPrivateDrive.data.token}`, 'Content-Type': 'application/json' }, body: '{}' });
+
+  await request(`${base}/nodes/${upload.data.id}/review`, {
+    method: 'PUT',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled: true, ownerId: 'u_demo', cycleDays: 30, nextReviewAt: new Date(Date.now() - 60_000).toISOString() })
+  });
+  await request(`${base}/messages?pageSize=200`, { headers: { Authorization: `Bearer ${demoLoginForPrivateDrive.data.token}` } });
+  const overdueReviewMessages = await request(`${base}/messages?type=document.review.overdue&pageSize=200`, { headers: { Authorization: `Bearer ${demoLoginForPrivateDrive.data.token}` } });
+  assert.equal(overdueReviewMessages.data.items.filter((item) => item.relatedNodeId === upload.data.id).length, 1);
+  await request(`${base}/messages?pageSize=200`, { headers: { Authorization: `Bearer ${demoLoginForPrivateDrive.data.token}` } });
+  const repeatedOverdueReviewMessages = await request(`${base}/messages?type=document.review.overdue&pageSize=200`, { headers: { Authorization: `Bearer ${demoLoginForPrivateDrive.data.token}` } });
+  assert.equal(repeatedOverdueReviewMessages.data.items.filter((item) => item.relatedNodeId === upload.data.id).length, 1);
 
   const templates = await request(`${base}/permission-templates`, {
     headers: { Authorization: `Bearer ${token}` }
@@ -959,6 +1263,7 @@ try {
     body: JSON.stringify({
       keyword: '质量手册',
       fileTypes: ['txt'],
+      securityLevels: ['internal'],
       creatorId: 'u_admin',
       updatedFrom: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(),
       updatedTo: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
@@ -1173,6 +1478,30 @@ try {
   });
   assert.ok(tagSearch.data.total >= 1);
 
+  const filteredByMetadata = await request(`${base}/search/files`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      keyword: '',
+      securityLevels: ['internal'],
+      categoryIds: ['c_iso'],
+      tags: ['质量体系'],
+      page: 1,
+      pageSize: 10
+    })
+  });
+  assert.ok(filteredByMetadata.data.items.some((item) => item.id === upload.data.id));
+  const filteredByWrongTag = await request(`${base}/search/files`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ categoryIds: ['c_iso'], tags: ['不存在标签'], page: 1, pageSize: 10 })
+  });
+  assert.equal(filteredByWrongTag.data.items.some((item) => item.id === upload.data.id), false);
+  const recentSearches = await request(`${base}/search/recent?limit=10`, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  assert.ok(recentSearches.data.some((item) => item.filters?.categoryIds?.includes('c_iso')));
+
   const share = await request(`${base}/nodes/${upload.data.id}/share`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
@@ -1215,6 +1544,19 @@ try {
     headers: { Authorization: `Bearer ${token}` }
   });
   assert.equal(announcementDownload.ok, true);
+  const completeBackup = await request(`${base}/system/backups`, {
+    method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: '{}'
+  });
+  const completeBackupDownload = await fetch(`${base}/system/backups/${completeBackup.data.id}/download`, { headers: { Authorization: `Bearer ${token}` } });
+  const completeBackupZip = new AdmZip(Buffer.from(await completeBackupDownload.arrayBuffer()));
+  const backupSnapshot = JSON.parse(completeBackupZip.readAsText('db.json'));
+  const archivedUploadNames = new Set(completeBackupZip.getEntries().filter((entry) => entry.entryName.startsWith('uploads/') && !entry.isDirectory).map((entry) => entry.entryName.slice('uploads/'.length)));
+  assert.ok(archivedUploadNames.has(backupSnapshot.attachments.find((item) => item.id === attachment.data.id).storageKey));
+  assert.ok(archivedUploadNames.has(backupSnapshot.announcements.find((item) => item.id === announcement.data.id).attachment.storageKey));
+  const completeBackupDrill = await request(`${base}/system/backups/${completeBackup.data.id}/drill`, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: '{}' });
+  assert.equal(completeBackupDrill.data.valid, true);
+  assert.ok(completeBackupDrill.data.attachmentCount >= 1);
+  assert.ok(completeBackupDrill.data.announcementAttachmentCount >= 1);
   const demoAnnouncementMessages = await request(`${base}/messages?pageSize=20`, {
     headers: { Authorization: `Bearer ${demoTokenForPermission}` }
   });
@@ -1342,6 +1684,9 @@ try {
     headers: { Authorization: `Bearer ${token}` }
   });
 
+  const duplicateVersionNames = (await fs.readdir(path.join(testRuntimeRoot, 'uploads')))
+    .filter((name) => name.includes('smoke-copy.txt'));
+  assert.ok(duplicateVersionNames.length >= 1);
   await request(`${base}/nodes/${duplicateUpload.data.id}`, {
     method: 'DELETE',
     headers: { Authorization: `Bearer ${token}` }
@@ -1350,6 +1695,8 @@ try {
     method: 'DELETE',
     headers: { Authorization: `Bearer ${token}` }
   });
+  const uploadNamesAfterDestroy = await fs.readdir(path.join(testRuntimeRoot, 'uploads'));
+  duplicateVersionNames.forEach((name) => assert.equal(uploadNamesAfterDestroy.includes(name), false));
 
   await request(`${base}/nodes/${upload.data.id}`, {
     method: 'DELETE',

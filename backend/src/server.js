@@ -39,6 +39,7 @@ import {
 
 await ensureDir(config.uploadDir);
 await ensureDir(config.tmpDir);
+await ensureDir(config.backupDir);
 await loadDb();
 
 const upload = multer({ dest: config.tmpDir, limits: { fileSize: 1024 * 1024 * 300 } });
@@ -76,6 +77,7 @@ const DEFAULT_WECOM_SETTINGS = {
   syncDepartments: true,
   syncUsers: true,
   pushMessages: false,
+  apiBaseUrl: 'https://qyapi.weixin.qq.com',
   lastTestAt: null,
   lastTestResult: null
 };
@@ -117,6 +119,7 @@ const TEXT_PREVIEW_EXTENSIONS = new Set([
 const TEXT_PREVIEW_FILENAMES = new Set(['.gitignore', '.dockerignore', '.npmrc', '.nvmrc', '.env', 'dockerfile', 'makefile', 'readme', 'license']);
 const JSON_PREVIEW_EXTENSIONS = new Set(['json']);
 const OFFICE_PREVIEW_EXTENSIONS = new Set(['doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx']);
+const OFFICE_EDIT_EXTENSIONS = new Set(['docx', 'xlsx', 'pptx']);
 const SEARCH_OFFICE_EXTENSIONS = new Set(['docx', 'xlsx', 'pptx']);
 const captchaStore = new Map();
 const apiRateBuckets = new Map();
@@ -321,6 +324,9 @@ const COLLECTIONS = [
   'propertyDefinitions',
   'propertyValues',
   'messages',
+  'notificationDeliveries',
+  'backupJobs',
+  'systemAlerts',
   'favorites',
   'comments',
   'ratings',
@@ -328,8 +334,10 @@ const COLLECTIONS = [
   'fileRelations',
   'reminders',
   'documentApprovals',
+  'approvalTemplates',
   'documentReviews',
   'versionChangeLogs',
+  'officeEditSessions',
   'subscriptions',
   'shares',
   'announcements',
@@ -595,7 +603,7 @@ function effectiveActions(db, user, node) {
   }
   sharedActionsForUser(db, user, node).forEach((action) => actions.add(action));
   (db.documentApprovals || [])
-    .filter((approval) => (approval.type || 'workflow') === 'permission')
+    .filter((approval) => ['permission', 'borrow', 'external'].includes(approval.type || 'workflow'))
     .filter((approval) => approval.status === 'approved' && approval.requesterId === user.id && approval.nodeId === node.id)
     .filter((approval) => !approval.expiresAt || new Date(approval.expiresAt).getTime() >= Date.now())
     .forEach((approval) => (approval.requestedActions || []).forEach((action) => actions.add(action)));
@@ -857,6 +865,7 @@ function normalizeWecomSettings(input = {}, fallback = {}) {
     syncDepartments: normalizeBoolean(input.syncDepartments ?? fallback.syncDepartments, DEFAULT_WECOM_SETTINGS.syncDepartments),
     syncUsers: normalizeBoolean(input.syncUsers ?? fallback.syncUsers, DEFAULT_WECOM_SETTINGS.syncUsers),
     pushMessages: normalizeBoolean(input.pushMessages ?? fallback.pushMessages, DEFAULT_WECOM_SETTINGS.pushMessages),
+    apiBaseUrl: String(input.apiBaseUrl ?? fallback.apiBaseUrl ?? DEFAULT_WECOM_SETTINGS.apiBaseUrl).trim().replace(/\/+$/, ''),
     lastTestAt: input.lastTestAt ?? fallback.lastTestAt ?? null,
     lastTestResult: input.lastTestResult ?? fallback.lastTestResult ?? null
   };
@@ -869,6 +878,12 @@ function sanitizeWecomSettings(settings = {}) {
     ...safe,
     hasSecret: Boolean(normalized.secret)
   };
+}
+
+function currentWecomSettings(db) {
+  db.settings = db.settings || {};
+  db.settings.wecom = normalizeWecomSettings(db.settings.wecom || {});
+  return db.settings.wecom;
 }
 
 function normalizeOfficePreviewSettings(input = {}, fallback = {}) {
@@ -959,6 +974,153 @@ function officeDocumentKey(version, documentUrl = '') {
   return String(`${version.id}-${version.md5 || version.createdAt || version.versionNo || ''}-${sourceKey}`)
     .replace(/[^A-Za-z0-9_.=-]/g, '_')
     .slice(0, 80);
+}
+
+function officeEditSessionById(db, sessionId) {
+  return (db.officeEditSessions || []).find((item) => item.id === sessionId) || null;
+}
+
+function activeOfficeEditSession(db, nodeId) {
+  return (db.officeEditSessions || []).find((item) => item.nodeId === nodeId && item.status === 'active') || null;
+}
+
+function publicOfficeEditSession(db, session) {
+  if (!session) return null;
+  const user = db.users.find((item) => item.id === session.userId);
+  return {
+    id: session.id,
+    nodeId: session.nodeId,
+    baseVersionId: session.baseVersionId,
+    userId: session.userId,
+    userName: user?.displayName || user?.username || session.userId,
+    status: session.status,
+    savedVersionId: session.savedVersionId || null,
+    startedAt: session.startedAt,
+    completedAt: session.completedAt || null,
+    lastCallbackStatus: session.lastCallbackStatus ?? null,
+    lastError: session.lastError || ''
+  };
+}
+
+function finishOfficeEditSession(db, session, status = 'closed') {
+  session.status = status;
+  session.completedAt = now();
+  const node = nodeById(db, session.nodeId);
+  if (node?.lockedBy === session.userId) {
+    node.lockedBy = null;
+    node.lockedAt = null;
+  }
+  return node;
+}
+
+function officeEditCallbackUrl(req, settings, session) {
+  const ticket = signToken({
+    kind: 'office_edit_callback',
+    sessionId: session.id,
+    nodeId: session.nodeId,
+    versionId: session.baseVersionId,
+    userId: session.userId
+  }, 12 * 60 * 60 * 1000);
+  return joinUrl(requestPublicBaseUrl(req, settings), `/api/v1/office-edit/callback?ticket=${encodeURIComponent(ticket)}`);
+}
+
+function buildOnlyOfficeEditor(req, node, version, extension, session) {
+  const settings = currentOfficePreviewSettings(req.db);
+  const documentType = officeDocumentType(extension);
+  if (!settings.enabled || !settings.documentServerUrl || !documentType || !OFFICE_EDIT_EXTENSIONS.has(extension)) return null;
+  const sourceToken = encodeURIComponent(signToken({
+    userId: req.user.id,
+    purpose: 'office-edit-source',
+    nodeId: node.id,
+    versionId: version.id,
+    sessionId: session.id
+  }, 12 * 60 * 60 * 1000));
+  const documentUrl = joinUrl(requestPublicBaseUrl(req, settings), `/storage/raw/${version.id}?token=${sourceToken}`);
+  const config = {
+    type: 'desktop',
+    documentType,
+    document: {
+      title: version.originalFilename || node.name,
+      url: documentUrl,
+      fileType: extension,
+      key: session.documentKey,
+      permissions: {
+        edit: true,
+        download: false,
+        print: false,
+        copy: true,
+        comment: true,
+        review: true
+      }
+    },
+    editorConfig: {
+      mode: 'edit',
+      lang: 'zh-CN',
+      callbackUrl: officeEditCallbackUrl(req, settings, session),
+      user: {
+        id: req.user.id,
+        name: req.user.displayName || req.user.username
+      },
+      customization: {
+        compactHeader: true,
+        compactToolbar: false,
+        hideRightMenu: false,
+        toolbarNoTabs: false,
+        autosave: true,
+        forcesave: true
+      }
+    }
+  };
+  if (settings.jwtSecret) config.token = signOnlyOfficeToken(config, settings.jwtSecret);
+  return { provider: 'onlyoffice', scriptUrl: '/web-apps/apps/api/documents/api.js', config };
+}
+
+function validateOfficeCallbackDownloadUrl(settings, value) {
+  let downloadUrl;
+  let documentServerUrl;
+  try {
+    downloadUrl = new URL(String(value || ''));
+    documentServerUrl = new URL(settings.documentServerUrl);
+  } catch {
+    throw createError(400, 'VALIDATION_ERROR', 'ONLYOFFICE 回传文件地址无效');
+  }
+  if (!['http:', 'https:'].includes(downloadUrl.protocol) || downloadUrl.username || downloadUrl.password) {
+    throw createError(400, 'VALIDATION_ERROR', 'ONLYOFFICE 回传文件地址来源不受信任');
+  }
+  if (downloadUrl.origin === documentServerUrl.origin) return downloadUrl.toString();
+  if (!downloadUrl.pathname.startsWith('/cache/files/')) {
+    throw createError(400, 'VALIDATION_ERROR', 'ONLYOFFICE 回传文件地址来源不受信任');
+  }
+  return new URL(`${downloadUrl.pathname}${downloadUrl.search}`, documentServerUrl).toString();
+}
+
+async function downloadOfficeEditedFile(db, settings, sourceUrl, session, extension) {
+  const downloadUrl = validateOfficeCallbackDownloadUrl(settings, sourceUrl);
+  const response = await fetch(downloadUrl, { signal: AbortSignal.timeout(30_000) });
+  if (!response.ok || !response.body) throw createError(502, 'OFFICE_EDIT_DOWNLOAD_FAILED', `下载编辑结果失败（HTTP ${response.status}）`);
+  const maxBytes = Number(currentFilePolicy(db).maxSizeMb || 300) * 1024 * 1024;
+  const contentLength = Number(response.headers.get('content-length') || 0);
+  if (contentLength > maxBytes) throw createError(413, 'FILE_TOO_LARGE', '在线编辑结果超过文件大小限制');
+  const tempPath = path.join(config.tmpDir, `${session.id}-${Date.now()}.${extension}`);
+  const fileHandle = await fs.open(tempPath, 'w');
+  let size = 0;
+  try {
+    for await (const chunk of response.body) {
+      size += chunk.length;
+      if (size > maxBytes) throw createError(413, 'FILE_TOO_LARGE', '在线编辑结果超过文件大小限制');
+      await fileHandle.write(chunk);
+    }
+  } catch (error) {
+    await fileHandle.close();
+    await fs.rm(tempPath, { force: true });
+    throw error;
+  }
+  await fileHandle.close();
+  if (!size) {
+    await fs.rm(tempPath, { force: true });
+    throw createError(502, 'OFFICE_EDIT_DOWNLOAD_FAILED', 'ONLYOFFICE 返回了空文件');
+  }
+  return tempPath;
 }
 
 function buildOnlyOfficePreview(req, node, version, extension) {
@@ -1737,6 +1899,50 @@ async function createVersionFromUpload(db, node, file, userId, description = '')
   return version;
 }
 
+async function createVersionFromFile(db, node, filePath, originalFilename, userId, description = '') {
+  const extension = extname(originalFilename);
+  const stats = await fs.stat(filePath);
+  const versionNo = db.versions.filter((item) => item.nodeId === node.id).length + 1;
+  const versionId = newId('ver_');
+  const storageName = `${versionId}-${safeFilename(originalFilename)}`;
+  const storagePath = path.join(config.uploadDir, storageName);
+  await fs.rename(filePath, storagePath);
+  let md5;
+  let mimeType;
+  let searchText;
+  try {
+    md5 = await fileMd5FromPath(storagePath);
+    mimeType = mime.lookup(originalFilename) || 'application/octet-stream';
+    searchText = await extractSearchText(storagePath, extension, mimeType, originalFilename);
+  } catch (error) {
+    await fs.rm(storagePath, { force: true });
+    throw error;
+  }
+  const version = {
+    id: versionId,
+    nodeId: node.id,
+    versionNo,
+    storageType: 'local',
+    storageKey: storageName,
+    originalFilename,
+    sizeBytes: stats.size,
+    md5,
+    mimeType,
+    description,
+    searchText,
+    previewStatus: 'unsupported',
+    indexStatus: indexStatusForSearchText(searchText, extension, mimeType, originalFilename),
+    createdBy: userId,
+    createdAt: now()
+  };
+  db.versions.push(version);
+  node.currentVersionId = version.id;
+  node.extension = extension;
+  node.updatedBy = userId;
+  node.updatedAt = now();
+  return version;
+}
+
 function streamVersion(res, version, downloadName = null, options = {}) {
   const filePath = versionFilePath(version, options.node, options.db);
   if (!fsSync.existsSync(filePath)) {
@@ -2092,6 +2298,86 @@ function publicMessage(db, user, message, options = {}) {
   };
 }
 
+function ensureNotificationDeliveries(db) {
+  db.notificationDeliveries = db.notificationDeliveries || [];
+  const existingKeys = new Set(db.notificationDeliveries.map((item) => `${item.messageId}:${item.channel}`));
+  const wecomEnabled = Boolean(db.settings?.wecom?.enabled && db.settings?.wecom?.pushMessages);
+  (db.messages || []).forEach((message) => {
+    const channels = ['system', ...(wecomEnabled ? ['wecom'] : [])];
+    channels.forEach((channel) => {
+      const key = `${message.id}:${channel}`;
+      if (existingKeys.has(key)) return;
+      existingKeys.add(key);
+      db.notificationDeliveries.unshift({
+        id: newId('nd_'),
+        messageId: message.id,
+        receiverId: message.receiverId,
+        channel,
+        status: channel === 'system' ? 'sent' : 'pending',
+        attempts: channel === 'system' ? 1 : 0,
+        lastError: '',
+        nextRetryAt: channel === 'system' ? null : now(),
+        sentAt: channel === 'system' ? message.createdAt : null,
+        createdAt: message.createdAt,
+        updatedAt: message.createdAt
+      });
+    });
+  });
+  db.notificationDeliveries = db.notificationDeliveries.slice(0, 10000);
+}
+
+function publicNotificationDelivery(db, delivery) {
+  const message = db.messages.find((item) => item.id === delivery.messageId);
+  return { ...delivery, title: message?.title || '', messageType: message?.messageType || '', content: message?.content || '' };
+}
+
+async function attemptNotificationDelivery(db, delivery) {
+  if (delivery.channel === 'system') {
+    delivery.status = 'sent';
+    delivery.sentAt = delivery.sentAt || now();
+    return delivery;
+  }
+  delivery.attempts = Number(delivery.attempts || 0) + 1;
+  delivery.updatedAt = now();
+  const settings = currentWecomSettings(db);
+  if (!settings.enabled || !settings.pushMessages || !settings.corpId || !settings.agentId || !settings.secret) {
+    delivery.status = 'failed';
+    delivery.lastError = '企业微信推送配置不完整';
+    delivery.nextRetryAt = new Date(Date.now() + Math.min(60, delivery.attempts * 5) * 60 * 1000).toISOString();
+    return delivery;
+  }
+  const message = db.messages.find((item) => item.id === delivery.messageId);
+  const receiver = db.users.find((item) => item.id === delivery.receiverId);
+  try {
+    const tokenResponse = await fetch(`${settings.apiBaseUrl}/cgi-bin/gettoken?corpid=${encodeURIComponent(settings.corpId)}&corpsecret=${encodeURIComponent(settings.secret)}`, { signal: AbortSignal.timeout(8000) });
+    const tokenPayload = await tokenResponse.json();
+    if (!tokenResponse.ok || Number(tokenPayload.errcode || 0) !== 0 || !tokenPayload.access_token) throw new Error(tokenPayload.errmsg || `HTTP ${tokenResponse.status}`);
+    const sendResponse = await fetch(`${settings.apiBaseUrl}/cgi-bin/message/send?access_token=${encodeURIComponent(tokenPayload.access_token)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        touser: receiver?.username || delivery.receiverId,
+        msgtype: 'text',
+        agentid: Number(settings.agentId) || settings.agentId,
+        text: { content: `${message?.title || '文档管理平台'}\n${message?.content || ''}` },
+        safe: 0
+      }),
+      signal: AbortSignal.timeout(8000)
+    });
+    const sendPayload = await sendResponse.json();
+    if (!sendResponse.ok || Number(sendPayload.errcode || 0) !== 0) throw new Error(sendPayload.errmsg || `HTTP ${sendResponse.status}`);
+    delivery.status = 'sent';
+    delivery.sentAt = now();
+    delivery.lastError = '';
+    delivery.nextRetryAt = null;
+  } catch (error) {
+    delivery.status = 'failed';
+    delivery.lastError = `企业微信推送失败：${error.message}`;
+    delivery.nextRetryAt = new Date(Date.now() + Math.min(60, delivery.attempts * 5) * 60 * 1000).toISOString();
+  }
+  return delivery;
+}
+
 function publicRecentAccess(db, user, access) {
   const node = nodeById(db, access.nodeId);
   return {
@@ -2100,16 +2386,211 @@ function publicRecentAccess(db, user, access) {
   };
 }
 
-function runtimeStatus(db) {
+function storageConsistencyReport(db) {
+  const issues = [];
+  const referencedStorageKeys = new Set();
+  db.versions.forEach((version) => {
+    const node = includeDeletedNodeById(db, version.nodeId);
+    if (!node) issues.push({ type: 'orphan_version', severity: 'error', versionId: version.id, message: '版本关联文件不存在' });
+    if ((version.storageType || 'local') === 'local') {
+      referencedStorageKeys.add(version.storageKey);
+      if (!version.storageKey || !fsSync.existsSync(path.join(config.uploadDir, version.storageKey))) issues.push({ type: 'missing_version_file', severity: 'error', versionId: version.id, nodeId: version.nodeId, message: '版本文件缺失' });
+    }
+  });
+  db.nodes.filter((node) => node.nodeType === 'file' && node.currentVersionId).forEach((node) => {
+    if (!db.versions.some((version) => version.id === node.currentVersionId && version.nodeId === node.id)) issues.push({ type: 'invalid_current_version', severity: 'error', nodeId: node.id, message: '当前版本引用无效' });
+  });
+  (db.attachments || []).forEach((attachment) => {
+    referencedStorageKeys.add(attachment.storageKey);
+    if (!attachment.storageKey || !fsSync.existsSync(path.join(config.uploadDir, attachment.storageKey))) issues.push({ type: 'missing_attachment_file', severity: 'error', attachmentId: attachment.id, nodeId: attachment.nodeId, message: '文档附件文件缺失' });
+  });
+  (db.announcements || []).filter((item) => item.attachment).forEach((announcement) => {
+    referencedStorageKeys.add(announcement.attachment.storageKey);
+    if (!announcement.attachment.storageKey || !fsSync.existsSync(path.join(config.uploadDir, announcement.attachment.storageKey))) issues.push({ type: 'missing_announcement_attachment', severity: 'error', announcementId: announcement.id, message: '公告附件文件缺失' });
+  });
+  const uploadFiles = fsSync.existsSync(config.uploadDir) ? fsSync.readdirSync(config.uploadDir, { withFileTypes: true }).filter((item) => item.isFile()).map((item) => item.name) : [];
+  uploadFiles.filter((name) => !referencedStorageKeys.has(name)).forEach((name) => issues.push({ type: 'orphan_upload', severity: 'warning', storageKey: name, message: '上传目录存在未引用文件' }));
+  return {
+    checkedAt: now(),
+    healthy: !issues.some((item) => item.severity === 'error'),
+    counts: {
+      nodes: db.nodes.length,
+      versions: db.versions.length,
+      uploadFiles: uploadFiles.length,
+      errors: issues.filter((item) => item.severity === 'error').length,
+      warnings: issues.filter((item) => item.severity === 'warning').length
+    },
+    issues: issues.slice(0, 500)
+  };
+}
+
+function evaluateSystemAlerts(db, consistency = storageConsistencyReport(db), runtime = null) {
+  const nowValue = now();
+  const candidates = [];
+  if (!consistency.healthy) candidates.push({ key: 'storage_consistency', severity: 'critical', title: '存储一致性异常', detail: `发现 ${consistency.counts.errors} 个错误` });
+  const failedSync = (db.externalSyncJobs || []).find((item) => item.status === 'failed');
+  if (failedSync) candidates.push({ key: 'external_sync_failed', severity: 'warning', title: '目录同步失败', detail: failedSync.error || '最近目录同步任务失败' });
+  const failedOffice = (db.officeEditSessions || []).filter((item) => item.status === 'failed').slice(0, 1)[0];
+  if (failedOffice) candidates.push({ key: 'office_edit_failed', severity: 'warning', title: 'Office 在线编辑保存失败', detail: failedOffice.lastError || failedOffice.id });
+  const failedDeliveries = (db.notificationDeliveries || []).filter((item) => item.status === 'failed').length;
+  if (failedDeliveries) candidates.push({ key: 'notification_failed', severity: 'warning', title: '通知投递失败', detail: `${failedDeliveries} 条通知等待重试` });
+  const recentLoginFailures = (db.auditLogs || []).filter((item) => item.action === 'auth.login_failed' && Date.now() - new Date(item.createdAt).getTime() <= 60 * 60 * 1000).length;
+  if (recentLoginFailures >= 5) candidates.push({ key: 'login_failures', severity: 'critical', title: '异常登录告警', detail: `最近一小时登录失败 ${recentLoginFailures} 次` });
+  const recentPreviewFailures = (db.auditLogs || []).filter((item) => item.action === 'file.preview_failed' && Date.now() - new Date(item.createdAt).getTime() <= 60 * 60 * 1000).length;
+  if (recentPreviewFailures >= 3) candidates.push({ key: 'preview_failures', severity: 'warning', title: '连续预览失败', detail: `最近一小时预览失败 ${recentPreviewFailures} 次` });
+  if (runtime?.disk?.warning) candidates.push({ key: 'disk_capacity_low', severity: 'critical', title: '磁盘可用空间不足', detail: `上传目录所在磁盘已使用 ${runtime.disk.usedPercent}%（阈值 ${runtime.disk.warningPercent}%）` });
+  if (runtime?.health?.mysql?.status === 'down') candidates.push({ key: 'mysql_health_down', severity: 'critical', title: 'MySQL 健康检查失败', detail: runtime.health.mysql.message });
+  if (runtime?.health?.onlyoffice?.status === 'down') candidates.push({ key: 'onlyoffice_health_down', severity: 'warning', title: 'ONLYOFFICE 健康检查失败', detail: runtime.health.onlyoffice.message });
+  db.systemAlerts = db.systemAlerts || [];
+  candidates.forEach((candidate) => {
+    const existing = db.systemAlerts.find((item) => item.key === candidate.key && item.status === 'open');
+    if (existing) {
+      existing.detail = candidate.detail;
+      existing.updatedAt = nowValue;
+    } else {
+      db.systemAlerts.unshift({ id: newId('alert_'), ...candidate, status: 'open', createdAt: nowValue, updatedAt: nowValue, resolvedAt: null, resolvedBy: null });
+    }
+  });
+  return db.systemAlerts;
+}
+
+function backupSafeSnapshot(db) {
+  const snapshot = structuredClone(db);
+  if (snapshot.settings?.wecom) snapshot.settings.wecom.secret = '';
+  if (snapshot.settings?.officePreview) snapshot.settings.officePreview.jwtSecret = '';
+  (snapshot.apiCredentials || []).forEach((item) => {
+    item.secretHash = '';
+    item.secretSalt = '';
+  });
+  snapshot.loginTickets = [];
+  return snapshot;
+}
+
+async function createSystemBackup(db, actorId) {
+  const job = { id: newId('backup_'), status: 'running', filename: '', sizeBytes: 0, error: '', createdBy: actorId, createdAt: now(), completedAt: null, drill: null };
+  db.backupJobs.unshift(job);
+  db.backupJobs = db.backupJobs.slice(0, 100);
+  const filename = `${job.id}-${new Date().toISOString().replace(/[:.]/g, '-')}.zip`;
+  const backupPath = path.join(config.backupDir, filename);
+  const snapshot = backupSafeSnapshot(db);
+  await new Promise((resolve, reject) => {
+    const output = fsSync.createWriteStream(backupPath);
+    const archive = archiver('zip', { zlib: { level: 9 } });
+    output.on('close', resolve);
+    output.on('error', reject);
+    archive.on('error', reject);
+    archive.pipe(output);
+    archive.append(JSON.stringify(snapshot, null, 2), { name: 'db.json' });
+    const storageKeys = new Set([
+      ...db.versions.filter((version) => (version.storageType || 'local') === 'local').map((version) => version.storageKey),
+      ...(db.attachments || []).map((attachment) => attachment.storageKey),
+      ...(db.announcements || []).map((announcement) => announcement.attachment?.storageKey)
+    ].filter(Boolean));
+    storageKeys.forEach((storageKey) => {
+      const source = path.join(config.uploadDir, storageKey);
+      if (fsSync.existsSync(source)) archive.file(source, { name: `uploads/${storageKey}` });
+    });
+    void archive.finalize();
+  });
+  const stats = await fs.stat(backupPath);
+  job.status = 'completed';
+  job.filename = filename;
+  job.sizeBytes = stats.size;
+  job.completedAt = now();
+  return job;
+}
+
+async function runBackupRestoreDrill(job) {
+  if (!job?.filename) throw createError(404, 'NOT_FOUND', '备份文件不存在');
+  const backupPath = path.join(config.backupDir, path.basename(job.filename));
+  if (!fsSync.existsSync(backupPath)) throw createError(404, 'NOT_FOUND', '备份文件不存在');
+  const zip = new AdmZip(backupPath);
+  const entries = zip.getEntries();
+  const unsafeEntry = entries.find((entry) => entry.entryName.includes('..') || path.isAbsolute(entry.entryName));
+  if (unsafeEntry) throw createError(400, 'BACKUP_INVALID', '备份包包含不安全路径');
+  const dbEntry = entries.find((entry) => entry.entryName === 'db.json');
+  if (!dbEntry) throw createError(400, 'BACKUP_INVALID', '备份包缺少账本快照');
+  let snapshot;
+  try {
+    snapshot = JSON.parse(dbEntry.getData().toString('utf8'));
+  } catch {
+    throw createError(400, 'BACKUP_INVALID', '备份账本格式无效');
+  }
+  const expectedFiles = [
+    ...(snapshot.versions || []).filter((version) => (version.storageType || 'local') === 'local').map((version) => ({ kind: 'version', id: version.id, storageKey: version.storageKey })),
+    ...(snapshot.attachments || []).map((attachment) => ({ kind: 'attachment', id: attachment.id, storageKey: attachment.storageKey })),
+    ...(snapshot.announcements || []).filter((announcement) => announcement.attachment).map((announcement) => ({ kind: 'announcement', id: announcement.id, storageKey: announcement.attachment.storageKey }))
+  ].filter((item) => item.storageKey);
+  const archivedFiles = new Set(entries.filter((entry) => entry.entryName.startsWith('uploads/') && !entry.isDirectory).map((entry) => entry.entryName.slice('uploads/'.length)));
+  const missingFiles = expectedFiles.filter((item) => !archivedFiles.has(item.storageKey));
+  const drill = { checkedAt: now(), valid: missingFiles.length === 0, nodeCount: (snapshot.nodes || []).length, versionCount: (snapshot.versions || []).length, attachmentCount: (snapshot.attachments || []).length, announcementAttachmentCount: (snapshot.announcements || []).filter((item) => item.attachment).length, archivedFileCount: archivedFiles.size, missingVersionIds: missingFiles.filter((item) => item.kind === 'version').map((item) => item.id).slice(0, 100), missingFiles: missingFiles.slice(0, 100) };
+  job.drill = drill;
+  return drill;
+}
+
+async function probeOnlyOfficeHealth(db) {
+  const settings = currentOfficePreviewSettings(db);
+  if (!settings.enabled || !settings.documentServerUrl) return { status: 'disabled', message: '未启用', checkedAt: now() };
+  try {
+    const response = await fetch(joinUrl(settings.documentServerUrl, '/healthcheck'), { signal: AbortSignal.timeout(5000) });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return { status: 'up', message: '服务可访问', checkedAt: now() };
+  } catch (error) {
+    return { status: 'down', message: `连接失败：${error.message}`, checkedAt: now() };
+  }
+}
+
+async function probeMysqlHealth() {
+  const storage = await readStorageConfig({ includePassword: true });
+  if (storage.provider !== 'mysql') return { status: 'disabled', message: '当前使用 JSON 存储', checkedAt: now() };
+  try {
+    const result = await testMysqlConnection(storage.mysql);
+    return { status: 'up', message: `MySQL ${result.version || ''}`.trim(), database: result.database, checkedAt: now() };
+  } catch (error) {
+    return { status: 'down', message: `连接失败：${error.message}`, checkedAt: now() };
+  }
+}
+
+async function withHealthProbeTimeout(label, operation, timeoutMs = 4000) {
+  try {
+    return await Promise.race([
+      operation(),
+      new Promise((resolve) => setTimeout(() => resolve({ status: 'down', message: `${label}健康检查超时（${Math.round(timeoutMs / 1000)} 秒）`, checkedAt: now() }), timeoutMs))
+    ]);
+  } catch (error) {
+    return { status: 'down', message: `${label}健康检查失败：${error.message}`, checkedAt: now() };
+  }
+}
+
+async function diskRuntimeStatus() {
+  try {
+    const stats = await fs.statfs(config.uploadDir);
+    const totalBytes = Number(stats.blocks) * Number(stats.bsize);
+    const freeBytes = Number(stats.bavail) * Number(stats.bsize);
+    const usedPercent = totalBytes ? Number((((totalBytes - freeBytes) / totalBytes) * 100).toFixed(1)) : 0;
+    return { totalBytes, freeBytes, usedBytes: totalBytes - freeBytes, usedPercent, warningPercent: config.diskWarningPercent, warning: usedPercent >= config.diskWarningPercent };
+  } catch (error) {
+    return { totalBytes: 0, freeBytes: 0, usedBytes: 0, usedPercent: 0, warningPercent: config.diskWarningPercent, warning: true, error: error.message };
+  }
+}
+
+async function runtimeStatus(db) {
   const files = db.nodes.filter((item) => item.nodeType === 'file' && item.status !== 'deleted');
   const folders = db.nodes.filter((item) => item.nodeType === 'folder' && item.status !== 'deleted');
+  const [mysqlHealth, onlyOfficeHealth, disk] = await Promise.all([
+    withHealthProbeTimeout('MySQL', probeMysqlHealth),
+    withHealthProbeTimeout('ONLYOFFICE', () => probeOnlyOfficeHealth(db)),
+    diskRuntimeStatus()
+  ]);
+  const degraded = disk.warning || [mysqlHealth, onlyOfficeHealth].some((item) => item.status === 'down');
   return {
-    status: 'up',
+    status: degraded ? 'degraded' : 'up',
     time: now(),
     uptimeSeconds: Math.round(process.uptime()),
     dataDir: config.dataDir,
     uploadDir: config.uploadDir,
     tmpDir: config.tmpDir,
+    backupDir: config.backupDir,
     dataDirExists: fsSync.existsSync(config.dataDir),
     uploadDirExists: fsSync.existsSync(config.uploadDir),
     tmpDirExists: fsSync.existsSync(config.tmpDir),
@@ -2124,8 +2605,16 @@ function runtimeStatus(db) {
       files: files.length,
       versions: db.versions.length,
       auditLogs: db.auditLogs.length,
-      pendingApprovals: (db.documentApprovals || []).filter((item) => item.status === 'pending').length
-    }
+      pendingApprovals: (db.documentApprovals || []).filter((item) => item.status === 'pending').length,
+      openAlerts: (db.systemAlerts || []).filter((item) => item.status === 'open').length,
+      failedNotifications: (db.notificationDeliveries || []).filter((item) => item.status === 'failed').length
+    },
+    storage: getStorageRuntimeInfo(),
+    disk,
+    health: { backend: { status: 'up', message: '服务正常', checkedAt: now() }, mysql: mysqlHealth, onlyoffice: onlyOfficeHealth },
+    officePreview: sanitizeOfficePreviewSettings(currentOfficePreviewSettings(db)),
+    lastSyncJob: db.externalSyncJobs?.[0] || null,
+    lastBackupJob: db.backupJobs?.[0] || null
   };
 }
 
@@ -2211,12 +2700,18 @@ function publicVersionChangeLog(db, log) {
 function publicApproval(db, user, approval) {
   const node = includeDeletedNodeById(db, approval.nodeId);
   const type = approval.type || 'workflow';
-  const typeLabels = { workflow: '文档流程', download: '下载审批', permission: '权限申请', publish: '发布审批' };
+  const typeLabels = { workflow: '文档流程', download: '下载审批', permission: '权限申请', publish: '发布审批', borrow: '借阅审批', external: '外发审批' };
   const actionLabels = {
     download: '下载文件',
     permission: '申请权限',
-    publish: '发布文件'
+    publish: '发布文件',
+    borrow: '借阅文件',
+    external: '外发文件'
   };
+  const steps = approvalSteps(approval);
+  const currentStep = steps[approval.currentStepIndex || 0] || null;
+  const currentApproverIds = currentStep?.approverIds || [];
+  const alreadyDecided = (currentStep?.decisions || []).some((item) => item.userId === user.id);
   return {
     ...approval,
     type,
@@ -2226,6 +2721,15 @@ function publicApproval(db, user, approval) {
     requestedActionsLabel: (approval.requestedActions || []).join('、'),
     requesterName: userDisplayName(db, approval.requesterId),
     approverName: userDisplayName(db, approval.approverId),
+    steps: steps.map((step, index) => ({
+      ...step,
+      index,
+      approverNames: step.approverIds.map((id) => userDisplayName(db, id)),
+      decisions: (step.decisions || []).map((item) => ({ ...item, userName: userDisplayName(db, item.userId) }))
+    })),
+    currentStepIndex: approval.currentStepIndex || 0,
+    currentStepName: currentStep?.name || '',
+    currentApproverNames: currentApproverIds.map((id) => userDisplayName(db, id)).join('、'),
     decidedByName: approval.decidedBy ? userDisplayName(db, approval.decidedBy) : '',
     nodeName: node?.name || approval.nodeId,
     nodePath: node?.fullPath || '',
@@ -2233,7 +2737,9 @@ function publicApproval(db, user, approval) {
     nodeBusinessStatus: node?.businessStatus || '',
     nodeSecurityLevel: node?.securityLevel || '',
     nodeSensitive: Boolean(node?.sensitive),
-    canDecide: approval.status === 'pending' && (isAdmin(user) || approval.approverId === user.id)
+    canDecide: approval.status === 'pending' && !alreadyDecided && (isAdmin(user) || currentApproverIds.includes(user.id)),
+    canWithdraw: approval.status === 'pending' && approval.requesterId === user.id,
+    canManageStep: approval.status === 'pending' && (isAdmin(user) || currentApproverIds.includes(user.id))
   };
 }
 
@@ -2267,7 +2773,9 @@ function approvalTypeLabel(type) {
     workflow: '文档流程',
     download: '下载审批',
     permission: '权限申请',
-    publish: '发布审批'
+    publish: '发布审批',
+    borrow: '借阅审批',
+    external: '外发审批'
   }[type] || type;
 }
 
@@ -2277,13 +2785,139 @@ function approvalActionLabel(approval) {
   if (type === 'download') return '下载文件';
   if (type === 'permission') return '申请权限';
   if (type === 'publish') return '发布文件';
+  if (type === 'borrow') return '借阅文件';
+  if (type === 'external') return '外发文件';
   return approval.action || type;
 }
 
+function approvalSteps(approval) {
+  if (Array.isArray(approval.steps) && approval.steps.length) return approval.steps;
+  return [{
+    id: `step_${approval.id || 'legacy'}_1`,
+    name: '审批',
+    mode: 'all',
+    approverIds: [approval.approverId].filter(Boolean),
+    decisions: approval.decidedBy ? [{ userId: approval.decidedBy, decision: approval.status === 'approved' ? 'approve' : 'reject', comment: approval.decisionComment || '', decidedAt: approval.decidedAt }] : [],
+    status: approval.status === 'approved' ? 'approved' : approval.status === 'rejected' ? 'rejected' : 'pending'
+  }];
+}
+
+function approvalStepConditionMatches(db, node, condition = null) {
+  if (!condition || !Object.keys(condition).length) return true;
+  const version = currentVersion(db, node);
+  if (condition.securityLevels?.length && !condition.securityLevels.includes(node.securityLevel)) return false;
+  if (condition.sensitive !== undefined && Boolean(condition.sensitive) !== Boolean(node.sensitive)) return false;
+  if (condition.extensions?.length && !condition.extensions.includes(node.extension)) return false;
+  if (condition.minSizeBytes && Number(version?.sizeBytes || 0) < Number(condition.minSizeBytes)) return false;
+  if (condition.maxSizeBytes && Number(version?.sizeBytes || 0) > Number(condition.maxSizeBytes)) return false;
+  return true;
+}
+
+function normalizeApprovalStepCondition(condition = {}) {
+  const normalized = {};
+  const securityLevels = (condition.securityLevels || []).filter((item) => SECURITY_LEVELS.includes(item));
+  const extensions = normalizeExtensions(condition.extensions || []);
+  if (securityLevels.length) normalized.securityLevels = securityLevels;
+  if (extensions.length) normalized.extensions = extensions;
+  if (condition.sensitive !== undefined && condition.sensitive !== null) normalized.sensitive = Boolean(condition.sensitive);
+  if (Number(condition.minSizeBytes) > 0) normalized.minSizeBytes = Number(condition.minSizeBytes);
+  if (Number(condition.maxSizeBytes) > 0) normalized.maxSizeBytes = Number(condition.maxSizeBytes);
+  return normalized;
+}
+
+function normalizeApprovalSteps(db, payload = {}, node = null) {
+  const source = Array.isArray(payload.steps) && payload.steps.length
+    ? payload.steps
+    : [{ name: '审批', mode: 'all', approverIds: [payload.approverId] }];
+  const normalized = source.map((step, index) => {
+    const approverIds = [...new Set((step.approverIds || [step.approverId]).map(String).filter(Boolean))];
+    if (!approverIds.length || approverIds.some((id) => !db.users.some((user) => user.id === id && user.status === 'enabled'))) {
+      throw createError(400, 'VALIDATION_ERROR', `第 ${index + 1} 个审批步骤包含无效审批人`);
+    }
+    return {
+      id: newId('apstep_'),
+      name: String(step.name || `第 ${index + 1} 级审批`).trim(),
+      mode: step.mode === 'any' ? 'any' : 'all',
+      approverIds,
+      condition: normalizeApprovalStepCondition(step.condition),
+      decisions: [],
+      status: index === 0 ? 'pending' : 'waiting'
+    };
+  });
+  const applicable = node ? normalized.filter((step) => approvalStepConditionMatches(db, node, step.condition)) : normalized;
+  if (!applicable.length) throw createError(400, 'VALIDATION_ERROR', '当前文件没有匹配的审批步骤');
+  return applicable.map((step, index) => ({ ...step, status: index === 0 ? 'pending' : 'waiting' }));
+}
+
+function normalizeApprovalTemplate(db, payload = {}, existing = null) {
+  const type = ['workflow', 'download', 'permission', 'publish', 'borrow', 'external'].includes(payload.type)
+    ? payload.type
+    : existing?.type || 'download';
+  const name = String(payload.name ?? existing?.name ?? '').trim();
+  if (!name) throw createError(400, 'VALIDATION_ERROR', '请输入审批模板名称');
+  const normalizedSteps = normalizeApprovalSteps(db, {
+    steps: payload.steps ?? existing?.steps,
+    approverId: payload.approverId ?? existing?.approverId
+  });
+  const steps = normalizedSteps.map(({ name: stepName, mode, approverIds, condition }) => ({
+    name: stepName,
+    mode,
+    approverIds,
+    condition
+  }));
+  const ccUserIds = [...new Set((payload.ccUserIds ?? existing?.ccUserIds ?? []).map(String).filter((id) => (
+    db.users.some((user) => user.id === id && user.status === 'enabled')
+  )))];
+  const requestedActions = type === 'permission'
+    ? normalizePermissionActions(payload.requestedActions ?? existing?.requestedActions ?? ['visible', 'file:preview'], ['visible', 'file:preview'])
+    : [];
+  return {
+    name,
+    description: String(payload.description ?? existing?.description ?? '').trim(),
+    type,
+    status: (payload.status ?? existing?.status) === 'disabled' ? 'disabled' : 'enabled',
+    steps,
+    ccUserIds,
+    requestedActions,
+    approvalTimeoutHours: Math.max(0, Math.min(Number(payload.approvalTimeoutHours ?? existing?.approvalTimeoutHours ?? 0), 24 * 365))
+  };
+}
+
+function publicApprovalTemplate(db, template) {
+  return {
+    ...template,
+    typeLabel: approvalTypeLabel(template.type),
+    steps: (template.steps || []).map((step) => ({
+      ...step,
+      approverNames: (step.approverIds || []).map((id) => userDisplayName(db, id))
+    })),
+    ccUserNames: (template.ccUserIds || []).map((id) => userDisplayName(db, id))
+  };
+}
+
+function notifyApprovalStep(db, approval, node) {
+  const step = approvalSteps(approval)[approval.currentStepIndex || 0];
+  if (!step) return;
+  approval.approverId = step.approverIds[0] || approval.approverId;
+  step.approverIds.forEach((userId) => addMessage(
+    db,
+    userId,
+    `${approval.type || 'workflow'}.approval.request`,
+    `${approvalTypeLabel(approval.type || 'workflow')}待处理`,
+    `${userDisplayName(db, approval.requesterId)} 提交了“${node.fullPath}”的${approvalActionLabel(approval)}申请，当前步骤：${step.name}`,
+    node.id
+  ));
+  (approval.ccUserIds || []).forEach((userId) => addMessage(db, userId, 'approval.cc', '审批抄送', `“${node.fullPath}”的${approvalActionLabel(approval)}流程进入${step.name}`, node.id));
+}
+
 function createApprovalRecord(db, user, node, payload = {}, req = null) {
-  const type = ['workflow', 'download', 'permission', 'publish'].includes(payload.type) ? payload.type : 'workflow';
-  const approver = defaultApprover(db, payload.approverId);
-  if (!approver) throw createError(400, 'VALIDATION_ERROR', '请选择有效审批人');
+  const type = ['workflow', 'download', 'permission', 'publish', 'borrow', 'external'].includes(payload.type) ? payload.type : 'workflow';
+  const template = payload.templateId ? db.approvalTemplates.find((item) => item.id === payload.templateId && item.status === 'enabled') : null;
+  if (payload.templateId && !template) throw createError(404, 'NOT_FOUND', '审批模板不存在或已停用');
+  if (template && template.type !== type) throw createError(400, 'VALIDATION_ERROR', '审批模板与申请类型不匹配');
+  const effectivePayload = template ? { ...template, ...payload, steps: payload.steps || template.steps, ccUserIds: payload.ccUserIds || template.ccUserIds } : payload;
+  const fallbackApprover = defaultApprover(db, effectivePayload.approverId);
+  const steps = normalizeApprovalSteps(db, { ...effectivePayload, approverId: effectivePayload.approverId || fallbackApprover?.id }, node);
   const timestamp = now();
   let action = payload.action || type;
   let requestedStatus = payload.requestedStatus || '';
@@ -2294,8 +2928,10 @@ function createApprovalRecord(db, user, node, payload = {}, req = null) {
     requestedStatus = actionConfig.status;
   }
   if (type === 'permission') {
-    requestedActions = normalizePermissionActions(payload.requestedActions || payload.actions || ['visible', 'file:preview'], ['visible', 'file:preview']);
+    requestedActions = normalizePermissionActions(effectivePayload.requestedActions || effectivePayload.actions || ['visible', 'file:preview'], ['visible', 'file:preview']);
   }
+  if (type === 'borrow') requestedActions = ['visible', 'file:preview', 'file:download'];
+  if (type === 'external') requestedActions = ['file:share_external'];
   const approval = {
     id: newId('appr_'),
     type,
@@ -2304,31 +2940,33 @@ function createApprovalRecord(db, user, node, payload = {}, req = null) {
     requestedStatus,
     requestedActions,
     requesterId: user.id,
-    approverId: approver.id,
+    approverId: steps[0].approverIds[0],
+    steps,
+    currentStepIndex: 0,
+    templateId: template?.id || null,
+    ccUserIds: [...new Set((effectivePayload.ccUserIds || []).map(String).filter((id) => db.users.some((userItem) => userItem.id === id && userItem.status === 'enabled')))],
+    events: [],
     requestComment: String(payload.reason ?? payload.comment ?? '').trim(),
     decisionComment: '',
     status: 'pending',
     expiresAt: payload.expiresAt || null,
+    dueAt: payload.dueAt || (Number(effectivePayload.approvalTimeoutHours || 0) > 0 ? new Date(Date.now() + Number(effectivePayload.approvalTimeoutHours) * 60 * 60 * 1000).toISOString() : null),
+    dueSoonNotifiedAt: null,
+    overdueNotifiedAt: null,
     decidedBy: null,
     decidedAt: null,
     createdAt: timestamp,
     updatedAt: timestamp
   };
   db.documentApprovals.unshift(approval);
-  addMessage(
-    db,
-    approver.id,
-    `${type}.approval.request`,
-    `${approvalTypeLabel(type)}待处理`,
-    `${userDisplayName(db, user.id)} 提交了“${node.fullPath}”的${approvalActionLabel(approval)}申请${approval.requestComment ? `：${approval.requestComment}` : ''}`,
-    node.id
-  );
+  notifyApprovalStep(db, approval, node);
   addAudit(db, user.id, `${type}.approval.submit`, 'document_approval', approval.id, {
     targetPath: node.fullPath,
     type,
     action: approval.action,
     requestedActions,
-    approverId: approver.id
+    approverId: approval.approverId,
+    stepCount: steps.length
   }, req);
   return approval;
 }
@@ -2336,6 +2974,73 @@ function createApprovalRecord(db, user, node, payload = {}, req = null) {
 function approvalDecisionMessage(db, approval, node, actor, approved) {
   const resultText = approved ? '已通过' : '已驳回';
   return `${userDisplayName(db, actor.id)} ${resultText}“${node.fullPath}”的${approvalActionLabel(approval)}申请${approval.decisionComment ? `：${approval.decisionComment}` : ''}`;
+}
+
+function currentApprovalStep(approval) {
+  return approvalSteps(approval)[approval.currentStepIndex || 0] || null;
+}
+
+function canManageCurrentApprovalStep(user, approval) {
+  const step = currentApprovalStep(approval);
+  return Boolean(step && (isAdmin(user) || step.approverIds.includes(user.id)));
+}
+
+function recordApprovalEvent(approval, type, actorId, detail = {}) {
+  approval.events = approval.events || [];
+  approval.events.push({ id: newId('apevt_'), type, actorId, detail, createdAt: now() });
+}
+
+function finalizeApprovedApproval(db, approval, node, actor, comment, req) {
+  approval.status = 'approved';
+  approval.decisionComment = comment;
+  approval.decidedBy = actor.id;
+  approval.decidedAt = now();
+  approval.updatedAt = now();
+  let detail = { actionLabel: approvalActionLabel(approval) };
+  if (['workflow', 'publish'].includes(approval.type || 'workflow')) {
+    detail = applyWorkflowAction(db, node, actor.id, approval.action, comment, req, approval);
+  }
+  addMessage(db, approval.requesterId, `${approval.type || 'workflow'}.approval.approved`, `${approvalTypeLabel(approval.type || 'workflow')}已通过`, approvalDecisionMessage(db, approval, node, actor, true), node.id);
+  recordApprovalEvent(approval, 'approved', actor.id, { comment });
+  return detail;
+}
+
+function decideApprovalStep(db, approval, node, actor, decision, comment = '', req = null) {
+  if (approval.status !== 'pending') throw createError(409, 'CONFLICT', '审批已处理');
+  const steps = approvalSteps(approval);
+  approval.steps = steps;
+  const stepIndex = approval.currentStepIndex || 0;
+  const step = steps[stepIndex];
+  if (!step || (!isAdmin(actor) && !step.approverIds.includes(actor.id))) throw createError(403, 'FORBIDDEN', '只有当前步骤审批人可以处理');
+  if ((step.decisions || []).some((item) => item.userId === actor.id)) throw createError(409, 'CONFLICT', '当前步骤已处理');
+  step.decisions = step.decisions || [];
+  step.decisions.push({ userId: actor.id, decision, comment, decidedAt: now() });
+  recordApprovalEvent(approval, decision, actor.id, { stepId: step.id, stepName: step.name, comment });
+  if (decision === 'reject') {
+    step.status = 'rejected';
+    approval.status = 'rejected';
+    approval.decisionComment = comment;
+    approval.decidedBy = actor.id;
+    approval.decidedAt = now();
+    approval.updatedAt = now();
+    addMessage(db, approval.requesterId, `${approval.type || 'workflow'}.approval.rejected`, `${approvalTypeLabel(approval.type || 'workflow')}已驳回`, approvalDecisionMessage(db, approval, node, actor, false), node.id);
+    return { completed: true, approved: false, detail: {} };
+  }
+  const approvedIds = new Set(step.decisions.filter((item) => item.decision === 'approve').map((item) => item.userId));
+  const stepComplete = isAdmin(actor) || step.mode === 'any' || step.approverIds.every((id) => approvedIds.has(id));
+  if (!stepComplete) {
+    approval.updatedAt = now();
+    return { completed: false, approved: false, detail: {} };
+  }
+  step.status = 'approved';
+  if (stepIndex < steps.length - 1) {
+    approval.currentStepIndex = stepIndex + 1;
+    steps[approval.currentStepIndex].status = 'pending';
+    approval.updatedAt = now();
+    notifyApprovalStep(db, approval, node);
+    return { completed: false, approved: false, detail: {} };
+  }
+  return { completed: true, approved: true, detail: finalizeApprovedApproval(db, approval, node, actor, comment, req) };
 }
 
 async function announcementAttachmentFromUpload(file) {
@@ -2460,6 +3165,35 @@ function dispatchDueReminders(db, userId) {
     });
 }
 
+function dispatchOperationalReminders(db) {
+  const current = Date.now();
+  (db.documentApprovals || []).filter((approval) => approval.status === 'pending' && approval.dueAt).forEach((approval) => {
+    const dueTime = new Date(approval.dueAt).getTime();
+    if (!Number.isFinite(dueTime)) return;
+    const step = currentApprovalStep(approval);
+    const node = includeDeletedNodeById(db, approval.nodeId);
+    if (dueTime <= current && !approval.overdueNotifiedAt) {
+      (step?.approverIds || []).forEach((userId) => addMessage(db, userId, 'approval.overdue', '审批已超时', `“${node?.fullPath || approval.nodeId}”的${approvalActionLabel(approval)}申请已超过处理时限`, approval.nodeId));
+      addMessage(db, approval.requesterId, 'approval.overdue.requester', '审批处理超时', `“${node?.fullPath || approval.nodeId}”的${approvalActionLabel(approval)}申请仍待处理`, approval.nodeId);
+      approval.overdueNotifiedAt = now();
+    } else if (dueTime > current && dueTime - current <= 24 * 60 * 60 * 1000 && !approval.dueSoonNotifiedAt) {
+      (step?.approverIds || []).forEach((userId) => addMessage(db, userId, 'approval.due_soon', '审批即将超时', `请在 ${approval.dueAt.slice(0, 16).replace('T', ' ')} 前处理“${node?.fullPath || approval.nodeId}”`, approval.nodeId));
+      approval.dueSoonNotifiedAt = now();
+    }
+  });
+  (db.nodes || []).filter((node) => node.nodeType === 'file' && node.reviewEnabled && node.reviewOwnerId && node.nextReviewAt).forEach((node) => {
+    const reviewTime = new Date(node.nextReviewAt).getTime();
+    if (!Number.isFinite(reviewTime)) return;
+    if (reviewTime <= current && !node.reviewOverdueNotifiedAt) {
+      addMessage(db, node.reviewOwnerId, 'document.review.overdue', '文档复审已逾期', `“${node.fullPath}”的复审日期已过，请尽快处理`, node.id);
+      node.reviewOverdueNotifiedAt = now();
+    } else if (reviewTime > current && reviewTime - current <= 7 * 24 * 60 * 60 * 1000 && !node.reviewDueSoonNotifiedAt) {
+      addMessage(db, node.reviewOwnerId, 'document.review.due_soon', '文档即将复审', `“${node.fullPath}”将在 ${node.nextReviewAt.slice(0, 10)} 到期复审`, node.id);
+      node.reviewDueSoonNotifiedAt = now();
+    }
+  });
+}
+
 function openApiDocument() {
   const endpoint = (summary, method = 'get') => ({
     [method]: {
@@ -2501,12 +3235,15 @@ function openApiDocument() {
       '/files/{id}/version-logs': endpoint('版本变更记录'),
       '/files/{id}/download': endpoint('文件下载'),
       '/files/{id}/preview': endpoint('文件预览'),
+      '/files/{id}/office-edit-session': endpoint('查询/发起 Office 在线编辑会话', 'post'),
+      '/files/{id}/office-edit-session/close': endpoint('关闭 Office 在线编辑会话', 'post'),
       '/files/{id}/read-upload-messages': endpoint('标记文件上传消息已读', 'post'),
       '/files/batch-download': endpoint('批量打包下载', 'post'),
       '/nodes/batch-move': endpoint('批量移动', 'post'),
       '/nodes/batch-delete': endpoint('批量删除', 'post'),
       '/search/files': endpoint('文件搜索', 'post'),
       '/search/suggestions': endpoint('搜索建议'),
+      '/search/recent': endpoint('个人最近搜索'),
       '/search/index/status': endpoint('全文检索索引状态'),
       '/search/index/rebuild': endpoint('重建全文检索索引', 'post'),
       '/governance/workspace': endpoint('知识治理聚合工作台'),
@@ -2523,6 +3260,8 @@ function openApiDocument() {
       '/categories/{id}/files': endpoint('分类文件列表'),
       '/permission-templates': endpoint('权限模板列表/新增'),
       '/permission-templates/{id}': endpoint('权限模板修改/删除'),
+      '/approval-templates': endpoint('审批模板列表/新增'),
+      '/approval-templates/{id}': endpoint('审批模板修改/删除'),
       '/nodes/{id}/permission-rules': endpoint('权限规则列表/新增'),
       '/nodes/{id}/permission-rules/batch': endpoint('批量套用权限模板', 'post'),
       '/permission-rules/{id}': endpoint('权限规则修改/删除'),
@@ -2550,6 +3289,10 @@ function openApiDocument() {
       '/audit-logs/report': endpoint('审计统计报表'),
       '/recent-access': endpoint('最近访问'),
       '/system/runtime-status': endpoint('系统运行与备份状态'),
+      '/system/consistency': endpoint('数据与文件一致性检查'),
+      '/system/backups': endpoint('备份任务列表/创建备份'),
+      '/system/alerts': endpoint('系统告警列表'),
+      '/notifications/deliveries': endpoint('通知投递记录'),
       '/system-settings/file-policy': endpoint('文件上传策略'),
       '/system-settings/security-policy': endpoint('文件安全策略'),
       '/system-settings/external-library': endpoint('服务器文档目录设置'),
@@ -3210,6 +3953,15 @@ app.delete('/api/v1/trash/:id', requireAuth, asyncRoute(async (req, res) => {
     throw createError(403, 'FORBIDDEN', '没有权限彻底删除该项目');
   }
   const affectedIds = new Set([node.id, ...descendantsIncludingDeleted(req.db, node.id).map((item) => item.id)]);
+  const storageKeys = [
+    ...req.db.versions
+      .filter((item) => affectedIds.has(item.nodeId) && (item.storageType || 'local') === 'local')
+      .map((item) => item.storageKey),
+    ...req.db.attachments
+      .filter((item) => affectedIds.has(item.nodeId))
+      .map((item) => item.storageKey)
+  ].filter((storageKey) => storageKey && path.basename(storageKey) === storageKey);
+  await Promise.all([...new Set(storageKeys)].map((storageKey) => fs.rm(path.join(config.uploadDir, storageKey), { force: true })));
   req.db.nodes = req.db.nodes.filter((item) => !affectedIds.has(item.id));
   req.db.versions = req.db.versions.filter((item) => !affectedIds.has(item.nodeId));
   req.db.permissionRules = req.db.permissionRules.filter((item) => !affectedIds.has(item.nodeId));
@@ -3344,6 +4096,158 @@ app.post('/api/v1/files/:id/versions/:versionId/rollback', requireAuth, asyncRou
   addAudit(req.db, req.user.id, 'file.version.rollback', 'node', node.id, { targetPath: node.fullPath, versionNo: version.versionNo }, req);
   await saveDb(req.db);
   res.json(ok(publicNode(req.db, req.user, node)));
+}));
+
+app.get('/api/v1/files/:id/office-edit-session', requireAuth, (req, res) => {
+  const node = nodeById(req.db, req.params.id);
+  requireNodeAction(req, node, 'visible');
+  requireNodePasswordAccess(req, node);
+  res.json(ok(publicOfficeEditSession(req.db, activeOfficeEditSession(req.db, node.id))));
+});
+
+app.post('/api/v1/files/:id/office-edit-session', requireAuth, asyncRoute(async (req, res) => {
+  const node = nodeById(req.db, req.params.id);
+  requireNodeAction(req, node, 'file:update');
+  requireNodePasswordAccess(req, node);
+  if (node.nodeType !== 'file') throw createError(400, 'VALIDATION_ERROR', '只能在线编辑文件');
+  if ((node.sourceType || 'local') === 'external') throw createError(409, 'CONFLICT', '同步目录文件由管理员维护源文件，暂不支持在线编辑');
+  const version = currentVersion(req.db, node);
+  if (!version) throw createError(404, 'NOT_FOUND', '当前版本不存在');
+  const extension = extname(version.originalFilename || node.name);
+  if (!OFFICE_EDIT_EXTENSIONS.has(extension)) throw createError(400, 'VALIDATION_ERROR', '在线编辑仅支持 docx、xlsx、pptx');
+  const settings = currentOfficePreviewSettings(req.db);
+  const configurationIssue = officePreviewConfigurationIssue(req, settings);
+  if (configurationIssue) throw createError(503, 'OFFICE_EDIT_UNAVAILABLE', configurationIssue);
+  if (!settings.enabled || !settings.documentServerUrl) throw createError(503, 'OFFICE_EDIT_UNAVAILABLE', '请先配置并启用 ONLYOFFICE Document Server');
+  let activeSession = activeOfficeEditSession(req.db, node.id);
+  if (activeSession && Date.now() - new Date(activeSession.startedAt).getTime() > 12 * 60 * 60 * 1000) {
+    finishOfficeEditSession(req.db, activeSession, 'failed');
+    activeSession.lastError = '在线编辑会话超时，已自动释放';
+    activeSession = null;
+  }
+  if (activeSession && activeSession.userId !== req.user.id) {
+    throw createError(409, 'OFFICE_EDIT_LOCKED', `文件正在由 ${userDisplayName(req.db, activeSession.userId)} 在线编辑`);
+  }
+  if (node.lockedBy && node.lockedBy !== req.user.id && !isAdmin(req.user)) throw createError(409, 'CONFLICT', '文件已被其他用户锁定');
+  let session = activeSession;
+  if (!session || session.baseVersionId !== version.id) {
+    if (session) finishOfficeEditSession(req.db, session, 'closed');
+    session = {
+      id: newId('oes_'),
+      nodeId: node.id,
+      baseVersionId: version.id,
+      userId: req.user.id,
+      documentKey: `${officeDocumentKey(version)}-${crypto.randomBytes(6).toString('hex')}`.slice(0, 80),
+      status: 'active',
+      savedVersionId: null,
+      startedAt: now(),
+      completedAt: null,
+      lastCallbackStatus: null,
+      lastError: ''
+    };
+    req.db.officeEditSessions.push(session);
+  }
+  node.lockedBy = req.user.id;
+  node.lockedAt = node.lockedAt || now();
+  const editor = buildOnlyOfficeEditor(req, node, version, extension, session);
+  if (!editor) throw createError(503, 'OFFICE_EDIT_UNAVAILABLE', '当前文件无法生成在线编辑配置');
+  addAudit(req.db, req.user.id, 'file.office_edit.start', 'node', node.id, {
+    targetPath: node.fullPath,
+    sessionId: session.id,
+    versionNo: version.versionNo
+  }, req);
+  await saveDb(req.db);
+  res.json(ok({ session: publicOfficeEditSession(req.db, session), editor }));
+}));
+
+app.post('/api/v1/files/:id/office-edit-session/close', requireAuth, asyncRoute(async (req, res) => {
+  const node = nodeById(req.db, req.params.id);
+  requireNodeAction(req, node, 'file:update');
+  const session = activeOfficeEditSession(req.db, node.id);
+  if (!session) return res.json(ok(null));
+  if (session.userId !== req.user.id && !isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只能关闭自己的在线编辑会话');
+  finishOfficeEditSession(req.db, session, 'closed');
+  addAudit(req.db, req.user.id, 'file.office_edit.close', 'node', node.id, { targetPath: node.fullPath, sessionId: session.id }, req);
+  await saveDb(req.db);
+  res.json(ok(publicOfficeEditSession(req.db, session)));
+}));
+
+app.post('/api/v1/office-edit/callback', asyncRoute(async (req, res) => {
+  const ticket = verifyToken(String(req.query.ticket || ''));
+  if (ticket?.kind !== 'office_edit_callback') return res.status(401).json({ error: 1 });
+  const db = await loadDb();
+  const session = officeEditSessionById(db, ticket.sessionId);
+  if (!session || session.nodeId !== ticket.nodeId || session.baseVersionId !== ticket.versionId || session.userId !== ticket.userId) {
+    return res.status(404).json({ error: 1 });
+  }
+  const callbackStatus = Number(req.body?.status || 0);
+  session.lastCallbackStatus = callbackStatus;
+  if (session.savedVersionId || session.status === 'saved') return res.json({ error: 0 });
+  const node = nodeById(db, session.nodeId);
+  const user = db.users.find((item) => item.id === session.userId && item.status === 'enabled');
+  if (!node || !user) {
+    session.lastError = '在线编辑关联的文件或用户不存在';
+    finishOfficeEditSession(db, session, 'failed');
+    await saveDb(db);
+    return res.status(404).json({ error: 1 });
+  }
+  if (callbackStatus === 1) {
+    await saveDb(db);
+    return res.json({ error: 0 });
+  }
+  if ([3, 7].includes(callbackStatus)) {
+    session.lastError = 'ONLYOFFICE 报告保存失败';
+    if (callbackStatus === 3) finishOfficeEditSession(db, session, 'failed');
+    await saveDb(db);
+    return res.json({ error: 0 });
+  }
+  if (callbackStatus === 4) {
+    finishOfficeEditSession(db, session, 'closed');
+    addAudit(db, user.id, 'file.office_edit.no_changes', 'node', node.id, { targetPath: node.fullPath, sessionId: session.id });
+    await saveDb(db);
+    return res.json({ error: 0 });
+  }
+  if (![2, 6].includes(callbackStatus) || !req.body?.url) return res.json({ error: 0 });
+  const baseVersion = versionById(db, session.baseVersionId);
+  const extension = extname(baseVersion?.originalFilename || node.name);
+  let tempPath = '';
+  try {
+    const settings = currentOfficePreviewSettings(db);
+    tempPath = await downloadOfficeEditedFile(db, settings, req.body.url, session, extension);
+    const previousVersion = currentVersion(db, node);
+    const version = await createVersionFromFile(
+      db,
+      node,
+      tempPath,
+      baseVersion?.originalFilename || node.name,
+      user.id,
+      'ONLYOFFICE 在线编辑'
+    );
+    tempPath = '';
+    addVersionChangeLog(db, node, version, user.id, 'office_edit', {
+      description: version.description,
+      sessionId: session.id,
+      fromVersionId: previousVersion?.id || null,
+      fromVersionNo: previousVersion?.versionNo || null
+    });
+    session.savedVersionId = version.id;
+    session.lastError = '';
+    finishOfficeEditSession(db, session, 'saved');
+    addAudit(db, user.id, 'file.office_edit.save', 'node', node.id, {
+      targetPath: node.fullPath,
+      sessionId: session.id,
+      versionNo: version.versionNo
+    });
+    notifySubscribers(db, user.id, node, 'update', version);
+    await saveDb(db);
+    return res.json({ error: 0 });
+  } catch (error) {
+    if (tempPath) await fs.rm(tempPath, { force: true }).catch(() => {});
+    session.lastError = error.message || '在线编辑结果保存失败';
+    if (callbackStatus === 2) finishOfficeEditSession(db, session, 'failed');
+    await saveDbBestEffort(db, 'office edit callback');
+    return res.status(502).json({ error: 1 });
+  }
 }));
 
 app.post('/api/v1/files/:id/lock', requireAuth, asyncRoute(async (req, res) => {
@@ -3522,7 +4426,7 @@ app.post('/api/v1/files/batch-download', requireAuth, asyncRoute(async (req, res
 app.get('/api/v1/approvals', requireAuth, (req, res) => {
   const scope = req.query.scope || 'todo';
   let approvals = req.db.documentApprovals || [];
-  if (scope === 'todo') approvals = approvals.filter((item) => item.approverId === req.user.id && item.status === 'pending');
+  if (scope === 'todo') approvals = approvals.filter((item) => item.status === 'pending' && (isAdmin(req.user) || currentApprovalStep(item)?.approverIds?.includes(req.user.id)));
   else if (scope === 'mine') approvals = approvals.filter((item) => item.requesterId === req.user.id);
   else if (scope === 'all') {
     if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以查看全部审批');
@@ -3541,15 +4445,64 @@ app.get('/api/v1/approvals', requireAuth, (req, res) => {
   sendPage(res, visibleApprovals, req.query.page, req.query.pageSize || 50);
 });
 
+app.get('/api/v1/approval-templates', requireAuth, (req, res) => {
+  let items = req.db.approvalTemplates || [];
+  if (!isAdmin(req.user)) items = items.filter((item) => item.status === 'enabled');
+  if (req.query.type) items = items.filter((item) => item.type === req.query.type);
+  res.json(ok(items
+    .slice()
+    .sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')))
+    .map((item) => publicApprovalTemplate(req.db, item))));
+});
+
+app.post('/api/v1/approval-templates', requireAuth, asyncRoute(async (req, res) => {
+  if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以维护审批模板');
+  const timestamp = now();
+  const template = {
+    id: newId('apt_'),
+    ...normalizeApprovalTemplate(req.db, req.body),
+    createdBy: req.user.id,
+    createdAt: timestamp,
+    updatedAt: timestamp
+  };
+  req.db.approvalTemplates.unshift(template);
+  addAudit(req.db, req.user.id, 'approval_template.create', 'approval_template', template.id, { name: template.name, type: template.type, stepCount: template.steps.length }, req);
+  await saveDb(req.db);
+  res.json(ok(publicApprovalTemplate(req.db, template)));
+}));
+
+app.put('/api/v1/approval-templates/:id', requireAuth, asyncRoute(async (req, res) => {
+  if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以维护审批模板');
+  const template = req.db.approvalTemplates.find((item) => item.id === req.params.id);
+  if (!template) throw createError(404, 'NOT_FOUND', '审批模板不存在');
+  Object.assign(template, normalizeApprovalTemplate(req.db, req.body, template), { updatedAt: now() });
+  addAudit(req.db, req.user.id, 'approval_template.update', 'approval_template', template.id, { name: template.name, type: template.type, stepCount: template.steps.length }, req);
+  await saveDb(req.db);
+  res.json(ok(publicApprovalTemplate(req.db, template)));
+}));
+
+app.delete('/api/v1/approval-templates/:id', requireAuth, asyncRoute(async (req, res) => {
+  if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以维护审批模板');
+  const template = req.db.approvalTemplates.find((item) => item.id === req.params.id);
+  if (!template) throw createError(404, 'NOT_FOUND', '审批模板不存在');
+  if ((req.db.documentApprovals || []).some((item) => item.templateId === template.id && item.status === 'pending')) {
+    throw createError(409, 'CONFLICT', '该模板存在待处理审批，暂不能删除');
+  }
+  req.db.approvalTemplates = req.db.approvalTemplates.filter((item) => item.id !== template.id);
+  addAudit(req.db, req.user.id, 'approval_template.delete', 'approval_template', template.id, { name: template.name, type: template.type }, req);
+  await saveDb(req.db);
+  res.json(ok(true));
+}));
+
 app.post('/api/v1/approvals', requireAuth, asyncRoute(async (req, res) => {
   const node = nodeById(req.db, req.body.nodeId);
   requireNodeAction(req, node, 'visible');
   requireNodePasswordAccess(req, node);
-  const type = ['workflow', 'download', 'permission', 'publish'].includes(req.body.type) ? req.body.type : 'download';
-  if (type === 'download') {
-    requireNodeAction(req, node, 'file:download');
+  const type = ['workflow', 'download', 'permission', 'publish', 'borrow', 'external'].includes(req.body.type) ? req.body.type : 'download';
+  if (type === 'download' || type === 'borrow') {
     if (node.nodeType !== 'file') throw createError(400, 'VALIDATION_ERROR', '只能对文件提交下载审批');
   }
+  if (type === 'external' && node.nodeType !== 'file') throw createError(400, 'VALIDATION_ERROR', '只能对文件提交外发审批');
   if (type === 'permission') {
     if (!Array.isArray(req.body.requestedActions) && !Array.isArray(req.body.actions)) throw createError(400, 'VALIDATION_ERROR', '请选择要申请的权限');
   }
@@ -3574,36 +4527,18 @@ app.get('/api/v1/approvals/:id', requireAuth, (req, res) => {
   if (!approval) throw createError(404, 'NOT_FOUND', '审批记录不存在');
   const node = nodeById(req.db, approval.nodeId);
   if (!node) throw createError(404, 'NOT_FOUND', '审批关联文件不存在');
-  if (!isAdmin(req.user) && approval.requesterId !== req.user.id && approval.approverId !== req.user.id) requireNodeAction(req, node, 'visible');
+  if (!isAdmin(req.user) && approval.requesterId !== req.user.id && !currentApprovalStep(approval)?.approverIds?.includes(req.user.id) && !(approval.ccUserIds || []).includes(req.user.id)) requireNodeAction(req, node, 'visible');
   res.json(ok(publicApproval(req.db, req.user, approval)));
 });
 
 app.post('/api/v1/approvals/:id/approve', requireAuth, asyncRoute(async (req, res) => {
   const approval = req.db.documentApprovals.find((item) => item.id === req.params.id);
   if (!approval) throw createError(404, 'NOT_FOUND', '审批记录不存在');
-  if (approval.status !== 'pending') throw createError(409, 'CONFLICT', '审批已处理');
-  if (!isAdmin(req.user) && approval.approverId !== req.user.id) throw createError(403, 'FORBIDDEN', '只有审批人可以处理');
   const node = nodeById(req.db, approval.nodeId);
   if (!node) throw createError(404, 'NOT_FOUND', '审批关联文件不存在');
   requireNodeAction(req, node, 'visible');
   requireNodePasswordAccess(req, node);
-  approval.status = 'approved';
-  approval.decisionComment = String(req.body.comment || '').trim();
-  approval.decidedBy = req.user.id;
-  approval.decidedAt = now();
-  approval.updatedAt = now();
-  let detail = { actionLabel: approvalActionLabel(approval) };
-  if ((approval.type || 'workflow') === 'workflow' || (approval.type || 'workflow') === 'publish') {
-    detail = applyWorkflowAction(req.db, node, req.user.id, approval.action, approval.decisionComment, req, approval);
-  }
-  addMessage(
-    req.db,
-    approval.requesterId,
-    `${approval.type || 'workflow'}.approval.approved`,
-    `${approvalTypeLabel(approval.type || 'workflow')}已通过`,
-    approvalDecisionMessage(req.db, approval, node, req.user, true),
-    node.id
-  );
+  const result = decideApprovalStep(req.db, approval, node, req.user, 'approve', String(req.body.comment || '').trim(), req);
   addAudit(req.db, req.user.id, `${approval.type || 'workflow'}.approval.approve`, 'document_approval', approval.id, {
     targetPath: node.fullPath,
     type: approval.type || 'workflow',
@@ -3611,37 +4546,95 @@ app.post('/api/v1/approvals/:id/approve', requireAuth, asyncRoute(async (req, re
     requestedActions: approval.requestedActions || []
   }, req);
   await saveDb(req.db);
-  res.json(ok({ approval: publicApproval(req.db, req.user, approval), node: publicNode(req.db, req.user, node) }));
+  res.json(ok({ approval: publicApproval(req.db, req.user, approval), node: publicNode(req.db, req.user, node), completed: result.completed }));
 }));
 
 app.post('/api/v1/approvals/:id/reject', requireAuth, asyncRoute(async (req, res) => {
   const approval = req.db.documentApprovals.find((item) => item.id === req.params.id);
   if (!approval) throw createError(404, 'NOT_FOUND', '审批记录不存在');
-  if (approval.status !== 'pending') throw createError(409, 'CONFLICT', '审批已处理');
-  if (!isAdmin(req.user) && approval.approverId !== req.user.id) throw createError(403, 'FORBIDDEN', '只有审批人可以处理');
   const node = nodeById(req.db, approval.nodeId);
   if (!node) throw createError(404, 'NOT_FOUND', '审批关联文件不存在');
   requireNodeAction(req, node, 'visible');
   requireNodePasswordAccess(req, node);
-  approval.status = 'rejected';
-  approval.decisionComment = String(req.body.comment || '').trim();
-  approval.decidedBy = req.user.id;
-  approval.decidedAt = now();
-  approval.updatedAt = now();
-  addMessage(
-    req.db,
-    approval.requesterId,
-    `${approval.type || 'workflow'}.approval.rejected`,
-    `${approvalTypeLabel(approval.type || 'workflow')}已驳回`,
-    approvalDecisionMessage(req.db, approval, node, req.user, false),
-    node.id
-  );
+  decideApprovalStep(req.db, approval, node, req.user, 'reject', String(req.body.comment || '').trim(), req);
   addAudit(req.db, req.user.id, `${approval.type || 'workflow'}.approval.reject`, 'document_approval', approval.id, {
     targetPath: node.fullPath,
     type: approval.type || 'workflow',
     action: approval.action,
     requestedActions: approval.requestedActions || []
   }, req);
+  await saveDb(req.db);
+  res.json(ok(publicApproval(req.db, req.user, approval)));
+}));
+
+app.post('/api/v1/approvals/:id/withdraw', requireAuth, asyncRoute(async (req, res) => {
+  const approval = req.db.documentApprovals.find((item) => item.id === req.params.id);
+  if (!approval) throw createError(404, 'NOT_FOUND', '审批记录不存在');
+  if (approval.status !== 'pending') throw createError(409, 'CONFLICT', '只能撤回待处理审批');
+  if (approval.requesterId !== req.user.id && !isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只能撤回自己的审批');
+  approval.status = 'cancelled';
+  approval.updatedAt = now();
+  approval.decisionComment = String(req.body.comment || '申请人撤回').trim();
+  recordApprovalEvent(approval, 'withdraw', req.user.id, { comment: approval.decisionComment });
+  addAudit(req.db, req.user.id, 'approval.withdraw', 'document_approval', approval.id, { nodeId: approval.nodeId }, req);
+  await saveDb(req.db);
+  res.json(ok(publicApproval(req.db, req.user, approval)));
+}));
+
+app.post('/api/v1/approvals/:id/transfer', requireAuth, asyncRoute(async (req, res) => {
+  const approval = req.db.documentApprovals.find((item) => item.id === req.params.id);
+  if (!approval) throw createError(404, 'NOT_FOUND', '审批记录不存在');
+  if (!canManageCurrentApprovalStep(req.user, approval)) throw createError(403, 'FORBIDDEN', '只有当前审批人可以转交');
+  const target = req.db.users.find((item) => item.id === req.body.userId && item.status === 'enabled');
+  if (!target) throw createError(400, 'VALIDATION_ERROR', '请选择有效转交人');
+  const step = currentApprovalStep(approval);
+  step.approverIds = isAdmin(req.user) && !step.approverIds.includes(req.user.id)
+    ? [target.id]
+    : step.approverIds.map((id) => id === req.user.id ? target.id : id);
+  if (!step.approverIds.includes(target.id)) step.approverIds.push(target.id);
+  approval.approverId = step.approverIds[0];
+  approval.updatedAt = now();
+  recordApprovalEvent(approval, 'transfer', req.user.id, { toUserId: target.id, comment: String(req.body.comment || '').trim() });
+  addMessage(req.db, target.id, 'approval.transfer', '审批已转交给你', `请处理${approvalActionLabel(approval)}申请`, approval.nodeId);
+  addAudit(req.db, req.user.id, 'approval.transfer', 'document_approval', approval.id, { toUserId: target.id }, req);
+  await saveDb(req.db);
+  res.json(ok(publicApproval(req.db, req.user, approval)));
+}));
+
+app.post('/api/v1/approvals/:id/add-step', requireAuth, asyncRoute(async (req, res) => {
+  const approval = req.db.documentApprovals.find((item) => item.id === req.params.id);
+  if (!approval) throw createError(404, 'NOT_FOUND', '审批记录不存在');
+  if (!canManageCurrentApprovalStep(req.user, approval)) throw createError(403, 'FORBIDDEN', '只有当前审批人可以加签');
+  const [step] = normalizeApprovalSteps(req.db, { steps: [{ name: req.body.name || '加签审批', mode: req.body.mode, approverIds: req.body.approverIds || [req.body.userId] }] });
+  step.status = 'waiting';
+  const insertAt = req.body.position === 'before' ? approval.currentStepIndex || 0 : (approval.currentStepIndex || 0) + 1;
+  approval.steps = approvalSteps(approval);
+  approval.steps.splice(insertAt, 0, step);
+  if (req.body.position === 'before') {
+    approval.steps[insertAt + 1].status = 'waiting';
+    step.status = 'pending';
+    approval.currentStepIndex = insertAt;
+    notifyApprovalStep(req.db, approval, nodeById(req.db, approval.nodeId));
+  }
+  approval.updatedAt = now();
+  recordApprovalEvent(approval, 'add_step', req.user.id, { stepId: step.id, position: req.body.position === 'before' ? 'before' : 'after' });
+  addAudit(req.db, req.user.id, 'approval.add_step', 'document_approval', approval.id, { stepId: step.id }, req);
+  await saveDb(req.db);
+  res.json(ok(publicApproval(req.db, req.user, approval)));
+}));
+
+app.post('/api/v1/approvals/:id/remind', requireAuth, asyncRoute(async (req, res) => {
+  const approval = req.db.documentApprovals.find((item) => item.id === req.params.id);
+  if (!approval) throw createError(404, 'NOT_FOUND', '审批记录不存在');
+  if (approval.status !== 'pending') throw createError(409, 'CONFLICT', '审批已结束');
+  if (approval.requesterId !== req.user.id && !isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有申请人可以催办');
+  if (approval.lastRemindedAt && Date.now() - new Date(approval.lastRemindedAt).getTime() < 10 * 60 * 1000) throw createError(429, 'RATE_LIMITED', '请勿频繁催办');
+  const step = currentApprovalStep(approval);
+  step.approverIds.forEach((userId) => addMessage(req.db, userId, 'approval.remind', '审批催办', `${userDisplayName(req.db, req.user.id)} 催办${approvalActionLabel(approval)}申请`, approval.nodeId));
+  approval.lastRemindedAt = now();
+  approval.updatedAt = now();
+  recordApprovalEvent(approval, 'remind', req.user.id);
+  addAudit(req.db, req.user.id, 'approval.remind', 'document_approval', approval.id, { stepId: step.id }, req);
   await saveDb(req.db);
   res.json(ok(publicApproval(req.db, req.user, approval)));
 }));
@@ -4440,6 +5433,9 @@ app.post('/api/v1/search/files', requireAuth, asyncRoute(async (req, res) => {
   const keyword = String(req.body.keyword || '').trim();
   const normalizedKeyword = keyword.toLowerCase();
   const fileTypes = req.body.fileTypes || [];
+  const securityLevels = Array.isArray(req.body.securityLevels) ? req.body.securityLevels.filter((item) => SECURITY_LEVELS.includes(item)) : [];
+  const categoryIds = Array.isArray(req.body.categoryIds) ? req.body.categoryIds.map(String).filter(Boolean) : [];
+  const tags = Array.isArray(req.body.tags) ? req.body.tags.map((item) => String(item).trim().toLowerCase()).filter(Boolean) : [];
   const pathPrefix = req.body.pathPrefix || '';
   const creatorId = req.body.creatorId || '';
   const updatedFrom = req.body.updatedFrom ? new Date(req.body.updatedFrom).getTime() : null;
@@ -4454,6 +5450,9 @@ app.post('/api/v1/search/files', requireAuth, asyncRoute(async (req, res) => {
     .filter((node) => node.nodeType === 'file')
     .filter((node) => !pathPrefix || node.fullPath.startsWith(pathPrefix))
     .filter((node) => !fileTypes.length || fileTypes.includes(node.extension))
+    .filter((node) => !securityLevels.length || securityLevels.includes(node.securityLevel))
+    .filter((node) => !categoryIds.length || categoryIds.every((categoryId) => req.db.documentCategories.some((item) => item.nodeId === node.id && item.categoryId === categoryId)))
+    .filter((node) => !tags.length || tags.every((tag) => (node.tags || []).some((item) => String(item).toLowerCase() === tag)))
     .filter((node) => !creatorId || node.createdBy === creatorId)
     .filter((node) => !updatedFrom || new Date(node.updatedAt).getTime() >= updatedFrom)
     .filter((node) => !updatedTo || new Date(node.updatedAt).getTime() <= updatedTo)
@@ -4489,7 +5488,7 @@ app.post('/api/v1/search/files', requireAuth, asyncRoute(async (req, res) => {
       highlight: searchMatch?.source === 'content' ? keyword : '',
       searchMatch
     }));
-  if (keyword) {
+  if (keyword || fileTypes.length || securityLevels.length || categoryIds.length || tags.length || creatorId || updatedFrom || updatedTo) {
     req.db.searchEvents.unshift({
       id: newId('search_'),
       userId: req.user.id,
@@ -4499,6 +5498,9 @@ app.post('/api/v1/search/files', requireAuth, asyncRoute(async (req, res) => {
       pathPrefix,
       filters: {
         fileTypes,
+        securityLevels,
+        categoryIds,
+        tags,
         creatorId,
         updatedFrom: req.body.updatedFrom || null,
         updatedTo: req.body.updatedTo || null,
@@ -4519,6 +5521,37 @@ app.get('/api/v1/search/suggestions', requireAuth, (req, res) => {
   const limit = Math.max(1, Math.min(20, Number(req.query.limit || 8)));
   res.json(ok(buildSearchSuggestions(req, keyword, pathPrefix, limit)));
 });
+
+app.get('/api/v1/search/recent', requireAuth, (req, res) => {
+  const limit = Math.max(1, Math.min(30, Number(req.query.limit || 10)));
+  const seen = new Set();
+  const items = (req.db.searchEvents || [])
+    .filter((item) => item.userId === req.user.id)
+    .sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')))
+    .filter((item) => {
+      const key = JSON.stringify({ keyword: item.keyword || '', pathPrefix: item.pathPrefix || '', filters: item.filters || {} });
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .slice(0, limit)
+    .map((item) => ({
+      id: item.id,
+      keyword: item.keyword || '',
+      resultCount: item.resultCount,
+      pathPrefix: item.pathPrefix || '',
+      filters: item.filters || {},
+      createdAt: item.createdAt
+    }));
+  res.json(ok(items));
+});
+
+app.delete('/api/v1/search/recent', requireAuth, asyncRoute(async (req, res) => {
+  const before = req.db.searchEvents.length;
+  req.db.searchEvents = req.db.searchEvents.filter((item) => item.userId !== req.user.id);
+  await saveDb(req.db);
+  res.json(ok({ deleted: before - req.db.searchEvents.length }));
+}));
 
 app.get('/api/v1/search/index/status', requireAuth, (req, res) => {
   if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以查看全文索引状态');
@@ -4666,6 +5699,8 @@ app.put('/api/v1/nodes/:id/review', requireAuth, asyncRoute(async (req, res) => 
   node.reviewCycleDays = cycleDays;
   node.reviewOwnerId = ownerId;
   node.nextReviewAt = nextReviewAt ? new Date(nextReviewAt).toISOString() : null;
+  node.reviewDueSoonNotifiedAt = null;
+  node.reviewOverdueNotifiedAt = null;
   node.updatedBy = req.user.id;
   node.updatedAt = now();
   addAudit(req.db, req.user.id, 'node.review.update', 'node', node.id, {
@@ -4713,6 +5748,8 @@ app.post('/api/v1/nodes/:id/review/complete', requireAuth, asyncRoute(async (req
   node.lastReviewConclusion = conclusion;
   node.lastReviewNote = note;
   node.nextReviewAt = review.nextReviewAt;
+  node.reviewDueSoonNotifiedAt = null;
+  node.reviewOverdueNotifiedAt = null;
   node.updatedBy = req.user.id;
   node.updatedAt = reviewedAt;
   addAudit(req.db, req.user.id, 'node.review.complete', 'node', node.id, {
@@ -4747,18 +5784,23 @@ app.post('/api/v1/search/folders', requireAuth, (req, res) => {
 
 app.get('/api/v1/messages', requireAuth, asyncRoute(async (req, res) => {
   dispatchDueReminders(req.db, req.user.id);
+  dispatchOperationalReminders(req.db);
+  ensureNotificationDeliveries(req.db);
   await saveDb(req.db);
   const unreadUploadCounts = unreadUploadCountsByNode(req.db, req.user);
   const unreadOnly = String(req.query.unread || '').toLowerCase() === 'true';
+  const messageType = String(req.query.type || '').trim();
   const messages = req.db.messages
     .filter((item) => item.receiverId === req.user.id)
     .filter((item) => !unreadOnly || !item.readAt)
+    .filter((item) => !messageType || item.messageType === messageType || item.messageType.startsWith(`${messageType}.`))
     .map((item) => publicMessage(req.db, req.user, item, { unreadUploadCounts }));
   sendPage(res, messages, req.query.page, req.query.pageSize || 50);
 }));
 
 app.get('/api/v1/messages/unread-count', requireAuth, asyncRoute(async (req, res) => {
   dispatchDueReminders(req.db, req.user.id);
+  dispatchOperationalReminders(req.db);
   await saveDb(req.db);
   res.json(ok(req.db.messages.filter((item) => item.receiverId === req.user.id && !item.readAt).length));
 }));
@@ -4778,11 +5820,43 @@ app.get('/api/v1/messages/:id', requireAuth, (req, res) => {
 });
 
 app.post('/api/v1/messages/read-all', requireAuth, asyncRoute(async (req, res) => {
-  req.db.messages.filter((item) => item.receiverId === req.user.id).forEach((item) => {
+  const messageType = String(req.body.type || '').trim();
+  req.db.messages.filter((item) => item.receiverId === req.user.id && (!messageType || item.messageType === messageType || item.messageType.startsWith(`${messageType}.`))).forEach((item) => {
     item.readAt = item.readAt || now();
   });
   await saveDb(req.db);
   res.json(ok(true));
+}));
+
+app.get('/api/v1/notifications/deliveries', requireAuth, (req, res) => {
+  if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以查看通知投递');
+  ensureNotificationDeliveries(req.db);
+  let items = req.db.notificationDeliveries;
+  if (req.query.status) items = items.filter((item) => item.status === req.query.status);
+  if (req.query.channel) items = items.filter((item) => item.channel === req.query.channel);
+  sendPage(res, items.map((item) => publicNotificationDelivery(req.db, item)), req.query.page, req.query.pageSize || 100);
+});
+
+app.post('/api/v1/notifications/deliveries/:id/retry', requireAuth, asyncRoute(async (req, res) => {
+  if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以重试通知投递');
+  const delivery = req.db.notificationDeliveries.find((item) => item.id === req.params.id);
+  if (!delivery) throw createError(404, 'NOT_FOUND', '通知投递记录不存在');
+  await attemptNotificationDelivery(req.db, delivery);
+  addAudit(req.db, req.user.id, 'notification.retry', 'notification_delivery', delivery.id, { channel: delivery.channel, status: delivery.status }, req);
+  await saveDb(req.db);
+  res.json(ok(publicNotificationDelivery(req.db, delivery)));
+}));
+
+app.post('/api/v1/notifications/process', requireAuth, asyncRoute(async (req, res) => {
+  if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以执行通知投递');
+  ensureNotificationDeliveries(req.db);
+  const due = req.db.notificationDeliveries
+    .filter((item) => ['pending', 'failed'].includes(item.status))
+    .filter((item) => !item.nextRetryAt || new Date(item.nextRetryAt).getTime() <= Date.now())
+    .slice(0, 100);
+  for (const delivery of due) await attemptNotificationDelivery(req.db, delivery);
+  await saveDb(req.db);
+  res.json(ok({ processed: due.length, sent: due.filter((item) => item.status === 'sent').length, failed: due.filter((item) => item.status === 'failed').length }));
 }));
 
 app.get('/api/v1/announcements', requireAuth, (req, res) => {
@@ -5339,6 +6413,9 @@ app.post('/api/v1/nodes/:id/comments', requireAuth, asyncRoute(async (req, res) 
   };
   if (!comment.content) throw createError(400, 'VALIDATION_ERROR', '评论内容不能为空');
   req.db.comments.unshift(comment);
+  if (node.ownerId && node.ownerId !== req.user.id) {
+    addMessage(req.db, node.ownerId, 'comment.created', '文档收到新评论', `${userDisplayName(req.db, req.user.id)} 评论了“${node.fullPath}”：${comment.content}`, node.id);
+  }
   await saveDb(req.db);
   res.json(ok(comment));
 }));
@@ -5382,10 +6459,80 @@ app.get('/api/v1/audit-logs/report', requireAuth, (req, res) => {
   res.json(ok(auditReport(req.db)));
 });
 
-app.get('/api/v1/system/runtime-status', requireAuth, (req, res) => {
+app.get('/api/v1/system/runtime-status', requireAuth, asyncRoute(async (req, res) => {
   if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以查看系统运行状态');
-  res.json(ok(runtimeStatus(req.db)));
+  const runtime = await runtimeStatus(req.db);
+  evaluateSystemAlerts(req.db, storageConsistencyReport(req.db), runtime);
+  void saveDbBestEffort(req.db, 'runtime health alerts');
+  res.json(ok(runtime));
+}));
+
+app.get('/api/v1/system/consistency', requireAuth, asyncRoute(async (req, res) => {
+  if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以执行一致性检查');
+  const report = storageConsistencyReport(req.db);
+  evaluateSystemAlerts(req.db, report);
+  addAudit(req.db, req.user.id, 'system.consistency.check', 'system', 'storage', report.counts, req);
+  await saveDb(req.db);
+  res.json(ok(report));
+}));
+
+app.get('/api/v1/system/backups', requireAuth, (req, res) => {
+  if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以查看备份');
+  sendPage(res, req.db.backupJobs || [], req.query.page, req.query.pageSize || 50);
 });
+
+app.post('/api/v1/system/backups', requireAuth, asyncRoute(async (req, res) => {
+  if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以创建备份');
+  let job;
+  try {
+    job = await createSystemBackup(req.db, req.user.id);
+    addAudit(req.db, req.user.id, 'system.backup.create', 'backup_job', job.id, { filename: job.filename, sizeBytes: job.sizeBytes }, req);
+  } catch (error) {
+    const running = req.db.backupJobs.find((item) => item.status === 'running' && item.createdBy === req.user.id);
+    if (running) Object.assign(running, { status: 'failed', error: error.message, completedAt: now() });
+    await saveDbBestEffort(req.db, 'backup job');
+    throw error;
+  }
+  await saveDb(req.db);
+  res.json(ok(job));
+}));
+
+app.post('/api/v1/system/backups/:id/drill', requireAuth, asyncRoute(async (req, res) => {
+  if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以执行恢复演练');
+  const job = req.db.backupJobs.find((item) => item.id === req.params.id);
+  if (!job) throw createError(404, 'NOT_FOUND', '备份任务不存在');
+  const drill = await runBackupRestoreDrill(job);
+  addAudit(req.db, req.user.id, 'system.backup.drill', 'backup_job', job.id, drill, req);
+  await saveDb(req.db);
+  res.json(ok(drill));
+}));
+
+app.get('/api/v1/system/backups/:id/download', requireAuth, (req, res) => {
+  if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以下载备份');
+  const job = req.db.backupJobs.find((item) => item.id === req.params.id && item.status === 'completed');
+  if (!job) throw createError(404, 'NOT_FOUND', '备份任务不存在');
+  const backupPath = path.join(config.backupDir, path.basename(job.filename));
+  if (!fsSync.existsSync(backupPath)) throw createError(404, 'NOT_FOUND', '备份文件不存在');
+  res.download(backupPath, job.filename);
+});
+
+app.get('/api/v1/system/alerts', requireAuth, (req, res) => {
+  if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以查看系统告警');
+  evaluateSystemAlerts(req.db, storageConsistencyReport(req.db));
+  let alerts = req.db.systemAlerts || [];
+  if (req.query.status) alerts = alerts.filter((item) => item.status === req.query.status);
+  sendPage(res, alerts, req.query.page, req.query.pageSize || 100);
+});
+
+app.post('/api/v1/system/alerts/:id/resolve', requireAuth, asyncRoute(async (req, res) => {
+  if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以处理系统告警');
+  const alert = req.db.systemAlerts.find((item) => item.id === req.params.id);
+  if (!alert) throw createError(404, 'NOT_FOUND', '系统告警不存在');
+  Object.assign(alert, { status: 'resolved', resolvedAt: now(), resolvedBy: req.user.id, resolution: String(req.body.resolution || '').trim(), updatedAt: now() });
+  addAudit(req.db, req.user.id, 'system.alert.resolve', 'system_alert', alert.id, { resolution: alert.resolution }, req);
+  await saveDb(req.db);
+  res.json(ok(alert));
+}));
 
 app.post('/api/v1/audit-logs/export', requireAuth, asyncRoute(async (req, res) => {
   if (!isAdmin(req.user)) throw createError(403, 'FORBIDDEN', '只有管理员可以导出审计日志');
@@ -5791,6 +6938,7 @@ app.get('/api/v1/sso/consume', asyncRoute(async (req, res) => {
 
 app.get('/api/v1/dashboard', requireAuth, asyncRoute(async (req, res) => {
   dispatchDueReminders(req.db, req.user.id);
+  dispatchOperationalReminders(req.db);
   await saveDb(req.db);
   const visible = listVisibleDescendants(req.db, req.user);
   const files = visible.filter((item) => item.nodeType === 'file');
@@ -5830,9 +6978,14 @@ if (fsSync.existsSync(config.frontendDist)) {
   });
 }
 
-app.use((err, _req, res, _next) => {
+app.use((err, req, res, _next) => {
   const status = err.status || 500;
   const code = err.code || 'INTERNAL_ERROR';
+  if (/^\/api\/v1\/files\/[^/]+\/preview(?:\?|$)/.test(req.originalUrl || '') && req.db) {
+    addAudit(req.db, req.user?.id || null, 'file.preview_failed', 'node', req.params?.id || 'unknown', { status, code, message: err.message || '服务异常' }, req);
+    evaluateSystemAlerts(req.db);
+    void saveDbBestEffort(req.db, 'preview failure audit');
+  }
   if (status >= 500) console.error(err);
   res.status(status).json({ code, message: err.message || '服务异常', data: err.data ?? null });
 });
@@ -5859,5 +7012,5 @@ server.on('upgrade', (req, socket, head) => {
 
 server.listen(config.port, () => {
   console.log(`Document platform API running at http://localhost:${config.port}`);
-  console.log('Default accounts: admin/admin123, demo/user123');
+  if (config.nodeEnv !== 'production') console.log('Development accounts: admin/admin123, demo/user123');
 });

@@ -103,7 +103,7 @@ function mysqlConnectionOptions(mysqlConfig) {
     password: mysqlConfig.password || '',
     database: mysqlConfig.database,
     charset: 'utf8mb4',
-    connectTimeout: 8000,
+    connectTimeout: 3000,
     ssl: mysqlConfig.ssl ? { rejectUnauthorized: false } : undefined
   };
 }
@@ -160,8 +160,14 @@ export async function loadMysqlSnapshot(storageConfig = null) {
   const activeConfig = storageConfig || await readStorageConfig({ includePassword: true });
   const mysqlConfig = activeConfig.mysql;
   if (!hasCompleteMysqlConfig(mysqlConfig)) return null;
-  await ensureMysqlStore(mysqlConfig);
   return withMysqlConnection(mysqlConfig, async (connection) => {
+    await connection.execute(`
+      CREATE TABLE IF NOT EXISTS ${STORE_TABLE} (
+        store_key VARCHAR(64) NOT NULL PRIMARY KEY,
+        store_value LONGTEXT NOT NULL,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+    `);
     const [rows] = await connection.execute(`SELECT store_value FROM ${STORE_TABLE} WHERE store_key = ? LIMIT 1`, [DB_STORE_KEY]);
     if (!rows.length) return null;
     return JSON.parse(rows[0].store_value);
@@ -174,8 +180,14 @@ export async function saveMysqlSnapshot(db, storageConfig = null) {
   if (!hasCompleteMysqlConfig(mysqlConfig)) {
     throw Object.assign(new Error('MySQL 连接配置不完整'), { code: 'VALIDATION_ERROR', status: 400 });
   }
-  await ensureMysqlStore(mysqlConfig);
   return withMysqlConnection(mysqlConfig, async (connection) => {
+    await connection.execute(`
+      CREATE TABLE IF NOT EXISTS ${STORE_TABLE} (
+        store_key VARCHAR(64) NOT NULL PRIMARY KEY,
+        store_value LONGTEXT NOT NULL,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+    `);
     await connection.execute(
       `INSERT INTO ${STORE_TABLE} (store_key, store_value) VALUES (?, ?)
        ON DUPLICATE KEY UPDATE store_value = VALUES(store_value), updated_at = CURRENT_TIMESTAMP`,

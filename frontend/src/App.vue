@@ -2,7 +2,7 @@
   <div v-if="!token || !user" class="login-shell">
     <section class="login-panel" aria-label="登录">
       <h1 class="login-title">文档管理平台</h1>
-      <p class="login-subtitle">B/S 架构三期开发版</p>
+      <p class="login-subtitle">B/S 架构 v1.0 候选版</p>
       <el-form label-position="top" @submit.prevent="login">
         <el-form-item label="账号">
           <el-input v-model="loginForm.username" size="large" autocomplete="username" />
@@ -18,7 +18,6 @@
         </el-form-item>
         <el-button type="primary" size="large" :loading="loading" style="width: 100%" @click="login">登录</el-button>
       </el-form>
-      <p class="muted" style="margin-bottom: 0">默认账号：admin/admin123，demo/user123</p>
     </section>
   </div>
 
@@ -28,7 +27,7 @@
         <div class="brand-mark">文</div>
         <div class="brand-copy">
           <strong>文档管理平台</strong>
-          <span>Phase 3</span>
+          <span>Phase 4</span>
         </div>
         <el-button
           class="sidebar-toggle"
@@ -75,6 +74,8 @@
           :users="users"
           :departments="flatDepartments"
           :roles="flatRoles"
+          :categories="flatCategories"
+          :recent-searches="recentSearches"
           :format-date="formatDate"
           :format-size="formatSize"
           :actions="actions"
@@ -90,6 +91,7 @@
           @delete="deleteNode"
           @download="downloadNode"
           @preview="previewNode"
+          @office-edit="openOfficeEditDialog"
           @versions="openVersionDialog"
           @lock="lockNode"
           @unlock="unlockNode"
@@ -99,6 +101,7 @@
           @node-password="openNodePasswordDialog"
           @sync-external="openExternalLibraryDialog"
           @search="searchFiles"
+          @clear-recent-searches="clearRecentSearches"
           @batch-download="batchDownload"
           @batch-move="openBatchMoveDialog"
           @batch-delete="batchDelete"
@@ -113,7 +116,7 @@
           @links="openLinkDialog"
           @workflow="openWorkflowDialog"
           @security="openSecurityDialog"
-          @request-download="openDownloadApprovalDialog"
+          @request-approval="openApprovalRequest"
           @governance="openGovernanceDialog"
         />
         <DocsViewPanel
@@ -124,6 +127,8 @@
           :users="users"
           :departments="flatDepartments"
           :roles="flatRoles"
+          :categories="flatCategories"
+          :recent-searches="recentSearches"
           :format-date="formatDate"
           :format-size="formatSize"
           :actions="actions"
@@ -140,6 +145,7 @@
           @delete="deleteNode"
           @download="downloadNode"
           @preview="previewNode"
+          @office-edit="openOfficeEditDialog"
           @versions="openVersionDialog"
           @lock="lockNode"
           @unlock="unlockNode"
@@ -148,6 +154,7 @@
           @view-access="openViewAccessDialog"
           @node-password="openNodePasswordDialog"
           @search="searchDriveFiles"
+          @clear-recent-searches="clearRecentSearches"
           @batch-download="batchDownload"
           @batch-move="openBatchMoveDialog"
           @batch-delete="batchDelete"
@@ -162,7 +169,7 @@
           @links="openLinkDialog"
           @workflow="openWorkflowDialog"
           @security="openSecurityDialog"
-          @request-download="openDownloadApprovalDialog"
+          @request-approval="openApprovalRequest"
           @governance="openGovernanceDialog"
         />
         <UsersViewPanel v-if="activeView === 'users'" :users="users" :departments="flatDepartments" :roles="flatRoles" @create="openUserDialog" @edit="openUserDialog" @reset="resetPassword" />
@@ -213,10 +220,17 @@
           :todo="approvalTodo"
           :mine="approvalMine"
           :all="approvalAll"
+          :templates="approvalTemplates"
+          :is-admin="isAdminUser"
           :format-date="formatDate"
           @approve="decideGeneralApproval($event, 'approve')"
           @reject="decideGeneralApproval($event, 'reject')"
+          @withdraw="withdrawApproval"
+          @remind="remindApproval"
+          @transfer="openApprovalManageDialog($event, 'transfer')"
+          @add-step="openApprovalManageDialog($event, 'add-step')"
           @refresh="loadApprovals"
+          @manage-templates="openApprovalTemplateDialog"
         />
         <ProfileViewPanel
           v-if="activeView === 'profile'"
@@ -278,6 +292,10 @@
           :office-preview-settings="officePreviewSettings"
           :search-index-status="searchIndexStatus"
           :runtime-status="runtimeStatus"
+          :consistency-report="consistencyReport"
+          :backup-jobs="backupJobs"
+          :system-alerts="systemAlerts"
+          :notification-deliveries="notificationDeliveries"
           :audit-report="auditReport"
           :format-date="formatDate"
           @edit-file-policy="openFilePolicyDialog"
@@ -290,6 +308,11 @@
           @rebuild-search-index="rebuildSearchIndex"
           @edit-wecom="openWecomDialog"
           @test-wecom="testWecomSettings"
+          @check-consistency="checkSystemConsistency"
+          @create-backup="createSystemBackup"
+          @drill-backup="drillSystemBackup"
+          @resolve-alert="resolveSystemAlert"
+          @retry-notification="retryNotificationDelivery"
           @export-audit="exportAuditLogs"
         />
         <AuditViewPanel v-if="activeView === 'audit'" :logs="auditLogs" :format-date="formatDate" @export="exportAuditLogs" />
@@ -412,16 +435,39 @@
         </div>
       </div>
       <el-form label-position="top">
+        <el-form-item label="审批模板">
+          <el-select v-model="workflowDialog.templateId" clearable filterable placeholder="不使用模板，手工设置流程" style="width: 100%" @change="applyWorkflowTemplate">
+            <el-option v-for="item in workflowApprovalTemplates" :key="item.id" :label="item.name" :value="item.id" />
+          </el-select>
+        </el-form-item>
         <div class="form-grid">
           <el-form-item label="流程动作">
             <el-segmented v-model="workflowDialog.action" :options="workflowActionOptions" />
           </el-form-item>
-          <el-form-item label="审批人">
+          <el-form-item v-if="!workflowDialog.templateId" label="审批人">
             <el-select v-model="workflowDialog.approverId" filterable style="width: 100%">
               <el-option v-for="item in users" :key="item.id" :label="item.displayName || item.username" :value="item.id" />
             </el-select>
           </el-form-item>
+          <el-form-item v-if="!workflowDialog.templateId" label="审批方式">
+            <el-select v-model="workflowDialog.mode" style="width: 100%">
+              <el-option label="单级审批" value="single" />
+              <el-option label="串行两级" value="serial" />
+              <el-option label="多人会签" value="all" />
+              <el-option label="多人或签" value="any" />
+            </el-select>
+          </el-form-item>
+          <el-form-item v-if="!workflowDialog.templateId && workflowDialog.mode !== 'single'" :label="workflowDialog.mode === 'serial' ? '第二级审批人' : '共同审批人'">
+            <el-select v-model="workflowDialog.secondApproverId" filterable style="width: 100%">
+              <el-option v-for="item in users" :key="item.id" :label="item.displayName || item.username" :value="item.id" />
+            </el-select>
+          </el-form-item>
         </div>
+        <el-form-item v-if="!workflowDialog.templateId" label="抄送人">
+          <el-select v-model="workflowDialog.ccUserIds" multiple filterable clearable style="width: 100%">
+            <el-option v-for="item in users" :key="item.id" :label="item.displayName || item.username" :value="item.id" />
+          </el-select>
+        </el-form-item>
         <el-form-item label="处理说明">
           <el-input v-model="workflowDialog.comment" type="textarea" :rows="3" placeholder="填写发布说明、作废原因或归档说明" />
         </el-form-item>
@@ -441,6 +487,7 @@
         </el-table-column>
         <el-table-column prop="requesterName" label="申请人" width="120" />
         <el-table-column prop="approverName" label="审批人" width="120" />
+        <el-table-column prop="currentStepName" label="当前步骤" width="130" />
         <el-table-column prop="requestComment" label="申请说明" min-width="180" />
         <el-table-column prop="decisionComment" label="处理说明" min-width="160" />
         <el-table-column label="时间" width="180">
@@ -939,12 +986,17 @@
       </template>
     </el-dialog>
 
-    <el-dialog v-model="approvalRequestDialog.visible" :title="approvalRequestDialog.type === 'permission' ? '权限申请' : '下载审批申请'" width="560px">
+    <el-dialog v-model="approvalRequestDialog.visible" :title="approvalRequestTitle" width="560px">
       <el-form label-position="top">
         <el-form-item label="文件/文件夹">
           <el-input :model-value="approvalRequestDialog.node?.fullPath || approvalRequestDialog.node?.name || ''" disabled />
         </el-form-item>
-        <el-form-item label="审批人">
+        <el-form-item label="审批模板">
+          <el-select v-model="approvalRequestDialog.templateId" clearable filterable placeholder="不使用模板，手工选择审批人" style="width: 100%" @change="applyRequestTemplate">
+            <el-option v-for="item in requestApprovalTemplates" :key="item.id" :label="item.name" :value="item.id" />
+          </el-select>
+        </el-form-item>
+        <el-form-item v-if="!approvalRequestDialog.templateId" label="审批人">
           <el-select v-model="approvalRequestDialog.approverId" filterable style="width: 100%">
             <el-option v-for="item in users" :key="item.id" :label="item.displayName || item.username" :value="item.id" />
           </el-select>
@@ -957,6 +1009,9 @@
             <el-checkbox label="file:update">编辑</el-checkbox>
           </el-checkbox-group>
         </el-form-item>
+        <el-form-item v-if="['borrow', 'external', 'permission'].includes(approvalRequestDialog.type)" label="权限有效期至">
+          <el-date-picker v-model="approvalRequestDialog.expiresAt" type="datetime" value-format="YYYY-MM-DDTHH:mm:ss.SSSZ" style="width:100%" />
+        </el-form-item>
         <el-form-item label="申请理由">
           <el-input v-model="approvalRequestDialog.reason" type="textarea" :rows="3" />
         </el-form-item>
@@ -965,6 +1020,56 @@
         <el-button @click="approvalRequestDialog.visible = false">取消</el-button>
         <el-button type="primary" :loading="loading" @click="submitApprovalRequest">提交申请</el-button>
       </template>
+    </el-dialog>
+
+    <el-dialog v-model="approvalTemplateDialog.visible" title="审批模板管理" width="980px" class="tall-dialog">
+      <el-table :data="approvalTemplates" border max-height="260" empty-text="暂无审批模板">
+        <el-table-column prop="name" label="模板" min-width="180" />
+        <el-table-column prop="typeLabel" label="类型" width="110" />
+        <el-table-column label="步骤" min-width="280"><template #default="{ row }">{{ row.steps.map((step) => step.name).join(' → ') }}</template></el-table-column>
+        <el-table-column label="状态" width="90"><template #default="{ row }"><el-tag :type="row.status === 'enabled' ? 'success' : 'info'">{{ row.status === 'enabled' ? '启用' : '停用' }}</el-tag></template></el-table-column>
+        <el-table-column label="操作" width="150"><template #default="{ row }"><el-button size="small" @click="editApprovalTemplate(row)">编辑</el-button><el-button size="small" type="danger" @click="deleteApprovalTemplate(row)">删除</el-button></template></el-table-column>
+      </el-table>
+      <el-divider />
+      <el-form label-position="top">
+        <div class="form-grid">
+          <el-form-item label="模板名称"><el-input v-model="approvalTemplateDialog.form.name" /></el-form-item>
+          <el-form-item label="流程类型"><el-select v-model="approvalTemplateDialog.form.type" style="width:100%"><el-option v-for="item in approvalTypeOptions" :key="item.value" :label="item.label" :value="item.value" /></el-select></el-form-item>
+          <el-form-item label="状态"><el-switch v-model="approvalTemplateDialog.form.enabled" active-text="启用" inactive-text="停用" /></el-form-item>
+          <el-form-item label="处理时限（小时）"><el-input-number v-model="approvalTemplateDialog.form.approvalTimeoutHours" :min="0" :max="8760" style="width:100%" /></el-form-item>
+          <el-form-item label="抄送人"><el-select v-model="approvalTemplateDialog.form.ccUserIds" multiple filterable clearable style="width:100%"><el-option v-for="item in users" :key="item.id" :label="item.displayName || item.username" :value="item.id" /></el-select></el-form-item>
+        </div>
+        <el-form-item label="说明"><el-input v-model="approvalTemplateDialog.form.description" /></el-form-item>
+        <div v-for="(step, index) in approvalTemplateDialog.form.steps" :key="step.key" class="approval-template-step">
+          <div class="section-header"><h3>第 {{ index + 1 }} 步</h3><el-button v-if="approvalTemplateDialog.form.steps.length > 1" type="danger" text @click="removeApprovalTemplateStep(index)">移除</el-button></div>
+          <div class="form-grid">
+            <el-form-item label="步骤名称"><el-input v-model="step.name" /></el-form-item>
+            <el-form-item label="审批规则"><el-select v-model="step.mode" style="width:100%"><el-option label="全部通过（会签）" value="all" /><el-option label="一人通过（或签）" value="any" /></el-select></el-form-item>
+            <el-form-item label="审批人"><el-select v-model="step.approverIds" multiple filterable style="width:100%"><el-option v-for="item in users" :key="item.id" :label="item.displayName || item.username" :value="item.id" /></el-select></el-form-item>
+            <el-form-item label="适用密级"><el-select v-model="step.securityLevels" multiple clearable style="width:100%"><el-option label="公开" value="public" /><el-option label="内部" value="internal" /><el-option label="受限" value="restricted" /><el-option label="机密" value="confidential" /></el-select></el-form-item>
+            <el-form-item label="敏感条件"><el-select v-model="step.sensitive" style="width:100%"><el-option label="不限" value="any" /><el-option label="仅敏感文件" value="true" /><el-option label="仅非敏感文件" value="false" /></el-select></el-form-item>
+            <el-form-item label="扩展名条件"><el-input v-model="step.extensions" placeholder="例如 docx,pdf；留空不限" /></el-form-item>
+          </div>
+        </div>
+        <el-button :icon="Plus" @click="addApprovalTemplateStep">增加审批步骤</el-button>
+      </el-form>
+      <template #footer><el-button @click="approvalTemplateDialog.visible = false">关闭</el-button><el-button @click="resetApprovalTemplateForm">新建</el-button><el-button type="primary" :loading="loading" @click="saveApprovalTemplate">保存模板</el-button></template>
+    </el-dialog>
+
+    <el-dialog v-model="approvalManageDialog.visible" :title="approvalManageDialog.action === 'transfer' ? '转交审批' : '审批加签'" width="520px">
+      <el-form label-position="top">
+        <el-form-item v-if="approvalManageDialog.action === 'add-step'" label="加签位置">
+          <el-segmented v-model="approvalManageDialog.position" :options="[{ label: '当前步骤前', value: 'before' }, { label: '当前步骤后', value: 'after' }]" />
+        </el-form-item>
+        <el-form-item label="处理人">
+          <el-select v-model="approvalManageDialog.userIds" :multiple="approvalManageDialog.action === 'add-step'" filterable style="width:100%">
+            <el-option v-for="item in users" :key="item.id" :label="item.displayName || item.username" :value="item.id" />
+          </el-select>
+        </el-form-item>
+        <el-form-item v-if="approvalManageDialog.action === 'add-step'" label="步骤名称"><el-input v-model="approvalManageDialog.name" /></el-form-item>
+        <el-form-item label="说明"><el-input v-model="approvalManageDialog.comment" type="textarea" :rows="3" /></el-form-item>
+      </el-form>
+      <template #footer><el-button @click="approvalManageDialog.visible = false">取消</el-button><el-button type="primary" @click="submitApprovalManage">确认</el-button></template>
     </el-dialog>
 
     <el-dialog v-model="batchMetadataDialog.visible" title="批量属性编辑" width="640px">
@@ -1599,6 +1704,40 @@
       </div>
     </el-dialog>
 
+    <el-dialog
+      v-model="officeEditDialog.visible"
+      :title="`在线编辑 - ${officeEditDialog.node?.name || ''}`"
+      width="92%"
+      class="office-edit-dialog"
+      align-center
+      destroy-on-close
+      @closed="handleOfficeEditClosed"
+    >
+      <div class="office-edit-shell">
+        <div class="office-edit-status">
+          <div>
+            <strong>ONLYOFFICE 在线编辑</strong>
+            <span>关闭编辑器后，修改内容会自动保存为平台新版本。</span>
+          </div>
+          <el-tag v-if="officeEditDialog.session" type="warning" effect="light">编辑中</el-tag>
+        </div>
+        <div v-if="officeEditDialog.loading" class="preview-office-loading">正在启动在线编辑器...</div>
+        <el-alert
+          v-if="officeEditDialog.error"
+          type="error"
+          :closable="false"
+          show-icon
+          title="在线编辑器启动失败"
+          :description="officeEditDialog.error"
+        />
+        <div ref="officeEditHost" class="office-edit-host"></div>
+      </div>
+      <template #footer>
+        <span class="muted">编辑器保存完成后再关闭，可确保新版本及时生成。</span>
+        <el-button @click="officeEditDialog.visible = false">关闭编辑器</el-button>
+      </template>
+    </el-dialog>
+
     <el-dialog v-model="userDialog.visible" :title="userDialog.form.id ? '编辑用户' : '新建用户'" width="560px">
       <el-form label-position="top">
         <el-form-item label="账号">
@@ -1758,7 +1897,14 @@ const user = ref(null);
 const loading = ref(false);
 const activeView = ref('docs');
 const sidebarCollapsed = ref(true);
-const loginForm = reactive({ username: 'admin', password: 'admin123', captchaId: '', captchaAnswer: '' });
+const isDevelopment = import.meta.env.DEV;
+const developmentValue = (codes) => (isDevelopment ? String.fromCharCode(...codes) : '');
+const loginForm = reactive({
+  username: developmentValue([97, 100, 109, 105, 110]),
+  password: developmentValue([97, 100, 109, 105, 110, 49, 50, 51]),
+  captchaId: '',
+  captchaAnswer: ''
+});
 const captcha = ref(null);
 const dashboard = ref(null);
 const users = ref([]);
@@ -1796,8 +1942,14 @@ const searchIndexStatus = ref(null);
 const approvalTodo = ref([]);
 const approvalMine = ref([]);
 const approvalAll = ref([]);
+const approvalTemplates = ref([]);
 const recentAccesses = ref([]);
+const recentSearches = ref([]);
 const runtimeStatus = ref(null);
+const consistencyReport = ref(null);
+const backupJobs = ref([]);
+const systemAlerts = ref([]);
+const notificationDeliveries = ref([]);
 const auditReport = ref(null);
 const governanceDashboard = ref(null);
 const governanceQualityItems = ref([]);
@@ -1812,7 +1964,7 @@ const folderDialog = reactive({ visible: false, name: '' });
 const uploadDialog = reactive({ visible: false, files: [], description: '初始版本' });
 const moveDialog = reactive({ visible: false, mode: 'move', space: 'docs', node: null, nodes: [], targetId: '' });
 const versionDialog = reactive({ visible: false, node: null, items: [], logs: [], file: null, description: '' });
-const workflowDialog = reactive({ visible: false, node: null, action: 'publish', approverId: '', comment: '', approvals: [] });
+const workflowDialog = reactive({ visible: false, node: null, action: 'publish', templateId: '', approverId: '', secondApproverId: '', mode: 'single', ccUserIds: [], comment: '', approvals: [] });
 const permissionDialog = reactive({
   visible: false,
   node: null,
@@ -1851,6 +2003,10 @@ const officeEditorHost = ref(null);
 const officeNativeState = reactive({ loading: false, error: '' });
 let officeEditorInstance = null;
 let officeEditorInstanceHost = null;
+const officeEditHost = ref(null);
+const officeEditDialog = reactive({ visible: false, node: null, session: null, editor: null, loading: false, error: '' });
+let officeEditInstance = null;
+let officeEditMountVersion = 0;
 let officeApiScriptPromise = null;
 let officeApiScriptUrl = '';
 let officeEditorMountVersion = 0;
@@ -2027,10 +2183,20 @@ const approvalRequestDialog = reactive({
   visible: false,
   node: null,
   type: 'download',
+  templateId: '',
   approverId: '',
   requestedActions: ['file:download'],
+  expiresAt: '',
   reason: ''
 });
+const approvalTypeOptions = [
+  { value: 'workflow', label: '文档流程' }, { value: 'publish', label: '发布审批' },
+  { value: 'download', label: '下载审批' }, { value: 'borrow', label: '借阅审批' },
+  { value: 'external', label: '外发审批' }, { value: 'permission', label: '权限申请' }
+];
+const newApprovalTemplateStep = () => ({ key: `${Date.now()}-${Math.random()}`, name: '审批', mode: 'all', approverIds: [], securityLevels: [], sensitive: 'any', extensions: '' });
+const approvalTemplateDialog = reactive({ visible: false, editingId: '', form: { name: '', description: '', type: 'download', enabled: true, approvalTimeoutHours: 0, ccUserIds: [], steps: [newApprovalTemplateStep()] } });
+const approvalManageDialog = reactive({ visible: false, row: null, action: 'transfer', position: 'after', userIds: [], name: '加签审批', comment: '' });
 const batchMetadataDialog = reactive({
   visible: false,
   rows: [],
@@ -2068,6 +2234,9 @@ const navItems = [
 ];
 const adminOnlyViews = new Set(['users', 'org', 'governance', 'announcements', 'api', 'system', 'audit']);
 const isAdminUser = computed(() => (user.value?.roleIds || []).includes('r_admin'));
+const workflowApprovalTemplates = computed(() => approvalTemplates.value.filter((item) => item.status === 'enabled' && ['workflow', 'publish'].includes(item.type)));
+const requestApprovalTemplates = computed(() => approvalTemplates.value.filter((item) => item.status === 'enabled' && item.type === approvalRequestDialog.type));
+const approvalRequestTitle = computed(() => ({ permission: '权限申请', download: '下载审批申请', borrow: '借阅申请', external: '外发申请' }[approvalRequestDialog.type] || '审批申请'));
 const visibleNavItems = computed(() => navItems.filter((item) => !adminOnlyViews.has(item.key) || isAdminUser.value));
 
 const subjectTypes = [
@@ -2287,6 +2456,93 @@ async function mountOfficeEditor() {
     }
   } finally {
     if (mountVersion === officeEditorMountVersion) officeNativeState.loading = false;
+  }
+}
+
+function destroyOfficeEditInstance() {
+  officeEditMountVersion += 1;
+  const instance = officeEditInstance;
+  const host = officeEditHost.value;
+  officeEditInstance = null;
+  try {
+    instance?.destroyEditor?.();
+  } catch {
+    // ONLYOFFICE cleanup is best-effort because external script versions differ.
+  }
+  host?.replaceChildren();
+}
+
+async function mountOfficeEditInstance() {
+  const editor = officeEditDialog.editor;
+  destroyOfficeEditInstance();
+  const mountVersion = officeEditMountVersion;
+  if (!officeEditDialog.visible || !editor?.scriptUrl || !editor?.config) return;
+  officeEditDialog.loading = true;
+  officeEditDialog.error = '';
+  try {
+    await loadOfficeApi(editor.scriptUrl);
+    await nextTick();
+    const host = officeEditHost.value;
+    if (mountVersion !== officeEditMountVersion || !officeEditDialog.visible || !host) return;
+    const editorId = `office-edit-${mountVersion}-${Date.now()}`;
+    const editorElement = document.createElement('div');
+    editorElement.id = editorId;
+    editorElement.className = 'office-edit-editor-host';
+    host.replaceChildren(editorElement);
+    const config = {
+      ...editor.config,
+      events: {
+        ...(editor.config.events || {}),
+        onError(event) {
+          if (mountVersion !== officeEditMountVersion) return;
+          const code = Number(event?.data?.errorCode ?? event?.data ?? 0);
+          officeEditDialog.error = `在线编辑器加载失败${code ? `（错误码 ${code}）` : ''}`;
+        }
+      }
+    };
+    officeEditInstance = new window.DocsAPI.DocEditor(editorId, config);
+  } catch (error) {
+    if (mountVersion === officeEditMountVersion) officeEditDialog.error = error.message || '在线编辑器加载失败';
+  } finally {
+    if (mountVersion === officeEditMountVersion) officeEditDialog.loading = false;
+  }
+}
+
+async function openOfficeEditDialog(node) {
+  await runWithPasswordUnlock(node, async () => {
+    destroyOfficeEditInstance();
+    officeEditDialog.node = node;
+    officeEditDialog.session = null;
+    officeEditDialog.editor = null;
+    officeEditDialog.error = '';
+    officeEditDialog.loading = true;
+    officeEditDialog.visible = true;
+    try {
+      const result = await api(`/files/${node.id}/office-edit-session`, { method: 'POST', headers: nodeUnlockHeaders(), body: {} });
+      officeEditDialog.session = result.session;
+      officeEditDialog.editor = result.editor;
+      officeEditDialog.loading = false;
+      await nextTick();
+      await mountOfficeEditInstance();
+    } catch (error) {
+      officeEditDialog.error = error.message || '无法启动在线编辑';
+      officeEditDialog.loading = false;
+    }
+  });
+}
+
+async function handleOfficeEditClosed() {
+  const node = officeEditDialog.node;
+  const hadSession = Boolean(officeEditDialog.session);
+  destroyOfficeEditInstance();
+  officeEditDialog.node = null;
+  officeEditDialog.session = null;
+  officeEditDialog.editor = null;
+  officeEditDialog.error = '';
+  if (node && hadSession) {
+    window.setTimeout(() => {
+      void Promise.allSettled([refreshCurrent(), loadRecentAccess()]);
+    }, 1200);
   }
 }
 
@@ -2766,7 +3022,7 @@ async function bootstrap() {
   user.value = me.user;
   actions.value = me.actions;
   if (adminOnlyViews.has(activeView.value) && !isAdminUser.value) activeView.value = 'dashboard';
-  const commonLoads = [loadOrg(), loadUsers(), loadKnowledge(), loadDashboard(), loadDocTree(), loadMessages(), loadCollaboration(), loadRecentAccess(), loadApprovals()];
+  const commonLoads = [loadOrg(), loadUsers(), loadKnowledge(), loadDashboard(), loadDocTree(), loadMessages(), loadCollaboration(), loadRecentAccess(), loadRecentSearches(), loadApprovals()];
   const adminLoads = isAdminUser.value ? [loadAnnouncements(), loadAudit(), loadExternalLibrary(), loadSecurityPolicy(), loadWecomSettings()] : [];
   await Promise.all([...commonLoads, ...adminLoads]);
 }
@@ -2923,6 +3179,47 @@ async function loadRuntimeStatus() {
   runtimeStatus.value = await api('/system/runtime-status');
 }
 
+async function loadOperationsData() {
+  if (!isAdminUser.value) return;
+  const [backups, alerts, deliveries] = await Promise.all([
+    api('/system/backups?pageSize=30'),
+    api('/system/alerts?status=open&pageSize=100'),
+    api('/notifications/deliveries?status=failed&pageSize=100')
+  ]);
+  backupJobs.value = backups.items || [];
+  systemAlerts.value = alerts.items || [];
+  notificationDeliveries.value = deliveries.items || [];
+}
+
+async function checkSystemConsistency() {
+  consistencyReport.value = await api('/system/consistency');
+  ElMessage.success(consistencyReport.value.healthy ? '一致性检查通过' : '检查完成，发现异常');
+  await Promise.all([loadRuntimeStatus(), loadOperationsData()]);
+}
+
+async function createSystemBackup() {
+  await api('/system/backups', { method: 'POST', body: {} });
+  ElMessage.success('备份已创建');
+  await Promise.all([loadRuntimeStatus(), loadOperationsData()]);
+}
+
+async function drillSystemBackup(row) {
+  const drill = await api(`/system/backups/${row.id}/drill`, { method: 'POST', body: {} });
+  ElMessage.success(drill.valid ? '恢复演练通过' : '恢复演练发现缺失文件');
+  await loadOperationsData();
+}
+
+async function resolveSystemAlert(row) {
+  const { value } = await ElMessageBox.prompt('填写处理结果', '处理系统告警', { inputPlaceholder: '例如：已修复并复核' });
+  await api(`/system/alerts/${row.id}/resolve`, { method: 'POST', body: { resolution: value || '' } });
+  await loadOperationsData();
+}
+
+async function retryNotificationDelivery(row) {
+  await api(`/notifications/deliveries/${row.id}/retry`, { method: 'POST', body: {} });
+  await loadOperationsData();
+}
+
 async function loadAuditReport() {
   if (!isAdminUser.value) return;
   auditReport.value = await api('/audit-logs/report');
@@ -2957,19 +3254,31 @@ async function loadGovernance() {
 }
 
 async function loadApprovals() {
-  const [todo, mine, all] = await Promise.all([
+  const [todo, mine, all, templates] = await Promise.all([
     api('/approvals?scope=todo&pageSize=200'),
     api('/approvals?scope=mine&pageSize=200'),
-    isAdminUser.value ? api('/approvals?scope=all&pageSize=200') : Promise.resolve({ items: [] })
+    isAdminUser.value ? api('/approvals?scope=all&pageSize=200') : Promise.resolve({ items: [] }),
+    api('/approval-templates')
   ]);
   approvalTodo.value = todo.items || [];
   approvalMine.value = mine.items || [];
   approvalAll.value = all.items || [];
+  approvalTemplates.value = templates || [];
 }
 
 async function loadRecentAccess() {
   const page = await api('/recent-access?pageSize=10');
   recentAccesses.value = page.items || [];
+}
+
+async function loadRecentSearches() {
+  recentSearches.value = await api('/search/recent?limit=10');
+}
+
+async function clearRecentSearches() {
+  await api('/search/recent', { method: 'DELETE' });
+  recentSearches.value = [];
+  ElMessage.success('最近搜索已清空');
 }
 
 async function loadSystemManagement() {
@@ -2985,7 +3294,8 @@ async function loadSystemManagement() {
     loadOfficePreviewSettings(),
     loadSearchIndexStatus(),
     loadRuntimeStatus(),
-    loadAuditReport()
+    loadAuditReport(),
+    loadOperationsData()
   ]);
 }
 
@@ -3348,22 +3658,48 @@ async function openWorkflowDialog(node) {
   await runWithPasswordUnlock(node, async () => {
     workflowDialog.node = node;
     workflowDialog.action = node.businessStatus === 'archived' ? 'publish' : 'archive';
+    workflowDialog.templateId = '';
     workflowDialog.approverId = defaultWorkflowApproverId();
+    workflowDialog.secondApproverId = '';
+    workflowDialog.mode = 'single';
+    workflowDialog.ccUserIds = [];
     workflowDialog.comment = '';
     await loadWorkflowDialogData();
     workflowDialog.visible = true;
   });
 }
 
+function applyWorkflowTemplate(templateId) {
+  const template = approvalTemplates.value.find((item) => item.id === templateId);
+  if (!template) return;
+  workflowDialog.ccUserIds = [...(template.ccUserIds || [])];
+  if (template.type === 'publish') workflowDialog.action = 'publish';
+}
+
 async function submitWorkflowApproval() {
   if (!workflowDialog.node) return;
-  if (!workflowDialog.approverId) return ElMessage.warning('请选择审批人');
-  await api(`/nodes/${workflowDialog.node.id}/approvals`, {
+  if (!workflowDialog.templateId && !workflowDialog.approverId) return ElMessage.warning('请选择审批人');
+  if (!workflowDialog.templateId && workflowDialog.mode !== 'single' && !workflowDialog.secondApproverId) return ElMessage.warning('请选择第二位审批人');
+  let steps;
+  if (workflowDialog.mode === 'serial') {
+    steps = [
+      { name: '一级审批', mode: 'all', approverIds: [workflowDialog.approverId] },
+      { name: '二级审批', mode: 'all', approverIds: [workflowDialog.secondApproverId] }
+    ];
+  } else if (['all', 'any'].includes(workflowDialog.mode)) {
+    steps = [{ name: workflowDialog.mode === 'all' ? '联合会签' : '联合或签', mode: workflowDialog.mode, approverIds: [workflowDialog.approverId, workflowDialog.secondApproverId] }];
+  }
+  await api('/approvals', {
     method: 'POST',
     headers: nodeUnlockHeaders(),
     body: {
+      nodeId: workflowDialog.node.id,
       action: workflowDialog.action,
+      type: workflowDialog.action === 'publish' && approvalTemplates.value.find((item) => item.id === workflowDialog.templateId)?.type === 'publish' ? 'publish' : 'workflow',
+      templateId: workflowDialog.templateId || undefined,
       approverId: workflowDialog.approverId,
+      steps,
+      ccUserIds: workflowDialog.ccUserIds,
       comment: workflowDialog.comment
     }
   });
@@ -3417,26 +3753,65 @@ async function decideGeneralApproval(row, decision) {
   await Promise.all([loadApprovals(), loadMessages(), refreshCurrent()]);
 }
 
+async function withdrawApproval(row) {
+  await ElMessageBox.confirm('确定撤回这条审批申请吗？', '撤回审批', { type: 'warning' });
+  await api(`/approvals/${row.id}/withdraw`, { method: 'POST', body: {} });
+  ElMessage.success('审批已撤回');
+  await Promise.all([loadApprovals(), loadMessages()]);
+}
+
+async function remindApproval(row) {
+  await api(`/approvals/${row.id}/remind`, { method: 'POST', body: {} });
+  ElMessage.success('已通知当前审批人');
+  await loadApprovals();
+}
+
+function openApprovalManageDialog(row, action) {
+  Object.assign(approvalManageDialog, { visible: true, row, action, position: 'after', userIds: [], name: '加签审批', comment: '' });
+}
+
+async function submitApprovalManage() {
+  const dialog = approvalManageDialog;
+  const userIds = Array.isArray(dialog.userIds) ? dialog.userIds : [dialog.userIds].filter(Boolean);
+  if (!userIds.length) return ElMessage.warning('请选择处理人');
+  if (dialog.action === 'transfer') {
+    await api(`/approvals/${dialog.row.id}/transfer`, { method: 'POST', body: { userId: userIds[0], comment: dialog.comment } });
+    ElMessage.success('审批已转交');
+  } else {
+    await api(`/approvals/${dialog.row.id}/add-step`, { method: 'POST', body: { position: dialog.position, name: dialog.name, approverIds: userIds, mode: 'all', comment: dialog.comment } });
+    ElMessage.success('加签步骤已添加');
+  }
+  dialog.visible = false;
+  await Promise.all([loadApprovals(), loadMessages()]);
+}
+
 function openApprovalRequest(node, type = 'download') {
   approvalRequestDialog.node = node;
   approvalRequestDialog.type = type;
+  approvalRequestDialog.templateId = '';
   approvalRequestDialog.approverId = defaultWorkflowApproverId();
   approvalRequestDialog.requestedActions = type === 'permission' ? ['visible', 'file:preview'] : ['file:download'];
+  const defaultHours = { borrow: 7 * 24, external: 24, permission: 30 * 24 }[type] || 0;
+  approvalRequestDialog.expiresAt = defaultHours ? new Date(Date.now() + defaultHours * 60 * 60 * 1000).toISOString() : '';
   approvalRequestDialog.reason = type === 'download' && node?.sensitive ? '因工作需要申请下载敏感文件' : '';
   approvalRequestDialog.visible = true;
 }
 
-function openDownloadApprovalDialog(node) {
-  openApprovalRequest(node, 'download');
+function applyRequestTemplate(templateId) {
+  const template = approvalTemplates.value.find((item) => item.id === templateId);
+  if (!template) return;
+  if (template.requestedActions?.length) approvalRequestDialog.requestedActions = [...template.requestedActions];
 }
 
 async function submitApprovalRequest() {
   if (!approvalRequestDialog.node) return;
-  if (!approvalRequestDialog.approverId) return ElMessage.warning('请选择审批人');
+  if (!approvalRequestDialog.templateId && !approvalRequestDialog.approverId) return ElMessage.warning('请选择审批人');
   const body = {
     nodeId: approvalRequestDialog.node.id,
     type: approvalRequestDialog.type,
+    templateId: approvalRequestDialog.templateId || undefined,
     approverId: approvalRequestDialog.approverId,
+    expiresAt: approvalRequestDialog.expiresAt || null,
     reason: approvalRequestDialog.reason
   };
   if (approvalRequestDialog.type === 'permission') body.requestedActions = approvalRequestDialog.requestedActions;
@@ -3444,6 +3819,83 @@ async function submitApprovalRequest() {
   approvalRequestDialog.visible = false;
   ElMessage.success('审批申请已提交');
   await Promise.all([loadApprovals(), loadMessages()]);
+}
+
+function resetApprovalTemplateForm() {
+  approvalTemplateDialog.editingId = '';
+  Object.assign(approvalTemplateDialog.form, { name: '', description: '', type: 'download', enabled: true, approvalTimeoutHours: 0, ccUserIds: [], steps: [newApprovalTemplateStep()] });
+}
+
+async function openApprovalTemplateDialog() {
+  await loadApprovals();
+  resetApprovalTemplateForm();
+  approvalTemplateDialog.visible = true;
+}
+
+function editApprovalTemplate(template) {
+  approvalTemplateDialog.editingId = template.id;
+  Object.assign(approvalTemplateDialog.form, {
+    name: template.name,
+    description: template.description || '',
+    type: template.type,
+    enabled: template.status === 'enabled',
+    approvalTimeoutHours: Number(template.approvalTimeoutHours || 0),
+    ccUserIds: [...(template.ccUserIds || [])],
+    steps: (template.steps || []).map((step) => ({
+      key: `${Date.now()}-${Math.random()}`,
+      name: step.name,
+      mode: step.mode,
+      approverIds: [...(step.approverIds || [])],
+      securityLevels: [...(step.condition?.securityLevels || [])],
+      sensitive: step.condition?.sensitive === undefined ? 'any' : String(step.condition.sensitive),
+      extensions: (step.condition?.extensions || []).join(',')
+    }))
+  });
+}
+
+function addApprovalTemplateStep() {
+  approvalTemplateDialog.form.steps.push(newApprovalTemplateStep());
+}
+
+function removeApprovalTemplateStep(index) {
+  approvalTemplateDialog.form.steps.splice(index, 1);
+}
+
+async function saveApprovalTemplate() {
+  const form = approvalTemplateDialog.form;
+  if (!form.name.trim()) return ElMessage.warning('请输入模板名称');
+  if (form.steps.some((step) => !step.approverIds.length)) return ElMessage.warning('每个步骤至少选择一位审批人');
+  const body = {
+    name: form.name,
+    description: form.description,
+    type: form.type,
+    status: form.enabled ? 'enabled' : 'disabled',
+    approvalTimeoutHours: Number(form.approvalTimeoutHours || 0),
+    ccUserIds: form.ccUserIds,
+    steps: form.steps.map((step) => ({
+      name: step.name,
+      mode: step.mode,
+      approverIds: step.approverIds,
+      condition: {
+        securityLevels: step.securityLevels,
+        extensions: step.extensions.split(/[,，\s]+/).filter(Boolean),
+        ...(step.sensitive === 'any' ? {} : { sensitive: step.sensitive === 'true' })
+      }
+    }))
+  };
+  const path = approvalTemplateDialog.editingId ? `/approval-templates/${approvalTemplateDialog.editingId}` : '/approval-templates';
+  await api(path, { method: approvalTemplateDialog.editingId ? 'PUT' : 'POST', body });
+  ElMessage.success('审批模板已保存');
+  await loadApprovals();
+  resetApprovalTemplateForm();
+}
+
+async function deleteApprovalTemplate(template) {
+  await ElMessageBox.confirm(`确定删除审批模板“${template.name}”吗？`, '删除模板', { type: 'warning' });
+  await api(`/approval-templates/${template.id}`, { method: 'DELETE' });
+  ElMessage.success('审批模板已删除');
+  await loadApprovals();
+  if (approvalTemplateDialog.editingId === template.id) resetApprovalTemplateForm();
 }
 
 async function openPermissionDialog(node) {
@@ -4024,6 +4476,9 @@ function hasSearchCriteria(criteria) {
   return Boolean(
     String(criteria.keyword || '').trim() ||
     criteria.fileTypes?.length ||
+    criteria.securityLevels?.length ||
+    criteria.categoryIds?.length ||
+    criteria.tags?.length ||
     criteria.creatorId ||
     criteria.updatedFrom ||
     criteria.updatedTo
@@ -4038,6 +4493,7 @@ async function searchFiles(keyword) {
     body: { ...criteria, pathPrefix: selectedFolder.value?.fullPath || '', page: 1, pageSize: 100 }
   });
   docChildren.value = page.items;
+  await loadRecentSearches();
 }
 
 async function searchDriveFiles(keyword) {
@@ -4048,6 +4504,7 @@ async function searchDriveFiles(keyword) {
     body: { ...criteria, pathPrefix: selectedDriveFolder.value?.fullPath || '', page: 1, pageSize: 100 }
   });
   driveChildren.value = page.items;
+  await loadRecentSearches();
 }
 
 async function suggestSearchFiles(keyword) {
@@ -4665,6 +5122,7 @@ watch(
 
 onBeforeUnmount(() => {
   destroyOfficeEditor();
+  destroyOfficeEditInstance();
 });
 
 onMounted(async () => {
