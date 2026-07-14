@@ -21,7 +21,7 @@ const builtAssets = fs.existsSync('dist/assets')
 if (/admin123|user123|默认账号/.test(builtAssets)) errors.push('生产前端产物包含开发账号或默认密码');
 
 const trackedFiles = execFileSync('git', ['ls-files', '--cached', '--others', '--exclude-standard'], { encoding: 'utf8' }).trim().split('\n').filter(Boolean);
-const forbiddenPaths = trackedFiles.filter((file) => /(^|\/)(\.env($|\.)|backend\/(data|uploads|tmp|backups)\/)|ssh/i.test(file) && file !== '.env.example');
+const forbiddenPaths = trackedFiles.filter((file) => /(^|\/)(\.env($|\.)|backend\/(data|uploads|tmp|backups|quarantine)\/)|ssh/i.test(file) && file !== '.env.example');
 forbiddenPaths.forEach((file) => errors.push(`仓库包含禁止提交的运行时或敏感文件：${file}`));
 
 const trackedText = trackedFiles

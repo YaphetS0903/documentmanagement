@@ -5207,15 +5207,17 @@ app.delete('/api/v1/uploads/chunked/:id', requireAuth, asyncRoute(async (req, re
 
 app.post('/api/v1/files', requireAuth, upload.single('file'), asyncRoute(async (req, res) => {
   if (!req.file) throw createError(400, 'VALIDATION_ERROR', '请选择要上传的文件');
-  await validateUploadedFileByPolicy(req.db, req.file);
-  await scanIncomingFile(req.db, req.file.path, req.file.originalname, req.user.id);
+  const originalFilename = req.body.originalFilename ? validateName(req.body.originalFilename) : req.file.originalname;
+  const uploadedFile = { ...req.file, originalname: originalFilename };
+  await validateUploadedFileByPolicy(req.db, uploadedFile);
+  await scanIncomingFile(req.db, uploadedFile.path, originalFilename, req.user.id);
   const parent = nodeById(req.db, req.body.parentId || 'n_root');
   requireNodeAction(req, parent, 'file:create');
   requireNodePasswordAccess(req, parent);
-  const name = validateName(req.body.name || req.file.originalname);
+  const name = validateName(req.body.name || originalFilename);
   ensureSiblingNameAvailable(req.db, parent.id, name);
   const node = createFileNode(req.db, parent, name, req.user.id, req.body.businessStatus || 'effective');
-  const version = await createVersionFromUpload(req.db, node, req.file, req.user.id, req.body.description || '初始版本');
+  const version = await createVersionFromUpload(req.db, node, uploadedFile, req.user.id, req.body.description || '初始版本');
   addVersionChangeLog(req.db, node, version, req.user.id, 'create', { description: version.description });
   addAudit(req.db, req.user.id, 'file.upload', 'node', node.id, { targetPath: node.fullPath, versionNo: version.versionNo }, req);
   notifyVisibleUsersAboutNewFile(req.db, req.user.id, node);
@@ -5225,15 +5227,17 @@ app.post('/api/v1/files', requireAuth, upload.single('file'), asyncRoute(async (
 
 app.post('/api/v1/files/:id/versions', requireAuth, upload.single('file'), asyncRoute(async (req, res) => {
   if (!req.file) throw createError(400, 'VALIDATION_ERROR', '请选择要上传的文件');
-  await validateUploadedFileByPolicy(req.db, req.file);
-  await scanIncomingFile(req.db, req.file.path, req.file.originalname, req.user.id);
+  const originalFilename = req.body.originalFilename ? validateName(req.body.originalFilename) : req.file.originalname;
+  const uploadedFile = { ...req.file, originalname: originalFilename };
+  await validateUploadedFileByPolicy(req.db, uploadedFile);
+  await scanIncomingFile(req.db, uploadedFile.path, originalFilename, req.user.id);
   const node = nodeById(req.db, req.params.id);
   requireNodeAction(req, node, 'file:update');
   requireNodePasswordAccess(req, node);
   if (node.nodeType !== 'file') throw createError(400, 'VALIDATION_ERROR', '只能更新文件');
   if (node.lockedBy && node.lockedBy !== req.user.id && !isAdmin(req.user)) throw createError(409, 'CONFLICT', '文件已被其他用户锁定');
   const previousVersion = currentVersion(req.db, node);
-  const version = await createVersionFromUpload(req.db, node, req.file, req.user.id, req.body.description || '上传更新');
+  const version = await createVersionFromUpload(req.db, node, uploadedFile, req.user.id, req.body.description || '上传更新');
   addVersionChangeLog(req.db, node, version, req.user.id, 'upload', {
     description: version.description,
     fromVersionId: previousVersion?.id || null,

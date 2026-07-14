@@ -13,6 +13,9 @@
     "test": "node backend/tests/api-smoke.mjs",
     "release:check": "npm test && npm run build && node scripts/release-check.mjs",
     "production:check": "node scripts/check-production-env.mjs",
+    "migration:scan": "node scripts/migrate-filesystem.mjs scan",
+    "migration:import": "node scripts/migrate-filesystem.mjs import",
+    "migration:test": "node scripts/migrate-filesystem.test.mjs",
     "onlyoffice:setup": "bash scripts/setup-onlyoffice-local.sh"
   },
   "dependencies": {

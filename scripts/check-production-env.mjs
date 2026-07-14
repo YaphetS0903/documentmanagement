@@ -5,7 +5,7 @@ import path from 'node:path';
 const errors = [];
 const warnings = [];
 const secret = String(process.env.JWT_SECRET || '');
-const requiredDirectories = ['DATA_DIR', 'UPLOAD_DIR', 'TMP_DIR', 'BACKUP_DIR'];
+const requiredDirectories = ['DATA_DIR', 'UPLOAD_DIR', 'TMP_DIR', 'BACKUP_DIR', 'QUARANTINE_DIR'];
 
 if (String(process.env.NODE_ENV || '').toLowerCase() !== 'production') errors.push('NODE_ENV 必须为 production');
 if (secret.length < 32 || secret === 'dev-document-platform-secret') errors.push('JWT_SECRET 必须是至少 32 个字符的随机密钥');

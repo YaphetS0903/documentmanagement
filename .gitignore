@@ -7,6 +7,9 @@ backend/uploads/
 backend/tmp/
 backend/backups/
 backend/quarantine/
+migration-state*.json
+migration-report*.json
+migration-report*.md
 *.log
 *.tgz
 *.zip

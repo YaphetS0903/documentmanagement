@@ -56,7 +56,7 @@ npm start
 生产环境要求：
 
 - 使用至少 32 字符的随机 `JWT_SECRET`。
-- 将 `DATA_DIR`、`UPLOAD_DIR`、`TMP_DIR`、`BACKUP_DIR` 放在仓库外的持久化磁盘。
+- 将 `DATA_DIR`、`UPLOAD_DIR`、`TMP_DIR`、`BACKUP_DIR`、`QUARANTINE_DIR` 放在仓库外的持久化磁盘。
 - 正式 MySQL 必须连接成功，不应以 JSON 降级状态上线。
 - 修改管理员默认密码，停用不需要的演示账号。
 - 配置 HTTPS、反向代理、ONLYOFFICE JWT 和备份策略。
@@ -66,6 +66,7 @@ npm start
 - `docs/生产部署说明.md`
 - `docs/部署与数据安全说明.md`
 - `docs/正式版发布检查清单.md`
+- `docs/正式上线与数据迁移实施方案.md`
 - `docs/四期验收报告.md`
 
 真实 `.env`、数据库连接、SSH 文件、运行数据、上传文件和备份不得提交到 Git。

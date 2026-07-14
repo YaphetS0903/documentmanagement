@@ -18,6 +18,18 @@ function wait(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function stopProcess(child) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) return;
+  await new Promise((resolve) => {
+    const forceStop = setTimeout(() => child.kill('SIGKILL'), 3000);
+    child.once('exit', () => {
+      clearTimeout(forceStop);
+      resolve();
+    });
+    child.kill('SIGTERM');
+  });
+}
+
 async function request(url, options = {}) {
   const res = await fetch(url, options);
   const text = await res.text();
@@ -577,6 +589,31 @@ try {
   assert.equal(upload.data.name, 'smoke.txt');
   assert.equal(upload.data.hasUnread, true);
   assert.equal(upload.data.unreadCount, 1);
+
+  const migrationUploadForm = new FormData();
+  migrationUploadForm.append('parentId', 'n_root');
+  migrationUploadForm.append('name', '迁移质量手册.txt');
+  migrationUploadForm.append('originalFilename', '迁移质量手册.txt');
+  migrationUploadForm.append('file', new Blob([Buffer.from('localized migration upload')]), 'migration-upload-a1b2c3d4.txt');
+  const migrationUpload = await request(`${base}/files`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` },
+    body: migrationUploadForm
+  });
+  assert.equal(migrationUpload.data.name, '迁移质量手册.txt');
+  const migrationVersions = await request(`${base}/files/${migrationUpload.data.id}/versions`, { headers: { Authorization: `Bearer ${token}` } });
+  assert.equal(migrationVersions.data[0].originalFilename, '迁移质量手册.txt');
+  const migrationVersionForm = new FormData();
+  migrationVersionForm.append('originalFilename', '迁移质量手册.txt');
+  migrationVersionForm.append('file', new Blob([Buffer.from('localized migration version')]), 'migration-upload-e5f6a7b8.txt');
+  await request(`${base}/files/${migrationUpload.data.id}/versions`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` },
+    body: migrationVersionForm
+  });
+  const updatedMigrationVersions = await request(`${base}/files/${migrationUpload.data.id}/versions`, { headers: { Authorization: `Bearer ${token}` } });
+  assert.equal(updatedMigrationVersions.data.length, 2);
+  assert.equal(updatedMigrationVersions.data[0].originalFilename, '迁移质量手册.txt');
 
   const chunkedBytes = Buffer.from('chunked upload smoke content split into several pieces');
   const chunkSize = 12;
@@ -2187,6 +2224,6 @@ try {
   console.log('api smoke passed');
 } finally {
   await fs.chmod(path.join(externalRoot, '无权限目录'), 0o700).catch(() => {});
-  server.kill('SIGTERM');
-  officeServer.close();
+  await stopProcess(server);
+  await new Promise((resolve) => officeServer.close(resolve));
 }
